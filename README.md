@@ -6,11 +6,29 @@
 
 <p align="center">A macOS-style Downloads stack for the Windows desktop.</p>
 
+<p align="center">
+  <a href="../../releases/latest"><img src="https://img.shields.io/github/v/release/frstycodes/stash?label=download" alt="Latest release"></a>
+  <a href="../../actions/workflows/ci.yml"><img src="https://github.com/frstycodes/stash/actions/workflows/ci.yml/badge.svg" alt="Build"></a>
+  <img src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue" alt="Windows 10 and 11">
+</p>
+
+<p align="center">
+  <img src="docs/demo.gif" width="360" alt="Stash fanning out, switching from Downloads to Screenshots and back, then collapsing">
+</p>
+
 ---
 
 Stash puts a small stack in the corner of your screen showing your newest downloads. Hover over it and it fans out into a list, the way a Dock stack does on a Mac. Click a file to open it, drag it straight into another app, or flick between folders with the scroll wheel.
 
 It's a small native app written in Rust. Animations run in the Windows compositor, so they stay smooth and Stash sits idle when you're not using it.
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/stack-closed.png" height="220" alt="The closed stack: a small pile of the newest files in the screen corner">
+  &nbsp;&nbsp;
+  <img src="docs/stack-open.png" height="520" alt="The open stack: files fanned out along a curve with their names, and Open Downloads at the bottom">
+</p>
 
 ## Features
 
@@ -27,6 +45,8 @@ It's a small native app written in Rust. Animations run in the Windows composito
 
 1. Download `Stash-Setup-<version>.exe` from the [latest release](../../releases/latest).
 2. Run it. It installs just for you (no admin prompt) and can start Stash when you sign in.
+
+Prefer not to install? Each release also has `Stash-<version>-portable.exe`, which runs as is.
 
 The installer isn't code-signed yet, so Windows SmartScreen may warn about an unrecognised app. Choose **More info → Run anyway**, or build it yourself from source (below).
 
@@ -70,6 +90,23 @@ It writes `dist\Stash-Setup-<version>.exe`.
 - `STASH_LOG=1` writes a log to `%TEMP%\stash.log`.
 - `STASH_SLOW=5` plays every animation five times slower.
 - `STASH_PIN_OPEN=1` keeps the stack open so you can inspect it.
+- `STASH_DEMO=<folder>;<folder>` shows those folders instead of yours, above every window, and saves nothing. The README screenshots use it.
+- `STASH_DEMO_SCRIPT="1.5:open;4:next;6:close"` plays a timed sequence in demo mode (seconds from start; commands are `open`, `close`, `next` and `prev`). The demo GIF uses it.
+
+## Releases
+
+Releases are built and published by GitHub Actions; nobody builds them by hand.
+
+- **Every push and pull request** builds the app and the installer ([CI](.github/workflows/ci.yml)), so a broken build shows up straight away.
+- **Pushing a version tag** such as `v0.3.0` builds the installer and a portable exe and publishes them as a GitHub release with notes generated from the commits ([Release](.github/workflows/release.yml)).
+
+To cut a release, run this from a clean `main`:
+
+```powershell
+.installerelease.ps1 0.3.0
+```
+
+It sets the version in `Cargo.toml`, commits, tags `v0.3.0` and pushes. The release appears on the [Releases page](../../releases) a few minutes later.
 
 ## How it works
 

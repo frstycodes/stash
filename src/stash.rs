@@ -98,6 +98,7 @@ const WM_APP_THUMBS: u32 = WM_APP + 1;
 const WM_APP_MENU: u32 = WM_APP + 2;
 const WM_APP_FOLDER: u32 = WM_APP + 3;
 const WM_APP_OUTSIDE: u32 = WM_APP + 4; // a mouse button went down somewhere; lparam = screen point
+const WM_APP_DEMO: u32 = WM_APP + 9;    // demo mode only, from a recording script; wparam = command
 const TRAY_CLICK: &str = "tray-click";
 const T_HOVER: usize = 1;
 const T_POLL: usize = 2;
@@ -253,6 +254,7 @@ pub struct Stash {
     topmost: bool,   // raised above all apps (while a tray-opened fan is showing)
     pinned_fg: HWND, // the foreground window when pinned; switching apps closes the fan
     wheel: i32,                     // wheel delta toward the next switch
+    demo: Option<Vec<PathBuf>>,     // STASH_DEMO's folders, in place of the real ones
     last_switch: std::time::Instant,
 
     tray: Option<tray_icon::TrayIcon>,
@@ -366,6 +368,13 @@ impl Stash {
         settings.folders.retain(|f| f != &downloads);
         // the folder on show last time, if it's still on the list
         let dir = settings.current.clone().filter(|c| settings.folders.contains(c)).unwrap_or_else(|| downloads.clone());
+        // STASH_DEMO=<folder>[;<folder>...] shows those folders instead of yours, above
+        // every window, and saves nothing (for screenshots and recordings)
+        let demo: Option<Vec<PathBuf>> = std::env::var("STASH_DEMO")
+            .ok()
+            .map(|v| v.split(';').filter(|f| !f.is_empty()).map(PathBuf::from).collect::<Vec<_>>())
+            .filter(|v| !v.is_empty());
+        let dir = demo.as_ref().map_or(dir, |d| d[0].clone());
 
         // Folder watcher: event-driven (ReadDirectoryChangesW), no polling. Every
         // watched folder, not just the one on show, so arrivals elsewhere bounce the stack.
@@ -435,6 +444,7 @@ impl Stash {
             topmost: false,
             pinned_fg: HWND::default(),
             wheel: 0,
+            demo: demo.clone(),
             last_switch: std::time::Instant::now(),
             tray: None,
             watcher,
@@ -447,7 +457,37 @@ impl Stash {
             s.reload(true);
             s.prefetch();
             s.ready = true;
+            if demo.is_some() {
+                s.topmost = true;
+                s.restack();
+                if std::env::var_os("STASH_PIN_OPEN").is_some() {
+                    s.open();
+                }
+            }
         });
+        // STASH_DEMO_SCRIPT="1.5:open;3:next;..." plays a timed sequence (seconds from
+        // start) in demo mode, for recordings. Commands: open, close, next, prev.
+        if let (Some(_), Ok(script)) = (&demo, std::env::var("STASH_DEMO_SCRIPT")) {
+            let steps: Vec<(f64, usize)> = script
+                .split(';')
+                .filter_map(|step| {
+                    let (t, cmd) = step.split_once(':')?;
+                    let cmd = ["open", "close", "next", "prev"].iter().position(|c| *c == cmd.trim())?;
+                    Some((t.trim().parse().ok()?, cmd))
+                })
+                .collect();
+            std::thread::spawn(move || {
+                let start = std::time::Instant::now();
+                for (t, cmd) in steps {
+                    let wait = std::time::Duration::from_secs_f64(t).saturating_sub(start.elapsed());
+                    std::thread::sleep(wait);
+                    let hwnd = HWND(TILE_HWND.load(Ordering::Relaxed) as *mut _);
+                    unsafe {
+                        let _ = PostMessageW(Some(hwnd), WM_APP_DEMO, WPARAM(cmd), LPARAM(0));
+                    }
+                }
+            });
+        }
         log("started");
         Ok(())
     }
@@ -599,7 +639,7 @@ impl Stash {
         let shown = done.iter().any(|d| d.path == self.dir || d.path.parent() == Some(self.dir.as_path()));
         for d in done {
             // a watched folder can also be an item in another one, so check both
-            if d.modified == SystemTime::UNIX_EPOCH && self.folders().contains(&d.path) {
+            if d.modified == SystemTime::UNIX_EPOCH && (d.path == self.dir || self.folders().contains(&d.path)) {
                 self.folder_icons.insert(d.path.clone(), d.pixels.clone());
             }
             if self.pending.remove(&d.path) {
@@ -999,7 +1039,7 @@ impl Stash {
         }
         let _ = self.animate_scalar("Label", 0.0, LABEL_OUT_MS, 0, &self.ease_out);
         let _ = self.spring_scalar("Progress", 0.0, CLOSE_DAMPING, CLOSE_PERIOD_MS, CLOSE_DELAY_MS);
-        if self.topmost && shell::covered(self.tile) {
+        if self.topmost && self.demo.is_none() && shell::covered(self.tile) {
             // it's about to drop back under a window: fade out while it collapses
             self.fade(0.0, FADE_OUT_MS, FADE_OUT_DELAY_MS);
         }
@@ -1123,7 +1163,7 @@ impl Stash {
                     return;
                 }
                 // STASH_PIN_OPEN=1 keeps the fan open (for inspecting it without a mouse)
-                if !self.open || self.dragging || self.menu_open || std::env::var_os("STASH_PIN_OPEN").is_some() {
+                if !self.open || self.dragging || self.menu_open || self.demo.is_some() || std::env::var_os("STASH_PIN_OPEN").is_some() {
                     self.outside_ms = 0;
                 } else if self.pointer_over() {
                     self.outside_ms = 0;
@@ -1146,7 +1186,7 @@ impl Stash {
                     }
                     self.fan_shown = false;
                     self.drop_outgoing(true);
-                    if self.topmost {
+                    if self.topmost && self.demo.is_none() {
                         self.topmost = false;
                         self.restack(); // back beneath every app window
                         // then make it opaque again (if it faded), once it's out of sight
@@ -1354,7 +1394,7 @@ impl Stash {
                 other => {
                     let before = self.settings.clone();
                     if menu::apply_setting(other, &mut self.settings) && self.settings != before {
-                        settings::save(&self.settings);
+                        self.save_settings();
                         self.close();
                         self.refresh_tray();
                         if self.settings.icon_size != before.icon_size {
@@ -1391,7 +1431,16 @@ impl Stash {
 
     /// Every watched folder, Downloads first.
     fn folders(&self) -> Vec<PathBuf> {
+        if let Some(demo) = &self.demo {
+            return demo.clone();
+        }
         std::iter::once(self.downloads.clone()).chain(self.settings.folders.iter().cloned()).collect()
+    }
+
+    fn save_settings(&self) {
+        if self.demo.is_none() {
+            settings::save(&self.settings);
+        }
     }
 
     fn current_index(&self) -> usize {
@@ -1412,7 +1461,7 @@ impl Stash {
         }
         self.dir = path;
         self.settings.current = (self.dir != self.downloads).then(|| self.dir.clone());
-        settings::save(&self.settings);
+        self.save_settings();
         // hand the old pile (or fan) to a visual of its own, to animate it out
         let leaving = if self.open { None } else { self.detach_pile().ok() };
         if self.fan_shown {
@@ -1618,7 +1667,7 @@ impl Stash {
             }
         }
         self.set_folder(path.clone(), 1.0);
-        settings::save(&self.settings);
+        self.save_settings();
         self.refresh_tray();
     }
 
@@ -1635,8 +1684,26 @@ impl Stash {
         self.folder_icons.remove(&gone);
         let prev = self.folders()[i - 1].clone();
         self.set_folder(prev, -1.0);
-        settings::save(&self.settings);
+        self.save_settings();
         self.refresh_tray();
+    }
+
+    /// Demo mode: a recording script drives the stack. 0 open, 1 close, 2 next folder,
+    /// 3 previous folder.
+    fn on_demo(&mut self, command: usize) {
+        if self.demo.is_none() {
+            return;
+        }
+        let folders = self.folders();
+        let n = folders.len();
+        let i = self.current_index();
+        match command {
+            0 => self.open(),
+            1 => self.close(),
+            2 => self.set_folder(folders[(i + 1) % n].clone(), 1.0),
+            3 => self.set_folder(folders[(i + n - 1) % n].clone(), -1.0),
+            _ => {}
+        }
     }
 
     /// Changes in the folder on show reload it; a new file anywhere else bounces the stack.
@@ -1801,6 +1868,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             None
         }
         WM_APP_MENU => with(|s| s.on_menu()).flatten(),
+        WM_APP_DEMO => {
+            with(|s| s.on_demo(wparam.0));
+            None
+        }
         WM_APP_OUTSIDE => {
             with(|s| s.on_outside_click(POINT { x, y }));
             None
