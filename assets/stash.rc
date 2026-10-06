@@ -1,0 +1,2 @@
+// The app icon, embedded in stash.exe (Explorer, Start menu, installer shortcuts).
+1 ICON "stash.ico"
