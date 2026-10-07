@@ -37,6 +37,7 @@ VIAddVersionKey "LegalCopyright" "Copyright 2026 Sandesh Pandey. PolyForm Noncom
 !define MUI_COMPONENTSPAGE_NODESC
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${EXE}"
 !define MUI_FINISHPAGE_RUN_TEXT "Start ${APP} now"
+!define MUI_FINISHPAGE_TEXT "${APP} is installed.$\r$\n$\r$\nWindows hides new tray icons behind the arrow next to the clock. To open ${APP} with one click, drag its icon onto the taskbar, or turn it on in Settings under Personalization, Taskbar, Other system tray icons."
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "..\LICENSE.md"
