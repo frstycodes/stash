@@ -1,5 +1,7 @@
-# Publishes a GitHub release when a version tag (v1.2.3) is pushed: builds the app
-# and installer, then attaches the installer and a portable exe.
+# Publishes a release when a version tag (v1.2.3) is pushed:
+#  - GitHub release: the installer, portable exes for x64 and Arm64, and the Store bundle
+#  - Microsoft Store: submits the bundle (x64 + Arm64) as a new Store version, once the
+#    Partner Center secrets are set (see "Store publishing" in README.md)
 # installer/release.ps1 bumps the version, tags and pushes in one go.
 name: Release
 
@@ -13,6 +15,8 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
+    env:
+      STORE_PRODUCT_ID: 9PMVDZ3LZ490
     steps:
       - uses: actions/checkout@v4
 
@@ -24,6 +28,8 @@ jobs:
           "VERSION=$version" >> $env:GITHUB_ENV
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc, aarch64-pc-windows-msvc
 
       - uses: Swatinem/rust-cache@v2
 
@@ -36,28 +42,44 @@ jobs:
         shell: pwsh
         run: ./installer/build.ps1
 
-      - name: Portable exe
+      # x64 and Arm64 packages in one bundle; the Store gives each PC its native one
+      - name: Store bundle
         shell: pwsh
-        run: Copy-Item target/release/stash.exe "dist/Stash-$env:VERSION-portable.exe"
+        run: ./packaging/build-msix.ps1 -Arch x64,arm64
 
-      # The Microsoft Store package, once packaging/identity.json holds the real
-      # Store identity. Upload it to Partner Center by hand; the Store signs it.
-      - name: Store package
+      - name: Portable exes
         shell: pwsh
         run: |
-          if ((Get-Content packaging/identity.json -Raw) -match 'Placeholder') {
-            'Store identity not set yet, skipping the .msix'
-          } else {
-            ./packaging/build-msix.ps1
-          }
+          Copy-Item target/release/stash.exe "dist/Stash-$env:VERSION-portable.exe"
+          Copy-Item target/aarch64-pc-windows-msvc/release/stash.exe "dist/Stash-$env:VERSION-arm64-portable.exe"
 
-      - name: Publish the release
+      - name: Publish the GitHub release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $files = @("dist/Stash-Setup-$env:VERSION.exe", "dist/Stash-$env:VERSION-portable.exe")
-          if (Test-Path "dist/Stash-$env:VERSION.msix") { $files += "dist/Stash-$env:VERSION.msix" }
-          gh release create "${{ github.ref_name }}" @files `
+          gh release create "${{ github.ref_name }}" `
+            "dist/Stash-Setup-$env:VERSION.exe" `
+            "dist/Stash-$env:VERSION-portable.exe" `
+            "dist/Stash-$env:VERSION-arm64-portable.exe" `
+            "dist/Stash-$env:VERSION.msixbundle" `
             --title "Stash $env:VERSION" `
             --generate-notes
+
+      # Skipped (not failed) until the Partner Center secrets exist.
+      - name: Check for Store credentials
+        id: store
+        shell: pwsh
+        env:
+          SELLER_ID: ${{ secrets.STORE_SELLER_ID }}
+        run: "\"ready=$([bool]$env:SELLER_ID)\" >> $env:GITHUB_OUTPUT"
+
+      - uses: microsoft/setup-msstore-cli@v1
+        if: steps.store.outputs.ready == 'True'
+
+      - name: Submit to the Microsoft Store
+        if: steps.store.outputs.ready == 'True'
+        shell: pwsh
+        run: |
+          msstore reconfigure --tenantId "${{ secrets.STORE_TENANT_ID }}" --sellerId "${{ secrets.STORE_SELLER_ID }}" --clientId "${{ secrets.STORE_CLIENT_ID }}" --clientSecret "${{ secrets.STORE_CLIENT_SECRET }}"
+          msstore publish "dist/Stash-$env:VERSION.msixbundle" -id $env:STORE_PRODUCT_ID -v
