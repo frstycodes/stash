@@ -4,9 +4,7 @@ Paste these into Partner Center when you create the submission.
 
 ## Product name
 
-Stash
-
-If "Stash" is already taken in the Store, try "Stash: Downloads Stack" or "Stash Downloads".
+Stash: Downloads stack (the reserved name; packaging/identity.json must match it exactly)
 
 ## Category
 
