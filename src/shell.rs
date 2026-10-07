@@ -176,8 +176,7 @@ pub fn restack(hwnd: HWND, above: Option<HWND>) {
 /// Above every non-topmost window (other apps, full-screen windows), without activating.
 pub fn raise_topmost(hwnd: HWND) {
     unsafe {
-        let r = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
-        crate::stash::log(format!("DBG raise_topmost {:?} -> {:?} ex={:x}", hwnd, r, windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(hwnd, GWL_EXSTYLE)));
+        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
     }
 }
 

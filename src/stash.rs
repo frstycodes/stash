@@ -1082,13 +1082,19 @@ impl Stash {
     /// Put both windows at their z-order: above every app while raised, otherwise
     /// just above the desktop. The fan always sits directly beneath the tile.
     fn restack(&self) {
+        // Each window is moved on its own: one slotted in after a topmost window doesn't
+        // reliably change band (it worked once after launch, then stayed under every app).
+        // Each move lands at the top (or bottom) of its band, so the order of calls sets
+        // badge > tile > fan.
         if self.topmost {
+            shell::raise_topmost(self.fan);
+            shell::raise_topmost(self.tile);
             shell::raise_topmost(self.badge);
         } else {
             shell::restack(self.badge, None);
+            shell::restack(self.tile, None);
+            shell::restack(self.fan, None);
         }
-        shell::restack(self.tile, Some(self.badge));
-        shell::restack(self.fan, Some(self.tile));
     }
 
     /// A tray-opened fan closes on any click outside it (the tray icon toggles it itself).
