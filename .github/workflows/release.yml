@@ -40,13 +40,24 @@ jobs:
         shell: pwsh
         run: Copy-Item target/release/stash.exe "dist/Stash-$env:VERSION-portable.exe"
 
+      # The Microsoft Store package, once packaging/identity.json holds the real
+      # Store identity. Upload it to Partner Center by hand; the Store signs it.
+      - name: Store package
+        shell: pwsh
+        run: |
+          if ((Get-Content packaging/identity.json -Raw) -match 'Placeholder') {
+            'Store identity not set yet, skipping the .msix'
+          } else {
+            ./packaging/build-msix.ps1
+          }
+
       - name: Publish the release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" `
-            "dist/Stash-Setup-$env:VERSION.exe" `
-            "dist/Stash-$env:VERSION-portable.exe" `
+          $files = @("dist/Stash-Setup-$env:VERSION.exe", "dist/Stash-$env:VERSION-portable.exe")
+          if (Test-Path "dist/Stash-$env:VERSION.msix") { $files += "dist/Stash-$env:VERSION.msix" }
+          gh release create "${{ github.ref_name }}" @files `
             --title "Stash $env:VERSION" `
             --generate-notes

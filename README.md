@@ -118,6 +118,10 @@ The script sets the version in `Cargo.toml`, commits, tags `v0.3.0` and pushes. 
 - The Windows shell supplies thumbnails through `IShellItemImageFactory`, and runs drag-and-drop and file actions.
 - The [`notify`](https://crates.io/crates/notify) crate watches folders with `ReadDirectoryChangesW`, so Stash never polls the disk.
 
+## Privacy
+
+Stash never connects to the internet and collects no data. See the [privacy policy](PRIVACY.md).
+
 ## License
 
 Stash is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE.md).

@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy these from Partner Center: your app > Product management > Product identity. Placeholders build a package that installs nowhere and that the Store rejects.",
+  "name": "00000Placeholder.Stash",
+  "publisher": "CN=00000000-0000-0000-0000-000000000000",
+  "publisherDisplayName": "Sandesh Pandey",
+  "displayName": "Stash"
+}

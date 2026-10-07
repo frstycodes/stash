@@ -327,7 +327,28 @@ pub fn recycle(path: &Path) {
 
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
+/// The Microsoft Store build runs as an MSIX package. Packaged apps start at sign-in
+/// through the StartupTask declared in their manifest, not the Run key.
+const STARTUP_TASK: &str = "StashStartup";
+
+pub fn is_packaged() -> bool {
+    use windows::Win32::Foundation::APPMODEL_ERROR_NO_PACKAGE;
+    use windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
+    let mut len = 0u32;
+    unsafe { GetCurrentPackageFullName(&mut len, None) != APPMODEL_ERROR_NO_PACKAGE }
+}
+
+fn startup_task() -> Option<windows::ApplicationModel::StartupTask> {
+    windows::ApplicationModel::StartupTask::GetAsync(&windows::core::HSTRING::from(STARTUP_TASK)).ok()?.get().ok()
+}
+
 pub fn start_at_login() -> bool {
+    if is_packaged() {
+        use windows::ApplicationModel::StartupTaskState;
+        return startup_task()
+            .and_then(|t| t.State().ok())
+            .is_some_and(|s| s == StartupTaskState::Enabled || s == StartupTaskState::EnabledByPolicy);
+    }
     windows_registry::CURRENT_USER
         .open(RUN_KEY)
         .and_then(|k| k.get_string("Stash"))
@@ -335,6 +356,17 @@ pub fn start_at_login() -> bool {
 }
 
 pub fn set_start_at_login(enabled: bool) {
+    if is_packaged() {
+        // If the user turned it off in Task Manager, only they can turn it back on there.
+        if let Some(task) = startup_task() {
+            if enabled {
+                let _ = task.RequestEnableAsync().and_then(|op| op.get());
+            } else {
+                let _ = task.Disable();
+            }
+        }
+        return;
+    }
     let Ok(key) = windows_registry::CURRENT_USER.create(RUN_KEY) else { return };
     if enabled {
         if let Ok(exe) = std::env::current_exe() {
