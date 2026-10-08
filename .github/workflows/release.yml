@@ -66,13 +66,19 @@ jobs:
             --title "Stash $env:VERSION" `
             --generate-notes
 
-      # Skipped (not failed) until the Partner Center secrets exist.
+      # Skipped (not failed) until all four Partner Center secrets exist.
       - name: Check for Store credentials
         id: store
         shell: pwsh
         env:
           SELLER_ID: ${{ secrets.STORE_SELLER_ID }}
-        run: "\"ready=$([bool]$env:SELLER_ID)\" >> $env:GITHUB_OUTPUT"
+          TENANT_ID: ${{ secrets.STORE_TENANT_ID }}
+          CLIENT_ID: ${{ secrets.STORE_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.STORE_CLIENT_SECRET }}
+        run: |
+          $ready = [bool]($env:SELLER_ID -and $env:TENANT_ID -and $env:CLIENT_ID -and $env:CLIENT_SECRET)
+          if (-not $ready) { 'Store secrets not all set, skipping the Store submission' }
+          "ready=$ready" >> $env:GITHUB_OUTPUT
 
       - uses: microsoft/setup-msstore-cli@v1
         if: steps.store.outputs.ready == 'True'
