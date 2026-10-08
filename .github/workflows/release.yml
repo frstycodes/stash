@@ -18,7 +18,7 @@ jobs:
     env:
       STORE_PRODUCT_ID: 9PMVDZ3LZ490
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check the tag matches Cargo.toml
         shell: pwsh
