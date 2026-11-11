@@ -109,8 +109,10 @@ jobs:
 
       # Chrome Web Store API v2: upload the keyless zip, wait for it to process, then submit
       # it for review; it goes live once approved.
+      # A store's trouble shouldn't stop the other stores: each publish step may fail alone.
       - name: Publish to the Chrome Web Store
         if: steps.chrome.outputs.ready == 'True'
+        continue-on-error: true
         shell: pwsh
         env:
           PUBLISHER_ID: ${{ secrets.CHROME_PUBLISHER_ID }}
@@ -126,8 +128,17 @@ jobs:
           $headers = @{ Authorization = "Bearer $token" }
           $item = "publishers/$env:PUBLISHER_ID/items/$env:EXTENSION_ID"
 
-          $upload = Invoke-RestMethod -Method Post -Headers $headers -ContentType 'application/zip' `
-            -Uri "https://chromewebstore.googleapis.com/upload/v2/${item}:upload" -InFile browser/dist/stash-chrome-store.zip
+          try {
+            $upload = Invoke-RestMethod -Method Post -Headers $headers -ContentType 'application/zip' `
+              -Uri "https://chromewebstore.googleapis.com/upload/v2/${item}:upload" -InFile browser/dist/stash-chrome-store.zip
+          } catch {
+            # the store takes no new version while one is in review; the next release will go in
+            if ("$_" -match 'in review|NOT_UPDATEABLE') {
+              "::warning::Chrome Web Store: the previous version is still in review, so $env:VERSION wasn't uploaded"
+              exit 0
+            }
+            throw
+          }
           $state = $upload.uploadState
           "Upload: $state"
           for ($i = 0; $state -match 'IN_PROGRESS' -and $i -lt 30; $i++) {
@@ -158,6 +169,7 @@ jobs:
       # without waiting for the review to finish.
       - name: Publish to addons.mozilla.org
         if: steps.amo.outputs.ready == 'True'
+        continue-on-error: true
         shell: pwsh
         env:
           WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
@@ -186,6 +198,7 @@ jobs:
 
       - name: Submit to the Microsoft Store
         if: steps.store.outputs.ready == 'True'
+        continue-on-error: true
         shell: pwsh
         run: |
           msstore reconfigure --tenantId "${{ secrets.STORE_TENANT_ID }}" --sellerId "${{ secrets.STORE_SELLER_ID }}" --clientId "${{ secrets.STORE_CLIENT_ID }}" --clientSecret "${{ secrets.STORE_CLIENT_SECRET }}"
