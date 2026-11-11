@@ -34,7 +34,11 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc, aarch64-pc-windows-msvc
 
+      # main's cache (saved by CI); a tag's own cache would be useless to the next tag
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stash
+          save-if: false
 
       - name: Install NSIS
         shell: pwsh
