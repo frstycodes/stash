@@ -58,9 +58,30 @@ VIAddVersionKey "LegalCopyright" "Copyright 2026 Sandesh Pandey. PolyForm Noncom
   Sleep 300
 !macroend
 
+; ...and wait until it lets go (a copy that's still exiting, or being looked at by
+; Windows Error Reporting, keeps the file locked): up to 15 seconds.
+Function WaitForExe
+  StrCpy $1 0
+  loop:
+    IfFileExists "$INSTDIR\${EXE}" 0 done
+    ClearErrors
+    FileOpen $2 "$INSTDIR\${EXE}" a
+    IfErrors 0 free
+    IntOp $1 $1 + 1
+    IntCmp $1 60 done
+    nsExec::Exec 'taskkill /F /IM ${EXE}'
+    Pop $0
+    Sleep 250
+    Goto loop
+  free:
+    FileClose $2
+  done:
+FunctionEnd
+
 Section "${APP}" SecApp
   SectionIn RO
   !insertmacro StopStash
+  Call WaitForExe
   SetOutPath "$INSTDIR"
   File "..\target\release\${EXE}"
   File "..\LICENSE.md"
@@ -98,9 +119,10 @@ Function .onInit
     SectionSetFlags ${SecLogin} 0
 FunctionEnd
 
+; --updated: the new Stash waits for the old one to be gone before starting
 Function .onInstSuccess
   IfSilent 0 +2
-    Exec '"$INSTDIR\${EXE}"'
+    Exec '"$INSTDIR\${EXE}" --updated'
 FunctionEnd
 
 Section "Uninstall"

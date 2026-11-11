@@ -1881,7 +1881,7 @@ impl Stash {
                     // save where every download got to, start the new version, and go
                     dl::engine().shutdown();
                     match crate::update::apply() {
-                        Ok(()) => unsafe { PostQuitMessage(0) },
+                        Ok(()) => self.exit_now(),
                         Err(e) => log(format!("update failed: {e}")),
                     }
                 }
@@ -1895,7 +1895,7 @@ impl Stash {
                 }
                 ids::QUIT => {
                     dl::engine().shutdown(); // saves where every download got to
-                    unsafe { PostQuitMessage(0) }
+                    self.exit_now();
                 }
                 ids::LOGIN => {
                     shell::set_start_at_login(!shell::start_at_login());
@@ -1939,6 +1939,17 @@ impl Stash {
             }
         }
         blocking
+    }
+
+    /// Leave at once, once everything is saved: the tray icon goes, and the process ends
+    /// without tearing down the engine's threads, the compositor and the windows one by
+    /// one (that teardown could hang, and crash, which kept the exe locked for an update).
+    fn exit_now(&mut self) {
+        self.tray = None; // removes the icon from the tray
+        log("exit");
+        unsafe {
+            let _ = windows::Win32::System::Threading::TerminateProcess(windows::Win32::System::Threading::GetCurrentProcess(), 0);
+        }
     }
 
     fn refresh_tray(&self) {
