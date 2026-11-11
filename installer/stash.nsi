@@ -64,6 +64,12 @@ Section "${APP}" SecApp
   SetOutPath "$INSTDIR"
   File "..\target\release\${EXE}"
   File "..\LICENSE.md"
+  ; the browser extensions, to load unpacked until they're in the stores
+  SetOutPath "$INSTDIR\browser"
+  File "..\browser\README.md"
+  File /r "..\browser\dist\chrome"
+  File /r "..\browser\dist\firefox"
+  SetOutPath "$INSTDIR"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
   CreateShortcut "$SMPROGRAMS\${APP}.lnk" "$INSTDIR\${EXE}"
@@ -85,8 +91,21 @@ Section "Start ${APP} when I sign in" SecLogin
   WriteRegStr HKCU "${RUN_KEY}" "${APP}" '"$INSTDIR\${EXE}"'
 SectionEnd
 
+; An update from inside Stash runs this installer silently (/S): it leaves the sign-in
+; setting as the user set it and starts the new Stash when it's done.
+Function .onInit
+  IfSilent 0 +2
+    SectionSetFlags ${SecLogin} 0
+FunctionEnd
+
+Function .onInstSuccess
+  IfSilent 0 +2
+    Exec '"$INSTDIR\${EXE}"'
+FunctionEnd
+
 Section "Uninstall"
   !insertmacro StopStash
+  RMDir /r "$INSTDIR\browser"
   Delete "$INSTDIR\${EXE}"
   Delete "$INSTDIR\LICENSE.md"
   Delete "$INSTDIR\Uninstall.exe"

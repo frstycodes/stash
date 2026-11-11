@@ -1,5 +1,6 @@
 # Publishes a release when a version tag (v1.2.3) is pushed:
-#  - GitHub release: the installer, portable exes for x64 and Arm64, and the Store bundle
+#  - GitHub release: the installer, portable exes for x64 and Arm64, the Store bundle, the
+#    browser extensions, and SHA256SUMS.txt (Stash's updater checks downloads against it)
 #  - Microsoft Store: submits the bundle (x64 + Arm64) as a new Store version, once the
 #    Partner Center secrets are set (see "Store publishing" in README.md)
 # installer/release.ps1 bumps the version, tags and pushes in one go.
@@ -17,6 +18,8 @@ jobs:
     runs-on: windows-latest
     env:
       STORE_PRODUCT_ID: 9PMVDZ3LZ490
+      # lets the app's native messaging host accept the Chrome Web Store extension (src/ipc.rs)
+      STASH_CHROME_STORE_ID: ${{ secrets.CHROME_EXTENSION_ID }}
     steps:
       - uses: actions/checkout@v7
 
@@ -53,6 +56,21 @@ jobs:
           Copy-Item target/release/stash.exe "dist/Stash-$env:VERSION-portable.exe"
           Copy-Item target/aarch64-pc-windows-msvc/release/stash.exe "dist/Stash-$env:VERSION-arm64-portable.exe"
 
+      # installer/build.ps1 already built them (the installer bundles them too)
+      - name: Browser extensions
+        shell: pwsh
+        run: |
+          Copy-Item browser/dist/stash-chrome.zip "dist/Stash-$env:VERSION-chrome-extension.zip"
+          Copy-Item browser/dist/stash-firefox.zip "dist/Stash-$env:VERSION-firefox-extension.zip"
+
+      # The in-app updater only installs a download whose hash is listed here.
+      - name: Checksums
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem dist -File | Where-Object { $_.Extension -in '.exe', '.msixbundle', '.zip' }
+          $files | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name } | Set-Content dist/SHA256SUMS.txt -Encoding ascii
+          Get-Content dist/SHA256SUMS.txt
+
       - name: Publish the GitHub release
         shell: pwsh
         env:
@@ -63,8 +81,87 @@ jobs:
             "dist/Stash-$env:VERSION-portable.exe" `
             "dist/Stash-$env:VERSION-arm64-portable.exe" `
             "dist/Stash-$env:VERSION.msixbundle" `
+            "dist/Stash-$env:VERSION-chrome-extension.zip" `
+            "dist/Stash-$env:VERSION-firefox-extension.zip" `
+            "dist/SHA256SUMS.txt" `
             --title "Stash $env:VERSION" `
             --generate-notes
+
+      # Browser extension stores (see "Publishing" in browser/README.md). Each one is skipped
+      # (not failed) until its secrets exist; the first listing in each store is made by hand.
+      - name: Check for Chrome Web Store credentials
+        id: chrome
+        shell: pwsh
+        env:
+          PUBLISHER_ID: ${{ secrets.CHROME_PUBLISHER_ID }}
+          EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
+          CLIENT_ID: ${{ secrets.CHROME_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CHROME_CLIENT_SECRET }}
+          REFRESH_TOKEN: ${{ secrets.CHROME_REFRESH_TOKEN }}
+        run: |
+          $ready = [bool]($env:PUBLISHER_ID -and $env:EXTENSION_ID -and $env:CLIENT_ID -and $env:CLIENT_SECRET -and $env:REFRESH_TOKEN)
+          if (-not $ready) { 'Chrome Web Store secrets not all set, skipping the Chrome Web Store' }
+          "ready=$ready" >> $env:GITHUB_OUTPUT
+
+      # Chrome Web Store API v2: upload the keyless zip, wait for it to process, then submit
+      # it for review; it goes live once approved.
+      - name: Publish to the Chrome Web Store
+        if: steps.chrome.outputs.ready == 'True'
+        shell: pwsh
+        env:
+          PUBLISHER_ID: ${{ secrets.CHROME_PUBLISHER_ID }}
+          EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
+          CLIENT_ID: ${{ secrets.CHROME_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CHROME_CLIENT_SECRET }}
+          REFRESH_TOKEN: ${{ secrets.CHROME_REFRESH_TOKEN }}
+        run: |
+          $token = (Invoke-RestMethod -Method Post -Uri https://oauth2.googleapis.com/token -Body @{
+            client_id = $env:CLIENT_ID; client_secret = $env:CLIENT_SECRET
+            refresh_token = $env:REFRESH_TOKEN; grant_type = 'refresh_token'
+          }).access_token
+          $headers = @{ Authorization = "Bearer $token" }
+          $item = "publishers/$env:PUBLISHER_ID/items/$env:EXTENSION_ID"
+
+          $upload = Invoke-RestMethod -Method Post -Headers $headers -ContentType 'application/zip' `
+            -Uri "https://chromewebstore.googleapis.com/upload/v2/${item}:upload" -InFile browser/dist/stash-chrome-store.zip
+          $state = $upload.uploadState
+          "Upload: $state"
+          for ($i = 0; $state -match 'IN_PROGRESS' -and $i -lt 30; $i++) {
+            Start-Sleep -Seconds 10
+            $status = Invoke-RestMethod -Headers $headers -Uri "https://chromewebstore.googleapis.com/v2/${item}:fetchStatus"
+            $state = $status.lastAsyncUploadState
+            "Upload: $state"
+          }
+          if ($state -notmatch 'SUCCE') { throw "Chrome Web Store upload didn't succeed: $state" }
+
+          $publish = Invoke-RestMethod -Method Post -Headers $headers -ContentType 'application/json' `
+            -Uri "https://chromewebstore.googleapis.com/v2/${item}:publish" -Body '{}'
+          "Submitted for review: $($publish.state)"
+          $publish.warningInfo.warnings | ForEach-Object { "::warning::Chrome Web Store: $($_.reason) $($_.description)" }
+
+      - name: Check for addons.mozilla.org credentials
+        id: amo
+        shell: pwsh
+        env:
+          JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+          JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: |
+          $ready = [bool]($env:JWT_ISSUER -and $env:JWT_SECRET)
+          if (-not $ready) { 'AMO secrets not all set, skipping addons.mozilla.org' }
+          "ready=$ready" >> $env:GITHUB_OUTPUT
+
+      # Submits the new version to the listed add-on (gecko id stash-downloads@frstycodes.github.io) for review,
+      # without waiting for the review to finish.
+      - name: Publish to addons.mozilla.org
+        if: steps.amo.outputs.ready == 'True'
+        shell: pwsh
+        env:
+          WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
+          WEB_EXT_API_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: |
+          npx --yes web-ext@8 sign --channel=listed --source-dir browser/dist/firefox `
+            --artifacts-dir browser/dist/web-ext-artifacts --approval-timeout 0
+          if ($LASTEXITCODE -ne 0) { throw 'web-ext sign failed' }
 
       # Skipped (not failed) until all four Partner Center secrets exist.
       - name: Check for Store credentials

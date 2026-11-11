@@ -38,11 +38,30 @@
         <desktop:Extension Category="windows.startupTask" Executable="stash.exe" EntryPoint="Windows.FullTrustApplication">
           <desktop:StartupTask TaskId="StashStartup" Enabled="false" DisplayName="Stash" />
         </desktop:Extension>
+        <!-- Magnet links open the New Download sheet. -->
+        <uap:Extension Category="windows.protocol">
+          <uap:Protocol Name="magnet">
+            <uap:DisplayName>Magnet link</uap:DisplayName>
+          </uap:Protocol>
+        </uap:Extension>
+        <!-- Stash appears in "Open with" for .torrent files. -->
+        <uap:Extension Category="windows.fileTypeAssociation">
+          <uap:FileTypeAssociation Name="torrent">
+            <uap:DisplayName>Torrent file</uap:DisplayName>
+            <uap:SupportedFileTypes>
+              <uap:FileType ContentType="application/x-bittorrent">.torrent</uap:FileType>
+            </uap:SupportedFileTypes>
+          </uap:FileTypeAssociation>
+        </uap:Extension>
       </Extensions>
     </Application>
   </Applications>
 
   <Capabilities>
+    <!-- downloads; BitTorrent also accepts connections from peers -->
+    <Capability Name="internetClient" />
+    <Capability Name="internetClientServer" />
+    <Capability Name="privateNetworkClientServer" />
     <rescap:Capability Name="runFullTrust" />
   </Capabilities>
 </Package>

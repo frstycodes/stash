@@ -22,7 +22,7 @@ pub struct Item {
 /// Downloads that are still in progress (browser temp files).
 pub fn is_partial(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    [".crdownload", ".part", ".partial", ".tmp", ".download", ".opdownload"]
+    [".crdownload", ".stashpart", ".part", ".partial", ".tmp", ".download", ".opdownload"]
         .iter()
         .any(|ext| lower.ends_with(ext))
 }
@@ -71,7 +71,7 @@ pub fn list(dir: &Path, sort: Sort) -> Vec<Item> {
     items
 }
 
-fn unique_dest(dir: &Path, name: &str) -> PathBuf {
+pub fn unique_dest(dir: &Path, name: &str) -> PathBuf {
     let path = Path::new(name);
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();

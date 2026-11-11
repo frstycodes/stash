@@ -385,7 +385,181 @@ pub fn already_running() -> bool {
     unsafe {
         let handle = CreateMutexW(None, true, w!("Local\\StashDownloadsStack"));
         let exists = GetLastError() == ERROR_ALREADY_EXISTS;
-        std::mem::forget(handle); // held for the life of the process
+        match handle {
+            // not ours: let it go, so asking again (after the other copy exits) can succeed
+            Ok(h) if exists => {
+                let _ = windows::Win32::Foundation::CloseHandle(h);
+            }
+            h => std::mem::forget(h), // held for the life of the process
+        }
         exists
+    }
+}
+
+// ---------- download manager helpers ----------
+
+/// The shell's icon for a file type (by name), for files that don't exist yet. Folders
+/// when `folder`.
+pub fn type_icon(name: &str, folder: bool, size: i32) -> Option<Pixels> {
+    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
+    use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
+    use windows::Win32::UI::Shell::{SHFILEINFOW, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SHGetImageList, SHIL_EXTRALARGE, SHIL_JUMBO};
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICONINFO};
+    unsafe {
+        let n = wide(if folder { "folder" } else { name });
+        let mut info = SHFILEINFOW::default();
+        let attrs = if folder { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL };
+        if SHGetFileInfoW(PCWSTR(n.as_ptr()), attrs, Some(&mut info), size_of::<SHFILEINFOW>() as u32, SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES) == 0 {
+            return None;
+        }
+        let list: IImageList = SHGetImageList(if size > 48 { SHIL_JUMBO } else { SHIL_EXTRALARGE } as i32).ok()?;
+        let icon = list.GetIcon(info.iIcon, ILD_TRANSPARENT.0).ok()?;
+        let mut ii = ICONINFO::default();
+        let ok = GetIconInfo(icon, &mut ii).is_ok();
+        let _ = DestroyIcon(icon);
+        if !ok {
+            return None;
+        }
+        let px = bitmap_pixels(ii.hbmColor);
+        let _ = DeleteObject(HGDIOBJ(ii.hbmColor.0));
+        let _ = DeleteObject(HGDIOBJ(ii.hbmMask.0));
+        // The jumbo list draws types without a big icon as a 48px icon in the corner.
+        px.map(|p| crop_small(p))
+    }
+}
+
+fn crop_small(px: Pixels) -> Pixels {
+    let (w, h) = (px.width as usize, px.height as usize);
+    if w <= 64 {
+        return px;
+    }
+    let used = |x: usize, y: usize| px.bgra[(y * w + x) * 4 + 3] != 0;
+    let beyond = (0..h).any(|y| (64..w).any(|x| used(x, y))) || (64..h).any(|y| (0..w).any(|x| used(x, y)));
+    if beyond {
+        return px;
+    }
+    let mut out = Vec::with_capacity(48 * 48 * 4);
+    for y in 0..48 {
+        out.extend_from_slice(&px.bgra[(y * w) * 4..(y * w + 48) * 4]);
+    }
+    Pixels { width: 48, height: 48, bgra: out }
+}
+
+pub fn clipboard_text() -> Option<String> {
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    unsafe {
+        OpenClipboard(None).ok()?;
+        let text = (|| {
+            let h = GetClipboardData(13 /* CF_UNICODETEXT */).ok()?;
+            let g = HGLOBAL(h.0);
+            let p = GlobalLock(g) as *const u16;
+            if p.is_null() {
+                return None;
+            }
+            let mut n = 0;
+            while *p.add(n) != 0 {
+                n += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+            let _ = GlobalUnlock(g);
+            Some(s)
+        })();
+        let _ = CloseClipboard();
+        text
+    }
+}
+
+pub fn set_clipboard_text(text: &str) {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+    let w: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return;
+        }
+        let _ = EmptyClipboard();
+        if let Ok(g) = GlobalAlloc(GMEM_MOVEABLE, w.len() * 2) {
+            let p = GlobalLock(g) as *mut u16;
+            if !p.is_null() {
+                std::ptr::copy_nonoverlapping(w.as_ptr(), p, w.len());
+                let _ = GlobalUnlock(g);
+                let _ = SetClipboardData(13, Some(HANDLE(g.0)));
+            }
+        }
+        let _ = CloseClipboard();
+    }
+}
+
+/// A file picker for .torrent files.
+pub fn pick_torrent() -> Option<PathBuf> {
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH};
+    unsafe {
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let filters = [COMDLG_FILTERSPEC { pszName: w!("Torrent files"), pszSpec: w!("*.torrent") }];
+        let _ = dialog.SetFileTypes(&filters);
+        let _ = dialog.SetTitle(w!("Open a torrent file"));
+        dialog.Show(None).ok()?;
+        let name = dialog.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = PathBuf::from(name.to_string().unwrap_or_default());
+        CoTaskMemFree(Some(name.0 as *const c_void));
+        (!path.as_os_str().is_empty()).then_some(path)
+    }
+}
+
+// ---------- magnet links and .torrent files ----------
+
+const MAGNET_KEY: &str = r"Software\Classes\magnet";
+const TORRENT_PROGID: &str = r"Software\Classes\Stash.Torrent";
+
+/// Whether magnet links open in Stash (registered for this user).
+pub fn handles_magnets() -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    windows_registry::CURRENT_USER
+        .open(format!(r"{MAGNET_KEY}\shell\open\command"))
+        .and_then(|k| k.get_string(""))
+        .is_ok_and(|cmd| cmd.to_lowercase().contains(&exe.display().to_string().to_lowercase()))
+}
+
+pub fn set_handles_magnets(on: bool) {
+    let reg = windows_registry::CURRENT_USER;
+    let Ok(exe) = std::env::current_exe() else { return };
+    let open = format!("\"{}\" \"%1\"", exe.display());
+    if on {
+        if let Ok(k) = reg.create(MAGNET_KEY) {
+            let _ = k.set_string("", "URL:Magnet link");
+            let _ = k.set_string("URL Protocol", "");
+        }
+        if let Ok(k) = reg.create(format!(r"{MAGNET_KEY}\DefaultIcon")) {
+            let _ = k.set_string("", format!("\"{}\",0", exe.display()));
+        }
+        if let Ok(k) = reg.create(format!(r"{MAGNET_KEY}\shell\open\command")) {
+            let _ = k.set_string("", &open);
+        }
+        if let Ok(k) = reg.create(TORRENT_PROGID) {
+            let _ = k.set_string("", "Torrent file");
+        }
+        if let Ok(k) = reg.create(format!(r"{TORRENT_PROGID}\shell\open\command")) {
+            let _ = k.set_string("", &open);
+        }
+        if let Ok(k) = reg.create(r"Software\Classes\.torrent\OpenWithProgids") {
+            let _ = k.set_string("Stash.Torrent", "");
+        }
+        if let Ok(k) = reg.create(r"Software\Classes\.torrent") {
+            if k.get_string("").is_err() {
+                let _ = k.set_string("", "Stash.Torrent");
+            }
+        }
+    } else {
+        let _ = reg.remove_tree(MAGNET_KEY);
+        let _ = reg.remove_tree(TORRENT_PROGID);
+    }
+    unsafe {
+        use windows::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
     }
 }

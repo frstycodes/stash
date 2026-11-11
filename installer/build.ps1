@@ -18,6 +18,9 @@ try {
     $ErrorActionPreference = 'Continue'
     cargo build --release 2>&1 | ForEach-Object { "$_" }
     if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
+    # the browser extensions ship inside the installer (Settings > Browsers opens them)
+    & "$root\browser\build.ps1"
+    if (-not $?) { throw 'browser extensions failed to build' }
     New-Item -ItemType Directory -Force "$root\dist" | Out-Null
     & $MakeNsis /V2 "/DVERSION=$version" "$root\installer\stash.nsi"
     if ($LASTEXITCODE -ne 0) { throw 'makensis failed' }

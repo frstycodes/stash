@@ -5,6 +5,8 @@ use tray_icon::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuI
 use crate::settings::{Corner, Display, IconSize, Settings, Sort};
 
 pub mod ids {
+    pub const DOWNLOADS: &str = "downloads";
+    pub const NEW_DOWNLOAD: &str = "new-download";
     pub const OPEN_FOLDER: &str = "open-folder";
     pub const LOGIN: &str = "login";
     pub const QUIT: &str = "quit";
@@ -23,7 +25,8 @@ fn radio(id: String, label: &str, checked: bool) -> CheckMenuItem {
 
 /// `folders` are the watched folders' names in order (Downloads first); `current`
 /// indexes the one on show.
-pub fn stack_menu(s: &Settings, start_at_login: bool, folders: &[String], current: usize) -> Menu {
+/// `update` is where Stash's own update stands (None: this copy doesn't update itself).
+pub fn stack_menu(s: &Settings, start_at_login: bool, folders: &[String], current: usize, update: Option<&crate::update::Status>) -> Menu {
     let folder_items: Vec<CheckMenuItem> = folders
         .iter()
         .enumerate()
@@ -36,7 +39,7 @@ pub fn stack_menu(s: &Settings, start_at_login: bool, folders: &[String], curren
     let mut folder_refs: Vec<&dyn IsMenuItem> = folder_items.iter().map(|m| m as &dyn IsMenuItem).collect();
     folder_refs.extend([&separator as &dyn IsMenuItem, &add, &remove]);
     let folders_menu = Submenu::with_items("Folders", true, &folder_refs).expect("menu");
-    let open_label = format!("Open \"{}\"", folders.get(current).map_or("Downloads", |n| n.as_str()));
+    let open_label = format!("Open \"{}\" in Explorer", folders.get(current).map_or("Downloads", |n| n.as_str()));
 
     let sort = Submenu::with_items(
         "Sort By",
@@ -86,8 +89,27 @@ pub fn stack_menu(s: &Settings, start_at_login: bool, folders: &[String], curren
     )
     .expect("menu");
 
-    Menu::with_items(&[
-        &MenuItem::with_id(ids::OPEN_FOLDER, open_label, true, None) as &dyn IsMenuItem,
+    use crate::update::Status;
+    let menu = Menu::new();
+    // an update on its way or ready goes first; otherwise "Check for Updates" sits above Quit
+    let busy = match update {
+        Some(Status::Ready { version, .. }) => Some(MenuItem::with_id("update:apply", format!("Restart to Update to {version}"), true, None)),
+        Some(Status::Downloading(v)) => Some(MenuItem::with_id("noop", format!("Downloading Stash {v}…"), false, None)),
+        _ => None,
+    };
+    if let Some(item) = &busy {
+        let _ = menu.append_items(&[item as &dyn IsMenuItem, &PredefinedMenuItem::separator()]);
+    }
+    let check = match update {
+        Some(Status::Checking) => Some(MenuItem::with_id("noop", "Checking for Updates…", false, None)),
+        Some(Status::Idle | Status::UpToDate | Status::Failed(_)) => Some(MenuItem::with_id("update:check", "Check for Updates", true, None)),
+        _ => None,
+    };
+    let _ = menu.append_items(&[
+        &MenuItem::with_id(ids::DOWNLOADS, "Open Stash", true, None) as &dyn IsMenuItem,
+        &MenuItem::with_id(ids::NEW_DOWNLOAD, "New Download…", true, None),
+        &PredefinedMenuItem::separator(),
+        &MenuItem::with_id(ids::OPEN_FOLDER, open_label, true, None),
         &folders_menu,
         &PredefinedMenuItem::separator(),
         &sort,
@@ -97,7 +119,22 @@ pub fn stack_menu(s: &Settings, start_at_login: bool, folders: &[String], curren
         &corner,
         &PredefinedMenuItem::separator(),
         &CheckMenuItem::with_id(ids::LOGIN, "Start at Login", true, start_at_login, None),
-        &MenuItem::with_id(ids::QUIT, "Quit", true, None),
+    ]);
+    if let Some(item) = &check {
+        let _ = menu.append(item);
+    }
+    let _ = menu.append(&MenuItem::with_id(ids::QUIT, "Quit", true, None));
+    menu
+}
+
+/// A download that's still in the stack: pause or resume it, or cancel it.
+pub fn job_menu(id: u64, paused: bool) -> Menu {
+    let toggle = if paused { ("resume", "Resume") } else { ("pause", "Pause") };
+    Menu::with_items(&[
+        &MenuItem::with_id(format!("dl:{}:{id}", toggle.0), toggle.1, true, None) as &dyn IsMenuItem,
+        &MenuItem::with_id(ids::DOWNLOADS, "Open Stash", true, None),
+        &PredefinedMenuItem::separator(),
+        &MenuItem::with_id(format!("dl:delete:{id}"), "Cancel Download", true, None),
     ])
     .expect("menu")
 }

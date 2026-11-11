@@ -2,7 +2,7 @@
 name = "stash"
 version = "0.2.1"
 edition = "2024"
-description = "A macOS-style Downloads stack for the Windows desktop (Windows Composition)"
+description = "A download manager (HTTP and BitTorrent) and macOS-style Downloads stack for Windows"
 authors = ["Sandesh Pandey"]
 license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/frstycodes/stash"
@@ -19,6 +19,18 @@ serde_json = "1"
 notify = "8"
 tray-icon = "0.21"
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Download engine: one small tokio runtime off the UI thread runs HTTP and torrents.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Schannel (the Windows TLS stack) instead of rustls/aws-lc: smaller, no C toolchain.
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "stream", "http2", "charset", "system-proxy"] }
+librqbit = { version = "9.1", default-features = false }
+# librqbit needs a SHA-1 backend; crypto-hash uses Windows CryptoAPI.
+librqbit-core = { version = "9.1", default-features = false, features = ["sha1-crypto-hash"] }
+sha1w = { package = "librqbit-sha1-wrapper", version = "9.1", default-features = false, features = ["sha1-crypto-hash"] }
+percent-encoding = "2"
+# checks downloaded updates against the release's SHA256SUMS.txt
+sha2 = "0.10"
 
 [dependencies.windows]
 version = "0.61"
@@ -47,6 +59,7 @@ features = [
     "Win32_Storage_Packaging_Appx",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
@@ -54,6 +67,7 @@ features = [
     "Win32_System_Threading",
     "Win32_System_WinRT",
     "Win32_System_WinRT_Composition",
+    "Win32_UI_Controls",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",

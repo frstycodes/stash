@@ -57,6 +57,40 @@ pub struct Settings {
     pub folders: Vec<PathBuf>,
     /// The folder on show; None = Downloads.
     pub current: Option<PathBuf>,
+    pub downloads: DlSettings,
+    /// Download new versions in the background (GitHub builds; the Store updates its own).
+    pub auto_update: bool,
+}
+
+/// The download manager's settings.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DlSettings {
+    pub max_active: usize,
+    pub connections: usize,
+    /// KB/s; 0 = unlimited
+    pub limit_kbps: u64,
+    pub seed: bool,
+    /// Where new downloads go; None = Downloads.
+    pub folder: Option<PathBuf>,
+    /// The downloads window's size, in logical pixels.
+    pub window: Option<(i32, i32)>,
+    /// Speeds in bits (Mbps) instead of bytes (MB/s).
+    pub bits: bool,
+    /// Sizes in binary units (MiB, 1024) instead of decimal (MB, 1000).
+    pub binary: bool,
+}
+
+impl Default for DlSettings {
+    fn default() -> Self {
+        Self { max_active: 3, connections: 8, limit_kbps: 0, seed: false, folder: None, window: None, bits: false, binary: false }
+    }
+}
+
+impl DlSettings {
+    pub fn config(&self) -> crate::dl::Config {
+        crate::dl::Config { max_active: self.max_active, connections: self.connections, limit_bps: self.limit_kbps * 1024, seed: self.seed }
+    }
 }
 
 impl Default for Settings {
@@ -69,6 +103,8 @@ impl Default for Settings {
             icon_size: IconSize::Medium,
             folders: Vec::new(),
             current: None,
+            downloads: DlSettings::default(),
+            auto_update: true,
         }
     }
 }

@@ -22,7 +22,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+    DWRITE_FACTORY_TYPE_SHARED,
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_METRICS, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
     DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteTextLayout,
 };
@@ -34,7 +34,7 @@ use windows::Win32::System::WinRT::Composition::{
 use windows::Win32::System::WinRT::{
     CreateDispatcherQueueController, DQTAT_COM_STA, DQTYPE_THREAD_CURRENT, DispatcherQueueOptions,
 };
-use windows::core::{Interface, Result, w};
+use windows::core::{Interface, Result};
 use windows_numerics::{Matrix3x2, Vector2};
 
 /// A decoded thumbnail: premultiplied BGRA, top-down rows.
@@ -45,10 +45,11 @@ pub struct Pixels {
     pub bgra: Vec<u8>,
 }
 
+#[derive(Clone)]
 pub struct Gfx {
     pub compositor: Compositor,
     device: CompositionGraphicsDevice,
-    dwrite: IDWriteFactory,
+    pub dwrite: IDWriteFactory,
     _d3d: ID3D11Device,
     _queue: DispatcherQueueController,
 }
@@ -173,15 +174,8 @@ impl Gfx {
     /// Text laid out on one line, trimmed with an ellipsis at `max_w`.
     pub fn text(&self, text: &str, size: f32, max_w: f32) -> Result<(IDWriteTextLayout, f32, f32)> {
         unsafe {
-            let format = self.dwrite.CreateTextFormat(
-                w!("Segoe UI"),
-                None,
-                DWRITE_FONT_WEIGHT_NORMAL,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                size,
-                w!("en-us"),
-            )?;
+            // the stack's labels use DM Sans too
+            let format = crate::paint::format(&self.dwrite, size, DWRITE_FONT_WEIGHT_NORMAL)?;
             format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             let sign = self.dwrite.CreateEllipsisTrimmingSign(&format)?;
             format.SetTrimming(&DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 }, &sign)?;
@@ -197,7 +191,7 @@ impl Gfx {
     pub fn label(&self, text: &str, k: f32, hover: bool) -> Result<(CompositionDrawingSurface, f32, f32)> {
         let pad = 10.0 * k;
         let h = 24.0 * k;
-        let (layout, tw, th) = self.text(text, 12.0 * k, 220.0 * k - pad * 2.0)?;
+        let (layout, tw, th) = self.text(text, 12.0 * k, 260.0 * k - pad * 2.0)?;
         let w = (tw + pad * 2.0).ceil();
         let surface = self.surface(w, h, |dc| unsafe {
             let rect = D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: 0.5, top: 0.5, right: w - 0.5, bottom: h - 0.5 }, radiusX: 7.0 * k, radiusY: 7.0 * k };
@@ -269,5 +263,64 @@ impl Gfx {
                 dc.DrawLine(p(1.0, -1.0), p(1.0, 0.2), &a, stroke, None);
             }
         })
+    }
+
+    /// A rounded bar of `color` that can be stretched to any width with crisp ends
+    /// (a nine-grid over a small pill), for progress bars whose Size animates.
+    pub fn pill_brush(&self, color: D2D1_COLOR_F, height: f32) -> Result<windows::UI::Composition::CompositionNineGridBrush> {
+        let r = height / 2.0;
+        let surface = self.surface(height * 2.0, height, |dc| unsafe {
+            if let Ok(b) = dc.CreateSolidColorBrush(&color, None) {
+                let rect = D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: 0.0, top: 0.0, right: height * 2.0, bottom: height }, radiusX: r, radiusY: r };
+                dc.FillRoundedRectangle(&rect, &b);
+            }
+        })?;
+        let sb = self.compositor.CreateSurfaceBrushWithSurface(&surface)?;
+        sb.SetStretch(windows::UI::Composition::CompositionStretch::Fill)?;
+        let nine = self.compositor.CreateNineGridBrush()?;
+        nine.SetSource(&sb)?;
+        nine.SetInsetsWithValues(r, 0.0, r, 0.0)?;
+        Ok(nine)
+    }
+
+    /// A squircle exactly `height` tall (logical px) with corner `radius`, the same shape
+    /// `P::round` draws, that stretches only sideways, so a sliding selection or a switch
+    /// part keeps true corners while its width animates. Use it for anything nested in a
+    /// painted container so the two stay concentric (inner radius = outer - padding).
+    pub fn shape_brush(&self, color: D2D1_COLOR_F, height: f32, radius: f32, k: f32) -> Result<windows::UI::Composition::CompositionNineGridBrush> {
+        let extent = (radius * 1.6).min(height / 2.0); // the corner P::round really draws
+        let width = (extent * 2.0 + 4.0).ceil();
+        let dw = self.dwrite.clone();
+        let surface = self.surface(width * k, height * k, |dc| {
+            let p = crate::paint::P { dc, dw: &dw, k };
+            p.round(0.0, 0.0, width, height, radius, color);
+        })?;
+        let sb = self.compositor.CreateSurfaceBrushWithSurface(&surface)?;
+        sb.SetStretch(windows::UI::Composition::CompositionStretch::Fill)?;
+        let nine = self.compositor.CreateNineGridBrush()?;
+        nine.SetSource(&sb)?;
+        nine.SetInsetsWithValues(extent * k, 0.0, extent * k, 0.0)?;
+        Ok(nine)
+    }
+
+    /// The small dark pill on the stack that shows the download speed.
+    pub fn speed_pill(&self, text: &str, k: f32) -> Result<(CompositionDrawingSurface, f32, f32)> {
+        let pad = 6.0 * k;
+        let h = (16.0 * k).round();
+        let (layout, tw, th) = self.text(text, 10.0 * k, 120.0 * k)?;
+        let w = (tw + pad * 2.0).ceil();
+        let surface = self.surface(w, h, |dc| unsafe {
+            let rect = D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: 0.5, top: 0.5, right: w - 0.5, bottom: h - 0.5 }, radiusX: h / 2.0, radiusY: h / 2.0 };
+            if let (Ok(f), Ok(e), Ok(t)) = (
+                dc.CreateSolidColorBrush(&color(28, 28, 30, 0.94), None),
+                dc.CreateSolidColorBrush(&color(255, 255, 255, 0.14), None),
+                dc.CreateSolidColorBrush(&color(255, 255, 255, 1.0), None),
+            ) {
+                dc.FillRoundedRectangle(&rect, &f);
+                dc.DrawRoundedRectangle(&rect, &e, 1.0, None);
+                dc.DrawTextLayout(Vector2 { X: pad, Y: (h - th) / 2.0 }, &layout, &t, Default::default());
+            }
+        })?;
+        Ok((surface, w, h))
     }
 }

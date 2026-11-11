@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Stash Downloads",
+  "short_name": "Stash",
+  "version": "0.3.0",
+  "description": "Send your downloads to Stash: faster multi-connection downloads, pause and resume, and torrents.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwAVph8wS8YXQVeHqpw0BHAGaqbKwAt7Sq+cTJTVmfYtc537ugALA93BPEVWdbSWNHS9xMLhdRjqEYVaCzzUkJ37OZ3GEHjxSnGJjJ8yaldpswzmOpf/B5FOs8H2MIjI/DaYh7M34W/mmxF3hN1gcOfvkVuNRCzTglhfPbfvt80Kkx+04zW/+HsJYd8ZepJmxjFn1HFyx8uUNJ+jBwjYmmavVq6L85FBvvBkbDU2qwgXutfxOBSuPFSIIfp/X5I7fa9ohbEA4tF/cNup2Ok2LMdeY0rMpb2gqsk9k1Vt0n+QaFodl0W1BS65l8PiUrFBwnmZvwgaEFt2qa58P7brJ2wIDAQAB",
+  "permissions": ["downloads", "nativeMessaging", "cookies", "contextMenus", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_title": "Stash",
+    "default_popup": "popup.html",
+    "default_icon": { "16": "icons/icon16.png", "32": "icons/icon32.png" }
+  },
+  "icons": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+}

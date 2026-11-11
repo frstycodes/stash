@@ -1,0 +1,74 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    --gold: #f9c74f; --orange: #f27d2e; --rose: #d1384b; --plum: #6a2c70;
+    --bg: #1f1b23; --card: #2a2530; --text: #f4f1f6; --dim: #a59fad;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; width: 300px; padding: 16px;
+    font: 13px/1.4 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+    color: var(--text); background: var(--bg);
+  }
+  header { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .logo { width: 34px; height: 34px; position: relative; }
+  .logo i {
+    position: absolute; left: 3px; width: 24px; height: 7px; border-radius: 3px;
+    transform-origin: 50% 50%; animation: bob 2.6s ease-in-out infinite;
+  }
+  .logo i:nth-child(1) { background: var(--gold);   top: 4px;  left: 1px; transform: rotate(-44deg); animation-delay: .66s; }
+  .logo i:nth-child(2) { background: var(--orange); top: 11px; left: 6px; transform: rotate(-29deg); animation-delay: .44s; }
+  .logo i:nth-child(3) { background: var(--rose);   top: 18px; left: 9px; transform: rotate(-15deg); animation-delay: .22s; }
+  .logo i:nth-child(4) { background: var(--plum);   top: 24px; left: 10px; }
+  @keyframes bob { 50% { translate: 1px -2px; } }
+  h1 { margin: 0; font-size: 16px; font-weight: 600; }
+  .status { font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 6px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); }
+  .dot.on { background: #30d158; box-shadow: 0 0 8px #30d15899; }
+  .dot.off { background: var(--rose); }
+  .card {
+    background: var(--card); border-radius: 16px; padding: 12px 14px;
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    border: 1px solid #ffffff12;
+  }
+  .card small { display: block; color: var(--dim); font-size: 11.5px; }
+  /* a squircle-ish toggle */
+  .toggle { position: relative; width: 44px; height: 26px; flex: none; }
+  .toggle input { appearance: none; margin: 0; width: 100%; height: 100%; border-radius: 10px; background: #ffffff1c; cursor: pointer; transition: background .25s; }
+  .toggle input:checked { background: var(--orange); }
+  .toggle span {
+    position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 8px; background: white;
+    pointer-events: none; transition: transform .25s cubic-bezier(.3, 1.18, .6, 1); box-shadow: 0 2px 6px #0005;
+  }
+  .toggle input:checked + span { transform: translateX(18px); }
+  button {
+    margin-top: 12px; width: 100%; height: 38px; border: 0; border-radius: 13px; cursor: pointer;
+    font: 600 13px "Segoe UI", system-ui, sans-serif; color: white; background: var(--orange);
+    transition: transform .16s cubic-bezier(.23, 1, .32, 1), background .15s;
+  }
+  button:hover { background: #f8955a; }
+  button:active { transform: scale(.97); }
+  .hint { margin: 10px 2px 0; color: var(--dim); font-size: 11.5px; }
+  .hint a { color: var(--orange); }
+</style>
+</head>
+<body>
+  <header>
+    <div class="logo"><i></i><i></i><i></i><i></i></div>
+    <div>
+      <h1>Stash</h1>
+      <div class="status"><span class="dot" id="dot"></span><span id="status">Looking for Stash…</span></div>
+    </div>
+  </header>
+  <label class="card">
+    <div>Send downloads to Stash<small>Your browser hands every download over.</small></div>
+    <span class="toggle"><input type="checkbox" id="enabled"><span></span></span>
+  </label>
+  <button id="open">Open Stash</button>
+  <p class="hint" id="hint" hidden>Stash isn't installed or isn't connected. <a href="https://github.com/frstycodes/stash/releases/latest" target="_blank">Get Stash</a>, then run it once.</p>
+  <script src="popup.js"></script>
+</body>
+</html>

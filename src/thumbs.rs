@@ -26,7 +26,12 @@ pub fn spawn_worker(deliver: impl Fn(Done) + Send + 'static) -> Sender<Job> {
         .spawn(move || {
             crate::shell::init_com_thread();
             while let Ok(job) = rx.recv() {
-                let pixels = crate::shell::thumbnail(&job.path, job.size);
+                // A download still in progress has no file yet: show its type's icon.
+                let pixels = crate::shell::thumbnail(&job.path, job.size).or_else(|| {
+                    let name = job.path.file_name()?.to_string_lossy().into_owned();
+                    let folder = job.path.extension().is_none();
+                    (!job.path.exists()).then(|| crate::shell::type_icon(&name, folder, job.size)).flatten()
+                });
                 deliver(Done { path: job.path, modified: job.modified, pixels });
             }
         })

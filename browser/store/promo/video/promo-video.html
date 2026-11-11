@@ -1,0 +1,768 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Stash promo</title>
+<!-- A 32 s, 1920x1080 motion piece for Stash, cut to music.wav (128 BPM).
+     Fully deterministic: render(t) draws the frame at t seconds; render.js steps it frame by frame.
+     Open with #play to watch it in a browser (no audio sync), or #t=12.3 to inspect one frame. -->
+<style>
+  @font-face { font-family: "DM Sans"; src: url("../../../../assets/fonts/DMSans.ttf") format("truetype"); font-weight: 100 1000; }
+  :root { --orange: #f27d2e; --gold: #f9c74f; --rose: #d1384b; --plum: #6a2c70; --ink: #141016; --text: #f6f1f3; --dim: #b3a9b6; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; width: 1920px; height: 1080px; overflow: hidden; background: #000; }
+  body { font-family: "DM Sans", sans-serif; color: var(--text); -webkit-font-smoothing: antialiased; }
+  #stage { position: absolute; inset: 0; overflow: hidden; background: var(--ink); }
+  #cam { position: absolute; inset: 0; transform-origin: 50% 50%; }
+  .abs { position: absolute; }
+  .layer { position: absolute; inset: 0; }
+  .center { left: 50%; top: 50%; }
+  svg.i { width: 1em; height: 1em; display: block; }
+
+  /* backgrounds */
+  #bgDark { background: radial-gradient(1200px 800px at 30% 20%, #2a1d33 0%, #141016 60%); }
+  #glow { width: 1400px; height: 1400px; left: 260px; top: -160px; border-radius: 50%;
+    background: radial-gradient(closest-side, #f27d2e55, #d1384b22 55%, transparent 72%); filter: blur(30px); }
+  #bgDusk { background:
+      radial-gradient(120% 90% at 85% 110%, #c08a74 0%, #c08a7400 60%),
+      linear-gradient(160deg, #3d3350 0%, #5d4a66 38%, #8a6670 70%, #a97c72 100%); }
+  #bgOrange { background: var(--orange); }
+  #stripes { inset: -400px; }
+  #stripes i { position: absolute; height: 54px; width: 3200px; border-radius: 27px; left: -200px; }
+
+  /* the logo: four capsules in the icon's 1024 frame */
+  .logo { position: absolute; width: 1024px; height: 1024px; transform-origin: 0 0; }
+  .logo i { position: absolute; width: 544.8px; height: 154px; border-radius: 43.1px; left: -272.4px; top: -77px; transform-origin: 50% 50%; }
+
+  /* type */
+  .word { position: absolute; white-space: nowrap; font-weight: 700; letter-spacing: -0.045em; line-height: 1; will-change: transform, opacity, filter; }
+  .cap { font-weight: 650; letter-spacing: -0.03em; }
+
+  /* the browser */
+  .browser { position: absolute; width: 1120px; height: 690px; background: #f7f5f7; border-radius: 18px; overflow: hidden; color: #1f1d22;
+    box-shadow: 0 60px 120px #12081899, 0 0 0 1px #00000040; }
+  .tabs { height: 52px; background: #e3dfe6; display: flex; align-items: flex-end; padding: 0 14px; gap: 6px; }
+  .tabs .t { height: 42px; padding: 0 18px; display: flex; align-items: center; gap: 10px; font-size: 16px; color: #4b4650; border-radius: 12px 12px 0 0; }
+  .tabs .t.on { background: #f7f5f7; color: #1f1d22; }
+  .fav { width: 18px; height: 18px; border-radius: 5px; }
+  .omni { height: 58px; display: flex; align-items: center; gap: 12px; padding: 0 16px; border-bottom: 1px solid #0000000f; }
+  .omni .url { flex: 1; height: 38px; border-radius: 19px; background: #ebe7ee; display: flex; align-items: center; padding: 0 18px; font-size: 16px; color: #4b4650; }
+  .omni .url b { color: #1f1d22; font-weight: 500; }
+  .page { padding: 46px 60px; }
+  .page h3 { margin: 0 0 8px; font-size: 36px; letter-spacing: -0.02em; }
+  .page .lede { margin: 0 0 30px; color: #6a6470; font-size: 18px; }
+  .dl { display: flex; align-items: center; gap: 18px; padding: 18px 22px; border-radius: 18px; background: #fff; box-shadow: 0 0 0 1px #0000000f; margin-bottom: 14px; }
+  .dl .ic { width: 48px; height: 48px; border-radius: 14px; background: #f1edf3; display: grid; place-items: center; font-size: 24px; color: #4b4650; }
+  .dl .n { font-weight: 600; font-size: 18px; } .dl .s { color: #7a7480; font-size: 15px; }
+  .dl .a { margin-left: auto; color: #3d63dd; font-weight: 600; font-size: 17px; text-decoration: underline; text-underline-offset: 4px; padding: 3px 8px; border-radius: 8px; }
+  .ctx { position: absolute; width: 330px; padding: 6px; border-radius: 12px; background: #fbfafcf5; box-shadow: 0 20px 50px #2a183055, 0 0 0 1px #00000018; color: #1f1d22; font-size: 16.5px; transform-origin: 0 0; }
+  .ctx div { height: 40px; padding: 0 12px; display: flex; align-items: center; gap: 12px; border-radius: 7px; }
+  .ctx hr { border: 0; height: 1px; background: #0000000f; margin: 5px 2px; }
+  .ctx .sp { width: 20px; height: 20px; position: relative; flex: none; } .ctx .stash svg { width: 20px; height: 20px; }
+  .ctx .k { margin-left: auto; color: #8a8490; font-size: 14px; }
+  #cursor { width: 34px; height: 34px; transform-origin: 4px 3px; filter: drop-shadow(0 3px 6px #0006); }
+  .ripple { width: 20px; height: 20px; border-radius: 50%; border: 3px solid var(--orange); }
+  .chip { display: flex; align-items: center; gap: 12px; height: 60px; padding: 0 24px 0 12px; border-radius: 30px; background: #221d26; color: #fff; font-size: 20px; font-weight: 600; box-shadow: 0 16px 40px #0007, 0 0 0 1px #ffffff1a; white-space: nowrap; }
+  .chip .ic { width: 40px; height: 40px; border-radius: 20px; background: var(--orange); display: grid; place-items: center; font-size: 22px; }
+
+  /* the Stash window */
+  .win { position: absolute; width: 1240px; height: 760px; display: grid; grid-template-columns: 250px 1fr; background: #232125; border-radius: 16px; overflow: hidden;
+    box-shadow: 0 60px 130px #0a050dcc, 0 0 0 1px #00000066, inset 0 0 0 1px #ffffff14; transform-origin: 0 0; }
+  .side { padding: 24px 12px; display: flex; flex-direction: column; gap: 3px; }
+  .wbrand { display: flex; align-items: center; gap: 12px; padding: 0 12px 22px; font-weight: 600; font-size: 20px; }
+  .wbrand .mini { width: 30px; height: 30px; position: relative; }
+  .nav { display: flex; align-items: center; gap: 13px; height: 42px; padding: 0 12px; border-radius: 16px; color: var(--dim); font-size: 16.5px; }
+  .nav.on { background: #ffffff13; color: var(--text); font-weight: 500; }
+  .nav .i { font-size: 21px; } .nav .c { margin-left: auto; color: #6f6a74; font-size: 15px; }
+  .wmain { position: relative; padding: 24px 22px; }
+  .whead { display: flex; align-items: center; padding: 0 10px 14px; }
+  .whead h2 { margin: 0; font-size: 26px; font-weight: 600; letter-spacing: -0.015em; }
+  .grp { padding: 14px 14px 8px; font-size: 15px; font-weight: 600; }
+  .row { display: grid; grid-template-columns: 54px 1fr; gap: 18px; align-items: start; padding: 14px; border-radius: 20px; margin-bottom: 2px; overflow: hidden; }
+  .row.hl { background: #ffffff0b; }
+  .tile { width: 54px; height: 54px; border-radius: 17px; background: #ffffff0d; display: grid; place-items: center; font-size: 27px; position: relative; }
+  .l1 { display: flex; align-items: baseline; gap: 12px; font-size: 18px; }
+  .l1 .n { font-weight: 500; } .l1 .spd { margin-left: auto; color: #ffb27d; font-size: 15.5px; font-variant-numeric: tabular-nums; } .l1 .pct { font-weight: 700; font-size: 16px; font-variant-numeric: tabular-nums; min-width: 46px; text-align: right; }
+  .bar { height: 5px; margin: 10px 0 8px; display: flex; gap: 5px; }
+  .bar i { display: block; height: 100%; background: var(--orange); border-radius: 5px; flex: none; }
+  .bar b { display: block; height: 100%; flex: 1; min-width: 5px; background: #ffffff17; border-radius: 5px; }
+  .meta { display: flex; color: var(--dim); font-size: 15px; font-variant-numeric: tabular-nums; }
+  .meta .r { margin-left: auto; }
+  .lanes { display: grid; gap: 7px; margin: 12px 0 6px; overflow: hidden; }
+  .lane { display: grid; grid-template-columns: 22px 1fr 54px; gap: 10px; align-items: center; font-size: 12.5px; color: #8f8794; font-variant-numeric: tabular-nums; }
+  .lane .bar { margin: 0; height: 6px; }
+  .done-badge { position: absolute; inset: 0; border-radius: 17px; background: #30d158; display: grid; place-items: center; color: #fff; font-size: 30px; }
+
+  /* feature cards */
+  .card { position: absolute; width: 560px; height: 640px; border-radius: 40px; corner-shape: squircle; background: #201b24; overflow: hidden; box-shadow: 0 50px 100px #0009, inset 0 0 0 1px #ffffff12; }
+  .card h4 { position: absolute; left: 44px; bottom: 92px; margin: 0; font-size: 46px; font-weight: 700; letter-spacing: -0.035em; line-height: 1.05; }
+  .card p { position: absolute; left: 44px; right: 44px; bottom: 44px; margin: 0; font-size: 21px; color: var(--dim); }
+  .peer { width: 26px; height: 26px; border-radius: 50%; background: #3a3240; box-shadow: inset 0 0 0 2px #ffffff22; }
+  .piece { width: 30px; height: 30px; border-radius: 8px; background: #ffffff10; }
+
+  /* taskbar */
+  .taskbar { position: absolute; left: 0; right: 0; height: 72px; background: #2b2430ee; box-shadow: 0 -1px 0 #ffffff14; }
+  .tb { position: absolute; top: 12px; width: 48px; height: 48px; border-radius: 10px; display: grid; place-items: center; }
+  .thumb { position: absolute; width: 130px; height: 92px; border-radius: 8px; background: #f1eef3; box-shadow: 0 10px 26px #0006, 0 0 0 5px #2a2330; overflow: hidden; }
+  .thumb::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 12px; background: var(--c); }
+  .thumb::after { content: ""; position: absolute; left: 40px; right: 10px; top: 40px; height: 36px; border-radius: 3px; background: linear-gradient(90deg, var(--c) 0 46%, transparent 46% 54%, color-mix(in srgb, var(--c) 45%, white) 54%); }
+  .thumb i { position: absolute; left: 10px; top: 22px; width: 22px; height: 60px; background: repeating-linear-gradient(#d6d1da 0 4px, transparent 4px 9px); }
+  .flbl { position: absolute; background: #1f1c22f2; color: #f6f3f7; font-size: 23px; padding: 10px 20px; border-radius: 15px; white-space: nowrap; box-shadow: 0 8px 22px #0005; }
+
+  /* pills */
+  .pill { position: absolute; height: 120px; padding: 0 54px; border-radius: 60px; display: flex; align-items: center; font-size: 66px; font-weight: 700; letter-spacing: -0.035em; white-space: nowrap; }
+
+  #flash { background: #fff; mix-blend-mode: normal; pointer-events: none; }
+  #grain { width: 1920px; height: 1080px; mix-blend-mode: overlay; opacity: .35; pointer-events: none; }
+  #vignette { background: radial-gradient(130% 100% at 50% 50%, transparent 55%, #00000073 100%); pointer-events: none; }
+  .wipe i { position: absolute; width: 3600px; height: 420px; left: -840px; }
+</style>
+</head>
+<body>
+<div id="stage">
+<div id="cam">
+  <div class="layer" id="bgDark"><div class="abs" id="glow"></div></div>
+  <div class="layer" id="bgDusk"></div>
+  <div class="layer" id="bgOrange"></div>
+  <div class="layer" id="stripes"></div>
+
+  <!-- 1 + 8: the logo -->
+  <div class="layer" id="sLogo">
+    <div class="logo" id="logo"></div>
+    <div class="word" id="wordmark" style="font-size:210px">Stash</div>
+    <div class="word cap" id="outSub" style="font-size:40px; color:var(--dim); font-weight:500; letter-spacing:-0.01em">Faster downloads, pause and resume, torrents.</div>
+    <div class="word cap" id="outCta" style="font-size:34px; font-weight:600; letter-spacing:-0.01em"></div>
+  </div>
+
+  <!-- 2: kinetic type -->
+  <div class="layer" id="sType"></div>
+
+  <!-- 3: browser -->
+  <div class="layer" id="sBrowser">
+    <div class="word cap" id="cap3a" style="font-size:88px; line-height:1.02"></div>
+    <div class="browser" id="browser">
+      <div class="tabs"><div class="t on"><span class="fav" style="background:#2f6f62"></span>Larkspur Films · Press kit</div><div class="t"><span class="fav" style="background:#5c5466"></span>New tab</div></div>
+      <div class="omni"><div class="url"><b>larkspur.film</b>/press</div><div id="extIcon" style="width:38px;height:38px;border-radius:11px;background:#f27d2e22;position:relative"></div></div>
+      <div class="page">
+        <h3>Press kit</h3>
+        <p class="lede">Trailer, stills and notes for <i>The Long Field</i>.</p>
+        <div class="dl"><span class="ic" data-i="video-play"></span><div><div class="n">Trailer, 4K master</div><div class="s">2.4 GB · ProRes 422 .mov</div></div><span class="a" id="dlLink">Download</span></div>
+        <div class="dl"><span class="ic" data-i="gallery"></span><div><div class="n">Stills and posters</div><div class="s">640 MB · 48 images .zip</div></div><span class="a">Download</span></div>
+        <div class="dl"><span class="ic" data-i="document-text"></span><div><div class="n">Press notes</div><div class="s">3.1 MB · PDF</div></div><span class="a">Download</span></div>
+      </div>
+      <div class="ctx" id="ctx">
+        <div><span class="sp"></span>Open link in new tab</div>
+        <div><span class="sp"></span>Open link in new window</div>
+        <hr>
+        <div><span class="sp"></span>Save link as…</div>
+        <div><span class="sp"></span>Copy link address</div>
+        <hr>
+        <div class="stash" id="ctxStash"><span class="sp" id="ctxLogo" style="position:relative"></span><b style="font-weight:600">Download with Stash</b></div>
+        <hr>
+        <div><span class="sp"></span>Inspect<span class="k">Ctrl+Shift+I</span></div>
+      </div>
+    </div>
+    <div class="abs ripple" id="ripple"></div>
+    <div class="abs chip" id="chip"><span class="ic" data-i="video-play"></span>Trailer 4K master.mov</div>
+    <svg class="abs" id="cursor" viewBox="0 0 24 24"><path d="M4 2.5v17.2l4.6-4.4 2.9 6.6 2.9-1.3-2.9-6.5h6.4z" fill="#fff" stroke="#1a1520" stroke-width="1.4" stroke-linejoin="round"/></svg>
+  </div>
+
+  <!-- 4: the Stash window -->
+  <div class="layer" id="sWin">
+    <div class="word cap" id="cap4a" style="font-size:80px; line-height:1.04"></div>
+    <div class="word" id="speedBig" style="font-size:150px; font-variant-numeric: tabular-nums"></div>
+    <div class="word cap" id="speedUnit" style="font-size:36px; color:var(--dim); font-weight:600; letter-spacing:-0.01em">MB/s</div>
+    <svg class="abs" id="spark" width="520" height="120" viewBox="0 0 520 120" style="width:470px"><path id="sparkPath" fill="none" stroke="#f27d2e" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <div class="win" id="win">
+      <aside class="side">
+        <div class="wbrand"><span class="mini" id="winLogo"></span>Stash</div>
+        <div class="nav on"><span data-i="layers"></span>All Downloads<span class="c">7</span></div>
+        <div class="nav"><span data-i="download"></span>Downloading<span class="c">3</span></div>
+        <div class="nav"><span data-i="tick-circle"></span>Completed<span class="c">4</span></div>
+      </aside>
+      <section class="wmain">
+        <div class="whead"><h2>All Downloads</h2></div>
+        <div class="grp">In progress</div>
+        <div class="row hl" id="row1">
+          <div class="tile" id="row1tile"><span data-i="video-play"></span><div class="done-badge" id="doneBadge"><span data-i="tick-circle"></span></div></div>
+          <div>
+            <div class="l1"><span class="n">Trailer 4K master.mov</span><span class="spd" id="r1spd"></span><span class="pct" id="r1pct"></span></div>
+            <div class="bar"><i id="r1bar"></i><b></b></div>
+            <div class="meta"><span id="r1size"></span><span class="r" id="r1conn">8 connections</span></div>
+            <div class="lanes" id="lanes"></div>
+          </div>
+        </div>
+        <div class="row">
+          <div class="tile"><span data-i="magnet"></span></div>
+          <div><div class="l1"><span class="n">ubuntu-24.04.3-desktop-amd64.iso</span><span class="spd">3.1 MB/s</span><span class="pct" id="r2pct">27%</span></div><div class="bar"><i id="r2bar" style="width:27%"></i><b></b></div><div class="meta"><span>1.65 GB of 6.10 GB</span><span class="r">41 peers</span></div></div>
+        </div>
+        <div class="row">
+          <div class="tile"><span data-i="archive"></span></div>
+          <div><div class="l1"><span class="n">blender-4.5.2-windows-x64.zip</span><span class="spd" style="color:var(--dim)">Paused</span><span class="pct">37%</span></div><div class="bar"><i style="width:37%;background:#8e8a94"></i><b></b></div><div class="meta"><span>141 MB of 383 MB</span><span class="r">Resumes where it stopped</span></div></div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- 5: feature cards -->
+  <div class="layer" id="sCards">
+    <div class="card" id="card1">
+      <div class="abs" style="left:44px; top:60px; right:44px">
+        <div style="display:flex; align-items:center; gap:18px">
+          <div id="pp" style="width:84px;height:84px;border-radius:42px;background:var(--orange);position:relative"></div>
+          <div style="flex:1"><div style="font-size:22px;font-weight:600" id="ppName">Trailer 4K master.mov</div><div style="font-size:18px;color:var(--dim);margin-top:4px" id="ppState"></div></div>
+        </div>
+        <div class="bar" style="height:10px; margin-top:34px; gap:8px"><i id="ppBar" style="border-radius:10px"></i><b style="border-radius:10px"></b></div>
+        <div style="display:flex; justify-content:space-between; color:var(--dim); font-size:18px; font-variant-numeric:tabular-nums"><span id="ppSize"></span><span id="ppPct"></span></div>
+      </div>
+      <h4>Pause it.<br>Resume it.</h4><p>Even after closing the browser or a restart.</p>
+    </div>
+    <div class="card" id="card2">
+      <div class="abs" id="net" style="left:0; top:0; width:560px; height:330px"></div>
+      <div class="abs" id="pieces" style="left:44px; top:300px; display:grid; grid-template-columns:repeat(13, 30px); gap:6px"></div>
+      <h4>Torrents and<br>magnet links.</h4><p id="peerTxt">Downloading from peers.</p>
+    </div>
+    <div class="card" id="card3">
+      <div class="abs" style="left:44px; right:44px; top:60px">
+        <div id="sign" style="height:120px; border-radius:26px; background:#2c2631; display:flex; align-items:center; gap:20px; padding:0 26px">
+          <div id="lock" style="width:64px;height:64px;position:relative"></div>
+          <div><div style="font-size:22px;font-weight:600">larkspur.film</div><div style="font-size:18px;color:var(--dim)" id="signTxt">Signed in</div></div>
+        </div>
+        <div id="flowRow" style="display:flex; align-items:center; gap:14px; margin-top:26px; font-size:18px; color:var(--dim)">
+          <span class="fpill" id="fp1" style="padding:10px 16px;border-radius:14px;background:#ffffff0d">Cookies</span>
+          <span class="fpill" id="fp2" style="padding:10px 16px;border-radius:14px;background:#ffffff0d">Page address</span>
+          <span id="fpArrow" style="color:var(--orange); font-size:26px">→</span>
+          <span id="fp3" style="width:48px;height:48px;position:relative"></span>
+        </div>
+      </div>
+      <h4>Signed-in<br>downloads work.</h4><p>Stash gets the site's cookies for that download.</p>
+    </div>
+  </div>
+
+  <!-- 6: the stack -->
+  <div class="layer" id="sStack">
+    <div class="word cap" id="cap6a" style="font-size:96px; left:110px; top:170px"></div>
+    <div class="word cap" id="cap6b" style="font-size:96px; left:110px; top:280px"></div>
+    <div class="layer" id="fan"></div>
+    <div class="taskbar" id="taskbar">
+      <div class="tb" style="left:880px"><span style="display:grid;grid-template-columns:14px 14px;gap:3px"><i style="width:14px;height:14px;background:#7fc4ff"></i><i style="width:14px;height:14px;background:#7fc4ff"></i><i style="width:14px;height:14px;background:#7fc4ff"></i><i style="width:14px;height:14px;background:#7fc4ff"></i></span></div>
+      <div class="tb" style="left:936px"><svg viewBox="0 0 24 24" style="width:32px;height:32px"><rect x="3" y="5" width="18" height="14" rx="3" fill="#f2c94c"/><rect x="3" y="8" width="18" height="11" rx="3" fill="#f6d36b"/></svg></div>
+      <div class="tb" style="left:992px"><svg viewBox="0 0 24 24" style="width:32px;height:32px"><circle cx="12" cy="12" r="9" fill="#3d8bfd"/><circle cx="12" cy="12" r="4" fill="#fff"/></svg></div>
+      <div class="tb" id="stackBtn" style="left:1700px; background:#ffffff14"><span id="stackLogo" style="width:34px;height:34px;position:relative"></span></div>
+      <div class="abs" style="right:24px; top:15px; text-align:right; font-size:15px; line-height:1.4">14:32<br>12/11/2026</div>
+    </div>
+  </div>
+
+  <!-- 7: every browser -->
+  <div class="layer" id="sBrowsers">
+    <div class="word" id="worksIn" style="font-size:150px; color:#fff"></div>
+    <div class="layer" id="pills"></div>
+    <div class="word" id="freeLine" style="font-size:72px; color:#2a0f04; font-weight:700"></div>
+  </div>
+
+  <div class="layer wipe" id="wipe"></div>
+</div>
+  <div class="layer" id="vignette"></div>
+  <canvas id="grain" class="abs" width="960" height="540"></canvas>
+  <div class="layer" id="flash"></div>
+</div>
+
+<script src="../icons.js"></script>
+<script>
+// ---------- time grid (matches music.js) ----------
+const BEAT = 60 / 128, BAR = BEAT * 4, DUR = 32, FPS = 60;
+const at = (bar, beat = 0) => (bar * 4 + beat) * BEAT;
+
+// ---------- math ----------
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lin = (t, a, b) => clamp((t - a) / (b - a));
+const mix = (a, b, k) => a + (b - a) * k;
+const E = {
+  outExpo: (x) => (x >= 1 ? 1 : 1 - Math.pow(2, -10 * x)),
+  inExpo: (x) => (x <= 0 ? 0 : Math.pow(2, 10 * x - 10)),
+  outCubic: (x) => 1 - Math.pow(1 - x, 3),
+  inCubic: (x) => x * x * x,
+  inOut: (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2),
+  outBack: (x, s = 1.25) => 1 + (s + 1) * Math.pow(x - 1, 3) + s * Math.pow(x - 1, 2),
+  outQuint: (x) => 1 - Math.pow(1 - x, 5),
+};
+const ease = (t, a, b, f = E.outExpo) => f(lin(t, a, b));
+// a damped spring settle 0 -> 1 (small overshoot)
+const spring = (t, a, k = 9, z = 0.55) => { const x = t - a; if (x <= 0) return 0; return 1 - Math.exp(-z * k * x) * Math.cos(k * Math.sqrt(1 - z * z) * x * 1.0); };
+let RNG = 1; const rand = (s) => { let x = Math.sin(s * 9301 + 49297) * 233280; return x - Math.floor(x); };
+
+const $ = (id) => document.getElementById(id);
+function T(el, { x = 0, y = 0, s = 1, sx = null, sy = null, r = 0, o = 1, blur = 0, z = null, rx = 0, ry = 0 } = {}) {
+  el.style.transform = `translate(${x}px, ${y}px) rotateX(${rx}deg) rotateY(${ry}deg) rotate(${r}deg) scale(${sx ?? s}, ${sy ?? s})`;
+  el.style.opacity = o;
+  el.style.filter = blur > 0.05 ? `blur(${blur.toFixed(2)}px)` : "none";
+  el.style.visibility = o <= 0.001 ? "hidden" : "visible";
+}
+const show = (el, on) => (el.style.display = on ? "" : "none");
+const icon = (n) => (ICONS[n] ? `<svg class="i" viewBox="0 0 24 24">${ICONS[n]}</svg>` : "");
+document.querySelectorAll("[data-i]").forEach((e) => (e.innerHTML = icon(e.dataset.i)));
+
+// ---------- the logo ----------
+const BARS = [ // top to bottom
+  { c: "#f9c74f", x: 382.9, y: 307.1, r: -44.2 },
+  { c: "#f27d2e", x: 510.4, y: 477.2, r: -29.47 },
+  { c: "#d1384b", x: 590.4, y: 674.2, r: -14.73 },
+  { c: "#6a2c70", x: 617.6, y: 885.0, r: 0 },
+];
+function makeLogo(host, size) {
+  const l = document.createElement("div"); l.className = "logo"; l.style.transform = `scale(${size / 1024})`;
+  BARS.forEach((b) => { const i = document.createElement("i"); i.style.background = b.c; i.style.transform = `translate(${b.x}px, ${b.y}px) rotate(${b.r}deg)`; l.appendChild(i); });
+  host.appendChild(l); return l;
+}
+const bigLogo = $("logo");
+BARS.forEach((b) => { const i = document.createElement("i"); i.style.background = b.c; bigLogo.appendChild(i); });
+for (const id of ["ctxLogo", "winLogo", "stackLogo", "fp3", "extIcon"]) makeLogo($(id), id === "winLogo" ? 30 : id === "stackLogo" ? 34 : id === "fp3" ? 48 : id === "extIcon" ? 30 : 20);
+$("extIcon").firstChild.style.left = "4px"; $("extIcon").firstChild.style.top = "4px";
+
+// ---------- scene 2 type ----------
+const TYPE = [
+  { txt: "Every", t: at(2, 0) }, { txt: "download", t: at(2, 1) }, { txt: "you", t: at(2, 2) }, { txt: "start", t: at(2, 3) },
+];
+const typeHost = $("sType");
+const words = TYPE.map((w) => { const d = document.createElement("div"); d.className = "word"; d.textContent = w.txt; d.style.fontSize = "150px"; typeHost.appendChild(d); return d; });
+const goes = Object.assign(document.createElement("div"), { className: "word", textContent: "goes straight to" }); goes.style.fontSize = "120px"; goes.style.color = "var(--dim)"; typeHost.appendChild(goes);
+const stashW = Object.assign(document.createElement("div"), { className: "word", textContent: "Stash." }); stashW.style.fontSize = "300px"; stashW.style.color = "var(--orange)"; typeHost.appendChild(stashW);
+const strobe = ["faster", "faster", "faster", "faster"].map(() => { const d = document.createElement("div"); d.className = "word"; d.textContent = "faster"; d.style.fontSize = "230px"; typeHost.appendChild(d); return d; });
+
+// stripes (riser bed)
+const stripeHost = $("stripes");
+const stripes = Array.from({ length: 14 }, (_, k) => { const i = document.createElement("i"); i.style.background = BARS[k % 4].c; i.style.top = `${200 + k * 118}px`; stripeHost.appendChild(i); return i; });
+
+// wipe bars
+const wipeHost = $("wipe");
+const wipes = BARS.map((b) => { const i = document.createElement("i"); i.style.background = b.c; wipeHost.appendChild(i); return i; });
+
+// scene 4 lanes
+const lanes = Array.from({ length: 8 }, (_, k) => {
+  const d = document.createElement("div"); d.className = "lane";
+  d.innerHTML = `<span>${k + 1}</span><div class="bar"><i></i><b></b></div><span class="lp">0%</span>`;
+  $("lanes").appendChild(d); return d;
+});
+const laneSpeed = [1.0, 0.82, 0.93, 0.7, 0.88, 0.76, 0.97, 0.64];
+
+// scene 5
+const net = $("net");
+const peers = Array.from({ length: 9 }, (_, k) => {
+  const a = (k / 9) * Math.PI * 2 - Math.PI / 2, rr = 118 + (k % 2) * 22;
+  const p = document.createElement("div"); p.className = "abs peer"; p.dataset.x = 280 + Math.cos(a) * rr * 1.55; p.dataset.y = 160 + Math.sin(a) * rr * 0.95;
+  net.appendChild(p); return p;
+});
+const netSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg"); netSvg.setAttribute("width", 560); netSvg.setAttribute("height", 330); netSvg.style.position = "absolute"; net.prepend(netSvg);
+const links = peers.map((p) => { const l = document.createElementNS("http://www.w3.org/2000/svg", "line"); l.setAttribute("x1", 280); l.setAttribute("y1", 160); l.setAttribute("x2", +p.dataset.x + 13); l.setAttribute("y2", +p.dataset.y + 13); l.setAttribute("stroke", "#f27d2e"); l.setAttribute("stroke-width", 3); l.setAttribute("stroke-linecap", "round"); netSvg.appendChild(l); return l; });
+const hub = document.createElement("div"); hub.className = "abs"; hub.style.cssText = "width:84px;height:84px;border-radius:42px;background:var(--orange);display:grid;place-items:center;font-size:40px;color:#fff;left:238px;top:118px"; hub.innerHTML = icon("magnet"); net.appendChild(hub);
+const pieces = Array.from({ length: 26 }, () => { const d = document.createElement("div"); d.className = "piece"; $("pieces").appendChild(d); return d; });
+const pieceAt = pieces.map((_, k) => rand(k + 3));
+
+// pause/resume button glyphs
+$("pp").innerHTML = `<span id="ppPause" class="abs" style="inset:0;display:grid;place-items:center;font-size:40px;color:#fff">${icon("pause")}</span><span id="ppPlay" class="abs" style="inset:0;display:grid;place-items:center;font-size:40px;color:#fff">${icon("play")}</span>`;
+// the lock
+$("lock").innerHTML = `<svg viewBox="0 0 64 64" width="64" height="64"><path id="shackle" d="M20 30V20a12 12 0 0 1 24 0v10" fill="none" stroke="#f9c74f" stroke-width="6" stroke-linecap="round"/><rect x="12" y="28" width="40" height="30" rx="9" fill="#f9c74f"/><circle cx="32" cy="43" r="5" fill="#2c2631"/></svg>`;
+
+// scene 6 files
+const FILES = [
+  ["Trailer 4K master.mov", "#d1384b"], ["Stills and posters.zip", "#f27d2e"], ["Press notes.pdf", "#6a2c70"],
+  ["lofi-beats-vol-2.mp3", "#1f8a70"], ["Screenshot 2026-11-12.png", "#f9c74f"],
+];
+const fanHost = $("fan");
+const fanItems = FILES.map(([n, c]) => {
+  const g = document.createElement("div"); g.className = "abs"; g.style.left = "0"; g.style.top = "0";
+  g.innerHTML = `<div class="flbl">${n}</div><div class="thumb" style="--c:${c}"><i></i></div>`;
+  fanHost.appendChild(g); return g;
+});
+
+// scene 7 pills
+const BROWSERS = [["Chrome", "#fff", "#c2410c"], ["Edge", "#2a0f04", "#fbd2b4"], ["Brave", "#fff", "#6a2c70"], ["Firefox", "#2a0f04", "#f9c74f"]];
+const pills = BROWSERS.map(([n, fg, bg]) => { const p = document.createElement("div"); p.className = "pill"; p.textContent = n; p.style.color = fg; p.style.background = bg; $("pills").appendChild(p); return p; });
+
+// grain
+const g = $("grain"), gx = g.getContext("2d"), gimg = gx.createImageData(960, 540);
+function grain(frame) {
+  let s = (frame * 2654435761) >>> 0;
+  for (let i = 0; i < gimg.data.length; i += 4) { s = (s * 1664525 + 1013904223) >>> 0; const v = s >>> 24; gimg.data[i] = gimg.data[i + 1] = gimg.data[i + 2] = v; gimg.data[i + 3] = 40; }
+  gx.putImageData(gimg, 0, 0); g.style.transform = "scale(2)"; g.style.transformOrigin = "0 0";
+}
+
+// measure text once fonts are in
+let W = {};
+function measure() { for (const [k, el] of Object.entries({ goes, stashW })) W[k] = el.offsetWidth; words.forEach((w, k) => (W["w" + k] = w.offsetWidth)); }
+
+// =====================================================================================
+function render(t) {
+  const frame = Math.round(t * FPS);
+  // ---------- camera: punch on impacts, a little drift ----------
+  let punch = 0;
+  for (const [ti, a] of [[at(1, 3), 0.05], [at(4), 0.07], [at(8), 0.05], [at(14), 0.06], [at(15), 0.05]]) if (t >= ti) punch += a * Math.exp(-(t - ti) * 7);
+  const shake = punch * 60;
+  T($("cam"), { s: 1 + punch, x: Math.sin(t * 53) * shake, y: Math.cos(t * 47) * shake * 0.6, r: Math.sin(t * 31) * punch * 4 });
+
+  // ---------- which scene ----------
+  const S1 = t < at(2) + 0.25, S2 = t >= at(2) - 0.2 && t < at(4) + 0.1, S3 = t >= at(4) - 0.05 && t < at(6) + 0.4, S4 = t >= at(6) - 0.4 && t < at(8) + 0.1,
+        S5 = t >= at(8) - 0.05 && t < at(10) + 0.1, S6 = t >= at(10) - 0.1 && t < at(12) + 0.1, S7 = t >= at(12) - 0.05 && t < at(14) + 0.1, S8 = t >= at(14) - 0.05;
+  show($("sLogo"), S1 || S8); show($("sType"), S2); show($("sBrowser"), S3); show($("sWin"), S4 || S3); show($("sCards"), S5); show($("sStack"), S6); show($("sBrowsers"), S7);
+  show($("bgDusk"), S3 || S4 || S6); show($("bgOrange"), S7); show($("stripes"), S2);
+  $("bgDusk").style.opacity = 1;
+
+  // background glow breathes with the beat
+  const bt = (t % BEAT) / BEAT, pulse = t >= at(4) && t < at(15) ? Math.exp(-bt * 5) : 0;
+  T($("glow"), { x: Math.sin(t * 0.6) * 120, y: Math.cos(t * 0.5) * 60, s: 1 + pulse * 0.06, o: 0.55 + pulse * 0.35 });
+
+  if (S1 || S8) sceneLogo(t);
+  if (S2) sceneType(t);
+  if (S3 || S4) sceneBrowser(t);
+  if (S3 || S4) sceneWin(t);
+  if (S5) sceneCards(t);
+  if (S6) sceneStack(t);
+  if (S7) sceneBrowsers(t);
+  transitions(t);
+  grain(frame);
+}
+
+// ---------- 1 + 8: logo build ----------
+function sceneLogo(t) {
+  const outro = t >= at(14) - 0.05;
+  const size = outro ? 300 : 420;
+  // where the 1024 frame sits
+  let ox = 960 - size / 2, oy = 540 - size / 2 - (outro ? 90 : 0);
+  if (!outro) { const k = ease(t, at(1, 3), at(1, 3) + 0.5, E.outExpo); ox -= k * 300; }
+  else { ox -= 330; }
+  const sc = size / 1024;
+  const items = bigLogo.children;
+  BARS.forEach((b, i) => {
+    let x, y, r, o = 1, blur = 0, s = 1;
+    if (!outro) {
+      // bar 0: each capsule shoots in on a beat and lands flat in a stack
+      const t0 = at(0, i), k = ease(t, t0, t0 + 0.55, E.outExpo), dir = i % 2 ? 1 : -1;
+      x = mix(512 + dir * 2600, 512, k); y = b.y; r = 0;
+      blur = (1 - k) * 30; o = t < t0 ? 0 : 1;
+      // bar 1: each beat snaps one capsule into the fan
+      const t1 = at(1, i), f = ease(t, t1, t1 + 0.38, (x) => E.outBack(x, 1.6));
+      if (i < 3) { x = mix(x, b.x, f); r = mix(0, b.r, f); }
+      else { x = mix(x, b.x, ease(t, at(1, 0), at(1, 0) + 0.38)); }
+      s = 1 + 0.18 * Math.exp(-Math.max(0, t - t1) * 14) * (t >= t1 ? 1 : 0);
+    } else {
+      // outro: capsules converge from the four corners
+      const t0 = at(14) + i * 0.06, k = ease(t, t0, t0 + 0.7, E.outExpo), ang = [-2.4, -0.7, 0.7, 2.4][i];
+      x = mix(b.x + Math.cos(ang) * 2600, b.x, k); y = mix(b.y + Math.sin(ang) * 1600, b.y, k); r = mix(b.r - 160, b.r, k); blur = (1 - k) * 26;
+      s = 1 + 0.15 * Math.exp(-Math.max(0, t - at(15)) * 12) * (t >= at(15) ? 1 : 0);
+    }
+    const el = items[i];
+    el.style.transform = `translate(${x}px, ${y}px) rotate(${r}deg) scale(${s})`;
+    el.style.opacity = o; el.style.filter = blur > 0.1 ? `blur(${blur}px)` : "none";
+  });
+  // zoom through at the end of the intro
+  let zs = 1, zo = 1, zb = 0;
+  if (!outro) { const z = ease(t, at(2) - 0.28, at(2) + 0.22, E.inExpo); zs = 1 + z * 14; zo = 1 - lin(t, at(2) + 0.05, at(2) + 0.22); zb = z * 18; }
+  const lg = $("logo");
+  lg.style.transformOrigin = "0 0";
+  lg.style.transform = `translate(${ox}px, ${oy}px) scale(${sc})`;
+  const sL = $("sLogo"); sL.style.transformOrigin = `${ox + size * 0.55}px ${oy + size * 0.6}px`; sL.style.transform = `scale(${zs})`; sL.style.opacity = zo; sL.style.filter = zb ? `blur(${zb}px)` : "none";
+
+  // wordmark slides out from behind the logo
+  const wm = $("wordmark");
+  if (!outro) {
+    const k = ease(t, at(1, 3) + 0.05, at(1, 3) + 0.6);
+    T(wm, { x: ox + size + 10 - (1 - k) * 160, y: 540 - 110, o: k, blur: (1 - k) * 12 });
+    wm.textContent = "Stash"; wm.style.fontSize = "210px";
+    T($("outSub"), { o: 0 }); T($("outCta"), { o: 0 });
+  } else {
+    const k = ease(t, at(14, 1), at(14, 1) + 0.6);
+    wm.textContent = "Stash"; wm.style.fontSize = "190px";
+    T(wm, { x: ox + size + 30 - (1 - k) * 120, y: oy + size / 2 - 112, o: k, blur: (1 - k) * 10 });
+    const k2 = ease(t, at(14, 2), at(14, 2) + 0.6);
+    T($("outSub"), { x: ox + 4, y: oy + size + 70 + (1 - k2) * 40, o: k2 });
+    const cta = $("outCta");
+    cta.innerHTML = `<span style="display:inline-flex;align-items:center;gap:14px;background:var(--orange);color:#fff;border-radius:40px;padding:18px 34px">Add Stash to your browser</span><span style="margin-left:26px;color:var(--dim);font-weight:500">github.com/frstycodes/stash</span>`;
+    const k3 = ease(t, at(14, 3), at(14, 3) + 0.6, (x) => E.outBack(x, 1.2));
+    T(cta, { x: ox + 4, y: oy + size + 150 + (1 - k3) * 40, o: lin(t, at(14, 3), at(14, 3) + 0.25), s: mix(0.94, 1, k3) });
+  }
+}
+
+// ---------- 2: kinetic type ----------
+function sceneType(t) {
+  // line 1: words land one per beat
+  let x = 0; const gap = 40, total = words.reduce((a, w, k) => a + W["w" + k], 0) + gap * 3;
+  const out1 = ease(t, at(3) - 0.05, at(3) + 0.25, E.inExpo);
+  words.forEach((w, k) => {
+    const t0 = TYPE[k].t, kk = ease(t, t0, t0 + 0.35, (v) => E.outBack(v, 1.4));
+    const vis = t >= t0 ? 1 : 0;
+    T(w, { x: 960 - total / 2 + x, y: 450 + (1 - kk) * 90 - out1 * 300, s: mix(0.7, 1, kk), o: vis * (1 - out1), blur: (1 - lin(t, t0, t0 + 0.12)) * 16 + out1 * 20 });
+    x += W["w" + k] + gap;
+  });
+  // line 2
+  const g0 = at(3, 0), gk = ease(t, g0, g0 + 0.4);
+  const sOut = t >= at(3, 3) ? 1 : 0;
+  T(goes, { x: 960 - W.goes / 2, y: 300 + (1 - gk) * 80, o: (t >= g0 ? gk : 0) * (1 - sOut), blur: (1 - gk) * 14 });
+  const s0 = at(3, 1), sk = ease(t, s0, s0 + 0.45, (v) => E.outBack(v, 1.3));
+  const throb = t >= at(3, 2) ? 1 + 0.05 * Math.exp(-((t - at(3, 2)) % (BEAT / 2)) * 10) : 1;
+  T(stashW, { x: 960 - W.stashW / 2, y: 420, s: mix(0.4, 1, sk) * throb * (1 + sOut * 0.6), o: (t >= s0 ? 1 : 0) * (1 - sOut), blur: (1 - lin(t, s0, s0 + 0.15)) * 24 + sOut * 30 });
+  // the roll: "faster" strobes on 16ths, colours cycling
+  strobe.forEach((el, k) => {
+    const t0 = at(3, 3) + k * BEAT / 4, on = t >= t0 && t < t0 + BEAT / 4 + (k === 3 ? 0.2 : 0);
+    el.style.color = BARS[k].c;
+    const kk = lin(t, t0, t0 + BEAT / 4);
+    T(el, { x: 960 - 330 + (k % 2 ? 60 : -60) * (1 - kk), y: 400, s: 0.8 + kk * 0.5 + k * 0.15, o: on ? 1 : 0, r: (k % 2 ? 3 : -3) });
+  });
+  // stripes race faster and faster (the riser)
+  const sp = Math.pow(lin(t, at(2), at(4)), 2.2);
+  stripes.forEach((s, k) => {
+    const dir = k % 2 ? 1 : -1, off = ((t * (300 + 2600 * sp) * (0.6 + rand(k) * 0.8) + k * 400) % 1600) * dir;
+    T(s, { x: off, r: -18, o: 0.08 + sp * 0.22, blur: sp * 6 });
+  });
+}
+
+// ---------- 3: right-click in the browser ----------
+const BR = { x: 740, y: 210 }; // browser top-left at rest
+function sceneBrowser(t) {
+  const t0 = at(4);
+  // the browser springs up and tilts flat
+  const k = ease(t, t0, t0 + 0.9, E.outQuint);
+  // after the click, the browser slides left and shrinks while Stash arrives
+  const away = ease(t, at(5, 2), at(6) + 0.3, E.inOut);
+  const bx = BR.x - away * 820, by = BR.y + (1 - k) * 700, bs = 1 - away * 0.25;
+  const br = $("browser");
+  br.style.transformOrigin = "50% 100%";
+  br.style.transform = `perspective(1800px) translate(${bx}px, ${by}px) rotateX(${(1 - k) * 32}deg) rotateY(${away * 18}deg) scale(${bs})`;
+  br.style.opacity = t < t0 ? 0 : 1 - lin(t, at(6), at(6) + 0.35);
+
+  // caption
+  const c = $("cap3a");
+  const c1 = t < at(5, 0);
+  c.innerHTML = c1 ? "Right-click<br>any link." : "Download<br>with Stash.";
+  const ck = c1 ? ease(t, at(4, 1), at(4, 1) + 0.5) : ease(t, at(5, 0), at(5, 0) + 0.5);
+  T(c, { x: 100, y: 400 + (1 - ck) * 50, o: ck * (1 - lin(t, at(5, 2.5), at(5, 3.2))), blur: (1 - ck) * 10 });
+  if (!c1) c.style.color = "var(--orange)"; else c.style.color = "";
+
+  // the cursor path, in browser coordinates
+  const link = { x: 958, y: 360 }, item = { x: 760, y: 570 };
+  const m1 = ease(t, at(4, 1.5), at(4, 2.8), E.inOut);
+  const m2 = ease(t, at(4, 3) + 0.25, at(5, 0), E.inOut);
+  let cx = mix(1240, link.x, m1), cy = mix(720, link.y, m1);
+  cx = mix(cx, item.x, m2); cy = mix(cy, item.y, m2);
+  const clickT = at(5, 1.5), press = t >= clickT && t < clickT + 0.12 ? 0.85 : 1;
+  const away2 = ease(t, at(5, 2), at(5, 3));
+  T($("cursor"), { x: bx + cx * bs, y: by + cy * bs, s: press, o: lin(t, at(4, 1), at(4, 1.3)) * (1 - away2) });
+  // the link highlights under the cursor
+  $("dlLink").style.background = m1 > 0.95 ? "#3d63dd18" : "transparent";
+
+  // context menu opens from the cursor on the right-click
+  const ctx = $("ctx"), ck2 = ease(t, at(4, 3), at(4, 3) + 0.22);
+  const closeK = ease(t, clickT + 0.05, clickT + 0.22);
+  ctx.style.left = (link.x - 330) + "px"; ctx.style.top = link.y + "px"; ctx.style.transformOrigin = "100% 0";
+  T(ctx, { s: mix(0.92, 1, ck2) * mix(1, 0.97, closeK), o: (t >= at(4, 3) ? ck2 : 0) * (1 - closeK) });
+  $("ctxStash").style.background = m2 > 0.9 ? "#f27d2e24" : "transparent";
+
+  // click ripple and the download chip that flies to Stash
+  const rk = lin(t, clickT, clickT + 0.6);
+  T($("ripple"), { x: bx + item.x * bs - 10, y: by + item.y * bs - 10, s: 1 + E.outCubic(rk) * 9, o: t >= clickT ? (1 - rk) : 0 });
+  const chip = $("chip"), f = ease(t, clickT + 0.05, at(6) + 0.1, E.inOut);
+  const sx = BR.x + item.x - 120, sy = BR.y + item.y - 30, ex = 1180, ey = 330;
+  const ax = mix(sx, ex, f), ay = mix(sy, ey, f) - Math.sin(f * Math.PI) * 260;
+  const chipIn = ease(t, clickT + 0.05, clickT + 0.3, (v) => E.outBack(v, 1.6));
+  T(chip, { x: ax, y: ay, s: mix(0.5, 1, chipIn) * mix(1, 0.6, lin(t, at(6) - 0.1, at(6) + 0.1)), o: t > clickT ? (1 - lin(t, at(6), at(6) + 0.12)) : 0, r: Math.sin(f * Math.PI) * -8, blur: Math.sin(f * Math.PI) * 3 });
+}
+
+// ---------- 4: the Stash window ----------
+function sceneWin(t) {
+  const win = $("win"), t0 = at(5, 3);
+  const k = ease(t, t0, t0 + 0.9, E.outQuint);
+  // arrives from the right, then the camera pushes in on the first row
+  const push = ease(t, at(6, 2), at(7, 2), E.inOut);
+  const ws = 0.94 + push * 0.06, wx = mix(2000, 680, k) - push * 40, wy = 150 - push * 30;
+  win.style.transform = `perspective(2000px) translate(${wx}px, ${wy}px) rotateY(${(1 - k) * -24}deg) scale(${ws})`;
+  win.style.opacity = t < t0 ? 0 : 1;
+
+  // the transfer: 8 lanes fill at their own pace, then merge
+  const s0 = at(6), s1 = at(7, 3);
+  const lanesOpen = ease(t, s0 + 0.1, s0 + 0.6, E.outQuint);
+  $("lanes").style.height = `${lanesOpen * 8 * 21}px`;
+  let sum = 0;
+  lanes.forEach((ln, k2) => {
+    const p = clamp(Math.pow(lin(t, s0 + 0.15 + k2 * 0.04, s0 + 0.15 + (s1 - s0) * laneSpeed[k2]), 0.9));
+    sum += p;
+    ln.querySelector("i").style.width = `${p * 100}%`;
+    ln.querySelector(".lp").textContent = p >= 1 ? "done" : `${Math.round(p * 100)}%`;
+    ln.style.opacity = ease(t, s0 + 0.1 + k2 * BEAT / 4, s0 + 0.35 + k2 * BEAT / 4);
+    ln.style.transform = `translateX(${(1 - ease(t, s0 + 0.1 + k2 * BEAT / 4, s0 + 0.4 + k2 * BEAT / 4)) * 40}px)`;
+  });
+  const prog = Math.max(0.12, sum / 8 * 0.88 + 0.12);
+  const done = t >= s1 + 0.1;
+  $("r1bar").style.width = `${(done ? 1 : prog) * 100}%`;
+  $("r1pct").textContent = done ? "100%" : `${Math.round(prog * 100)}%`;
+  $("r1size").textContent = done ? "2.40 GB" : `${(prog * 2.4).toFixed(2)} GB of 2.40 GB`;
+  const spd = t < s0 ? 0 : done ? 0 : 24.8 * ease(t, s0, s0 + 1.2, E.outCubic) + Math.sin(t * 9) * 0.6;
+  $("r1spd").textContent = done ? "" : `${spd.toFixed(1)} MB/s`;
+  $("r1conn").textContent = done ? "Done" : "8 connections";
+  const dk = ease(t, s1 + 0.1, s1 + 0.45, (v) => E.outBack(v, 1.8));
+  T($("doneBadge"), { s: mix(0.3, 1, dk), o: done ? 1 : 0 });
+  // other rows tick along
+  const r2 = 27 + lin(t, at(6), at(8)) * 9;
+  $("r2bar").style.width = `${r2}%`; $("r2pct").textContent = `${Math.round(r2)}%`;
+
+  // left side: the speed readout and its sparkline, plus the caption
+  const capK = ease(t, at(6, 0.5), at(6, 1.2));
+  const cap = $("cap4a");
+  cap.innerHTML = `Eight<br>connections.<br><span style="color:var(--orange)">One file.</span>`;
+  T(cap, { x: 100 - (1 - capK) * 60, y: 150, o: capK * (1 - lin(t, at(7, 3.2), at(8))), blur: (1 - capK) * 12 });
+  const big = $("speedBig"), num = ease(t, at(6, 1), at(7, 1), E.outCubic) * 24.8;
+  big.textContent = num.toFixed(1);
+  const bk = ease(t, at(6, 1), at(6, 1.6));
+  T(big, { x: 94, y: 520, o: bk * (1 - lin(t, at(7, 3.2), at(8))), s: 1 + (t > at(7, 1) ? 0.04 * Math.exp(-(t - at(7, 1)) * 6) : 0) });
+  T($("speedUnit"), { x: 104, y: 680, o: bk * (1 - lin(t, at(7, 3.2), at(8))) });
+  // sparkline draws in from the left
+  const pts = []; const n = 40, sk = ease(t, at(6, 1), at(7, 2), E.inOut);
+  for (let i = 0; i <= n * sk; i++) { const x = i / n; pts.push([10 + x * 500, 100 - (Math.pow(x, 0.5) * 70 + Math.sin(x * 21) * 6 + Math.sin(x * 7 + 1) * 5)]); }
+  $("sparkPath").setAttribute("d", pts.length > 1 ? "M" + pts.map((p) => p.map((v) => v.toFixed(1)).join(" ")).join(" L") : "");
+  T($("spark"), { x: 100, y: 760, o: bk * (1 - lin(t, at(7, 3.2), at(8))) });
+  // the window leaves with the wipe
+  if (t > at(8) - 0.3) win.style.opacity = 1 - lin(t, at(8) - 0.1, at(8));
+}
+
+// ---------- 5: feature cards ----------
+function sceneCards(t) {
+  const xs = [80, 680, 1280];
+  ["card1", "card2", "card3"].forEach((id, k) => {
+    const t0 = at(8, k), kk = ease(t, t0, t0 + 0.6, E.outQuint);
+    const out = ease(t, at(9, 3) + k * 0.06, at(10) + k * 0.06, E.inExpo);
+    const el = $(id);
+    el.style.left = xs[k] + "px"; el.style.top = "220px";
+    const beatPop = t >= at(8, 3) ? 1 + 0.03 * Math.exp(-(t - at(8, 3)) * 10) : 1;
+    T(el, { y: (1 - kk) * 900 - out * 1300, r: (1 - kk) * (k - 1) * 14 + out * (k - 1) * -10, s: beatPop, o: t >= t0 ? 1 : 0, blur: out * 10 });
+  });
+  // card 1: download, pause (grey, frozen), resume
+  const pa = at(8, 2), ps = at(9, 0), rs = at(9, 2);
+  const run1 = lin(t, pa, ps) * 0.28, run2 = lin(t, rs, at(10)) * 0.5;
+  const p = 0.18 + run1 + run2, paused = t >= ps && t < rs;
+  $("ppBar").style.width = `${p * 100}%`;
+  $("ppBar").style.background = paused ? "#8e8a94" : "var(--orange)";
+  $("ppSize").textContent = `${(p * 2.4).toFixed(2)} of 2.40 GB`; $("ppPct").textContent = `${Math.round(p * 100)}%`;
+  $("ppState").textContent = paused ? "Paused · resumes where it stopped" : t < pa ? "" : "Downloading · 24.8 MB/s";
+  const swap = (a) => { const k = ease(t, a, a + 0.2); return k; };
+  const toPlay = t >= ps ? swap(ps) : 0, toPause = t >= rs ? swap(rs) : 0;
+  const playVis = toPlay * (1 - toPause);
+  T($("ppPause"), { s: mix(1, 0.25, playVis), o: 1 - playVis, blur: playVis * 4 });
+  T($("ppPlay"), { s: mix(0.25, 1, playVis), o: playVis, blur: (1 - playVis) * 4 });
+  $("pp").style.background = paused ? "#57505d" : "var(--orange)";
+  // card 2: peers connect, pieces fill
+  peers.forEach((pe, k) => {
+    const t0 = at(8, 1.5) + k * BEAT / 4, kk = ease(t, t0, t0 + 0.3, (v) => E.outBack(v, 1.6));
+    T(pe, { x: +pe.dataset.x, y: +pe.dataset.y, s: kk, o: t >= t0 ? 1 : 0 });
+    pe.style.background = t > t0 + 0.2 ? BARS[k % 4].c : "#3a3240";
+    const lk = ease(t, t0 + 0.05, t0 + 0.3);
+    links[k].setAttribute("x2", mix(280, +pe.dataset.x + 13, lk)); links[k].setAttribute("y2", mix(160, +pe.dataset.y + 13, lk));
+    links[k].setAttribute("opacity", 0.35 + 0.65 * Math.exp(-((t * 3 + k * 0.37) % 1) * 4));
+  });
+  const fill = lin(t, at(8, 2), at(10));
+  pieces.forEach((pc, k) => { pc.style.background = pieceAt[k] < fill ? BARS[k % 4].c : "#ffffff10"; });
+  $("peerTxt").textContent = `Downloading from ${Math.round(9 + fill * 32)} peers.`;
+  // card 3: the lock opens (signed in), cookies and the page address flow to Stash
+  const lockOpen = ease(t, at(8, 3), at(8, 3) + 0.3, (v) => E.outBack(v, 2));
+  $("shackle").setAttribute("transform", `translate(${lockOpen * 10} ${-lockOpen * 6}) rotate(${-lockOpen * 18} 44 30)`);
+  ["fp1", "fp2", "fpArrow", "fp3"].forEach((id, k) => {
+    const t0 = at(9, 0) + k * BEAT / 2, kk = ease(t, t0, t0 + 0.35, (v) => E.outBack(v, 1.5));
+    T($(id), { x: (1 - kk) * -30, s: mix(0.6, 1, kk), o: t >= t0 ? kk : 0 });
+  });
+  $("fp1").style.color = $("fp2").style.color = t > at(9, 2) ? "#fff" : "";
+  $("fp1").style.background = $("fp2").style.background = t > at(9, 2) ? "#f27d2e44" : "#ffffff0d";
+}
+
+// ---------- 6: the stack ----------
+function sceneStack(t) {
+  const t0 = at(10);
+  const tb = $("taskbar"), tk = ease(t, t0, t0 + 0.5, E.outQuint);
+  tb.style.top = `${1080 - 72 * tk}px`;
+  const btn = { x: 1724, y: 1080 - 72 + 36 }; // stack button centre
+  // captions
+  const c1 = ease(t, at(10, 0.5), at(10, 1.1)), c2 = ease(t, at(10, 1), at(10, 1.6));
+  const cOut = lin(t, at(11, 3.5), at(12));
+  $("cap6a").textContent = "Finished files"; $("cap6b").innerHTML = `<span style="color:var(--gold)">stack up.</span>`;
+  T($("cap6a"), { y: (1 - c1) * 40, o: c1 * (1 - cOut), blur: (1 - c1) * 10 });
+  T($("cap6b"), { y: (1 - c2) * 40, o: c2 * (1 - cOut), blur: (1 - c2) * 10 });
+  // files fly in on 8ths and drop into the stack button
+  let bump = 0;
+  fanItems.forEach((it, k) => {
+    const lbl = it.querySelector(".flbl"), th = it.querySelector(".thumb");
+    const a = at(10, 1.5) + k * BEAT / 2, b = a + 0.5, land = ease(t, a, b, E.inOut);
+    if (t >= b) bump += 0.18 * Math.exp(-(t - b) * 12);
+    // then the stack fans out on bar 11
+    const step = FILES.length - 1 - k;
+    const fo = at(11, 0) + 0.06 + step * 0.05, fk = spring(t, fo, 14, 0.62);
+    const fanX = btn.x - 150 - step * step * 9, fanY = btn.y - 170 - step * 120, rot = -3 - step * 2.6;
+    let x, y, s, r, lo;
+    if (t < fo) {
+      const sx = 300 + k * 60, sy = 700 - k * 40;
+      x = mix(sx, btn.x - 65, land) ; y = mix(sy, btn.y - 46, land) - Math.sin(land * Math.PI) * 300; s = mix(1, 0.18, land); r = mix(-14 + k * 6, 0, land); lo = 0;
+      th.style.opacity = t >= a ? (land < 0.98 ? 1 : 0) : 0;
+    } else {
+      x = mix(btn.x - 65, fanX, fk); y = mix(btn.y - 46, fanY, fk); s = mix(0.18, 1, clamp(fk, 0, 1.2)); r = rot * fk; lo = clamp(fk);
+      th.style.opacity = 1;
+    }
+    th.style.transform = `translate(${x}px, ${y}px) rotate(${r}deg) scale(${s})`;
+    lbl.style.transform = `translate(${x - lbl.offsetWidth - 18 + 10}px, ${y + 24}px) rotate(${r}deg)`;
+    lbl.style.opacity = lo; lbl.style.transformOrigin = "100% 50%";
+  });
+  // the button bounces as each file lands, and is pressed to open the fan
+  const press = t >= at(11, 0) - 0.1 && t < at(11, 0) + 0.05 ? -0.12 : 0;
+  T($("stackBtn"), { s: 1 + bump + press, y: -bump * 20 });
+}
+
+// ---------- 7: every browser ----------
+function sceneBrowsers(t) {
+  const t0 = at(12);
+  const wk = ease(t, t0, t0 + 0.45, (v) => E.outBack(v, 1.2));
+  const wi = $("worksIn"); wi.textContent = "Works in";
+  const out = ease(t, at(13, 3), at(14), E.inExpo);
+  T(wi, { x: 140, y: 170 + (1 - wk) * 100 - out * 400, o: (t >= t0 ? 1 : 0) * (1 - out), blur: (1 - lin(t, t0, t0 + 0.15)) * 20 + out * 20 });
+  let x = 140;
+  pills.forEach((p, k) => {
+    const pt = at(12, 1 + k * 0.75), kk = ease(t, pt, pt + 0.45, (v) => E.outBack(v, 1.5));
+    const row = k < 2 ? 0 : 1, px = k % 2 === 0 ? 140 : 140 + (k === 1 ? 520 : 470);
+    T(p, { x: px - (1 - kk) * 200, y: 420 + row * 160 - out * 400 * (1 + k * 0.1), s: mix(0.6, 1, kk), r: (1 - kk) * -8, o: t >= pt ? 1 : 0, blur: (1 - lin(t, pt, pt + 0.12)) * 18 + out * 16 });
+  });
+  const fl = $("freeLine"); fl.textContent = "Free for Windows.";
+  const fk = ease(t, at(13, 1.5), at(13, 2.2));
+  T(fl, { x: 1100 - (1 - fk) * 80, y: 760 - out * 400, o: fk * (1 - out), blur: (1 - fk) * 10 });
+  // the orange floods in, beat by beat it breathes
+  const bt = (t % BEAT) / BEAT;
+  $("bgOrange").style.filter = `brightness(${1 + Math.exp(-bt * 6) * 0.08})`;
+}
+
+// ---------- transitions: brand-bar wipes and flashes ----------
+function transitions(t) {
+  // a wipe = the four capsules sweep across, covering the cut
+  const cuts = [at(4), at(8), at(12), at(14)];
+  let shown = false;
+  for (const c of cuts) {
+    if (t > c - 0.35 && t < c + 0.35) {
+      shown = true;
+      const k = lin(t, c - 0.35, c + 0.35);
+      wipes.forEach((w, i) => {
+        const kk = E.inOut(clamp(k * 1.25 - i * 0.08));
+        w.style.top = `${-200 + i * 380}px`;
+        T(w, { x: mix(-3800, 3800, kk), r: -16, o: 1 });
+      });
+    }
+  }
+  if (!shown) wipes.forEach((w) => T(w, { o: 0 }));
+  // white flashes on the big hits
+  let fl = 0;
+  for (const [c, a] of [[at(4), 0.85], [at(14), 0.6], [at(15), 0.35], [at(1, 3), 0.25]]) if (t >= c) fl = Math.max(fl, a * Math.exp(-(t - c) * 9));
+  // fade out at the end
+  const end = lin(t, DUR - 1.4, DUR - 0.2);
+  const f = $("flash");
+  f.style.background = end > 0 && fl < end ? "#000" : "#fff";
+  f.style.opacity = Math.max(fl, end);
+}
+
+// ---------- boot ----------
+window.ready = document.fonts.ready.then(() => { measure(); render(0); return true; });
+window.render = render;
+if (location.hash.startsWith("#t=")) window.ready.then(() => render(parseFloat(location.hash.slice(3))));
+if (location.hash === "#play") window.ready.then(() => { const s = performance.now(); const loop = () => { render(((performance.now() - s) / 1000) % DUR); requestAnimationFrame(loop); }; loop(); });
+</script>
+</body>
+</html>

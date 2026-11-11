@@ -29,7 +29,10 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, Interface, PCWSTR, Result, w};
 use windows_numerics::{Vector2, Vector3};
 
+use crate::dl::{self, JobView, Snapshot, State as DlState};
 use crate::droptarget::{self, DropTarget};
+use crate::ipc;
+use crate::manager;
 use crate::files::{self, Item};
 use crate::gfx::{Gfx, Pixels};
 use crate::menu::{self, ids};
@@ -98,6 +101,8 @@ const WM_APP_THUMBS: u32 = WM_APP + 1;
 const WM_APP_MENU: u32 = WM_APP + 2;
 const WM_APP_FOLDER: u32 = WM_APP + 3;
 const WM_APP_OUTSIDE: u32 = WM_APP + 4; // a mouse button went down somewhere; lparam = screen point
+const WM_APP_DL: u32 = WM_APP + 5;      // the download engine has news
+const WM_APP_UPDATE: u32 = WM_APP + 6;  // the updater's status changed
 const WM_APP_DEMO: u32 = WM_APP + 9;    // demo mode only, from a recording script; wparam = command
 const TRAY_CLICK: &str = "tray-click";
 const T_HOVER: usize = 1;
@@ -144,6 +149,66 @@ pub fn log(line: impl AsRef<str>) {
     }
 }
 
+/// Run a menu command later, on the UI thread (used by the downloads window).
+pub fn queue(id: String) {
+    MENU_QUEUE.lock().unwrap().push(id);
+    post(WM_APP_MENU);
+}
+
+/// A request from another launch or a browser (see `ipc`).
+pub fn handle(r: ipc::Request) {
+    with(|s| s.on_request(r));
+}
+
+/// What sits in the stack: files in the folder, and downloads still on their way there.
+#[derive(Clone)]
+enum Entry {
+    File(Item),
+    Job(JobView),
+}
+
+impl Entry {
+    /// The path its thumbnail is keyed by (a download's future file).
+    fn key(&self) -> PathBuf {
+        match self {
+            Entry::File(i) => i.path.clone(),
+            Entry::Job(j) => job_key(j),
+        }
+    }
+
+    fn stamp(&self) -> SystemTime {
+        match self {
+            Entry::File(i) => i.modified,
+            Entry::Job(_) => SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+        }
+    }
+}
+
+fn job_key(j: &JobView) -> PathBuf {
+    j.dir.join(if j.name.is_empty() { "download" } else { &j.name })
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy().trim_end_matches('\\').eq_ignore_ascii_case(b.to_string_lossy().trim_end_matches('\\'))
+}
+
+/// The pill label for a download in the fan: its name, how far along, and how fast.
+fn job_label(j: &JobView) -> String {
+    let name: String = if j.name.chars().count() > 22 { j.name.chars().take(20).collect::<String>() + "…" } else { j.name.clone() };
+    let pct = j.fraction().map(|f| format!("{:.0}%", f * 100.0));
+    match j.state {
+        DlState::Active => match (pct, j.phase) {
+            (_, Some(phase)) => format!("{name}  ·  {}", phase.trim_end_matches('…')),
+            (Some(p), None) => format!("{name}  ·  {p}  ·  {}", crate::paint::speed(j.speed)),
+            (None, None) => format!("{name}  ·  {}", crate::paint::speed(j.speed)),
+        },
+        DlState::Queued => format!("{name}  ·  Waiting"),
+        DlState::Paused => format!("{name}  ·  Paused{}", pct.map(|p| format!(" at {p}")).unwrap_or_default()),
+        DlState::Failed => format!("{name}  ·  Failed"),
+        _ => name,
+    }
+}
+
 fn post(msg: u32) {
     post_with(msg, LPARAM(0));
 }
@@ -174,7 +239,10 @@ struct Row {
     center: (f32, f32),          // icon center when fanned out, fan-window pixels
     angle: f32,                  // tilt when fanned out, radians
     extent: (f32, f32, f32, f32), // icon + label box around the center, before tilt
-    path: Option<PathBuf>,       // None = "Open in Explorer"
+    path: Option<PathBuf>,       // None = "Open in Explorer" (or a download, below)
+    job: Option<u64>,            // a download still in progress
+    bar: Option<SpriteVisual>,   // its progress fill
+    text: String,                // the label's text, to repaint only on change
 }
 
 impl Row {
@@ -202,6 +270,9 @@ impl Row {
 enum Blocking {
     Drag(PathBuf),
     Menu { hwnd: HWND, item: bool },
+    JobMenu { hwnd: HWND, id: u64, paused: bool },
+    PickDownloadFolder,
+    ChangeFolder(usize),
     PickFolder,
 }
 
@@ -259,6 +330,18 @@ pub struct Stash {
 
     tray: Option<tray_icon::TrayIcon>,
     watcher: Option<notify::RecommendedWatcher>,
+
+    // downloads
+    inflight: Vec<JobView>,                         // unfinished downloads, newest first
+    seen_jobs: HashSet<u64>,
+    popping: HashMap<u64, std::time::Instant>,      // just started: pop into the stack
+    first_snapshot: bool,
+    dl_overlay: ContainerVisual,                    // speed pill and progress bar on the tile
+    dl_pill: SpriteVisual,
+    dl_track: SpriteVisual,
+    dl_fill: SpriteVisual,
+    dl_text: String,
+    dl_shown: bool,
 }
 
 thread_local! {
@@ -328,6 +411,13 @@ impl Stash {
         let stack = c.CreateContainerVisual()?;
         tile_root.Children()?.InsertAtTop(&glow)?;
         tile_root.Children()?.InsertAtTop(&stack)?;
+        let dl_overlay = c.CreateContainerVisual()?;
+        let (dl_pill, dl_track, dl_fill) = (c.CreateSpriteVisual()?, c.CreateSpriteVisual()?, c.CreateSpriteVisual()?);
+        for v in [&dl_track, &dl_fill, &dl_pill] {
+            dl_overlay.Children()?.InsertAtTop(v)?;
+        }
+        dl_overlay.SetOpacity(0.0)?;
+        tile_root.Children()?.InsertAtTop(&dl_overlay)?;
 
         let props = c.CreatePropertySet()?;
         props.InsertScalar(&HSTRING::from("Progress"), 0.0)?;
@@ -363,8 +453,9 @@ impl Stash {
             }
         }));
 
-        let downloads = shell::downloads_dir();
         let mut settings = settings::load();
+        let downloads = manager::default_dir(&settings);
+        crate::paint::set_units(settings.downloads.bits, settings.downloads.binary);
         settings.folders.retain(|f| f != &downloads);
         // the folder on show last time, if it's still on the list
         let dir = settings.current.clone().filter(|c| settings.folders.contains(c)).unwrap_or_else(|| downloads.clone());
@@ -448,8 +539,24 @@ impl Stash {
             last_switch: std::time::Instant::now(),
             tray: None,
             watcher,
+            inflight: Vec::new(),
+            seen_jobs: HashSet::new(),
+            popping: HashMap::new(),
+            first_snapshot: true,
+            dl_overlay,
+            dl_pill,
+            dl_track,
+            dl_fill,
+            dl_text: String::new(),
+            dl_shown: false,
         };
         APP.with(|a| *a.borrow_mut() = Some(state));
+        // The download engine: its own thread; it pokes us when there's news.
+        let dl_config = with(|s| s.settings.downloads.config()).unwrap_or_default();
+        dl::init(dl_config, || post(WM_APP_DL));
+        // updates for the GitHub builds: checked daily, downloaded in the background
+        crate::update::set_auto(with(|s| s.settings.auto_update).unwrap_or(true));
+        crate::update::start(|| post(WM_APP_UPDATE));
         with(|s| {
             s.tray = build_tray(s.stack_menu());
             s.layout();
@@ -457,6 +564,7 @@ impl Stash {
             s.reload(true);
             s.prefetch();
             s.ready = true;
+            s.on_downloads();
             if demo.is_some() {
                 s.topmost = true;
                 s.restack();
@@ -527,6 +635,10 @@ impl Stash {
         let _ = self.build_glow();
         let _ = self.build_tile();
         let _ = self.build_fan();
+        self.dl_text.clear();
+        if let Some(snap) = dl::engine_opt().map(|e| e.snapshot()) {
+            let _ = self.update_dl_overlay(&snap);
+        }
     }
 
     /// The tile window's size: whole pixels, so its center matches the fan's origin.
@@ -591,12 +703,21 @@ impl Stash {
         }
     }
 
-    fn visible(&self) -> &[Item] {
-        &self.items[..self.items.len().min(self.settings.limit.min(MAX_ITEMS))]
+    /// Downloads on their way into the folder on show, then its files.
+    fn entries(&self) -> Vec<Entry> {
+        let mut v: Vec<Entry> = self.inflight.iter().filter(|j| same_dir(&j.dir, &self.dir)).cloned().map(Entry::Job).collect();
+        v.extend(self.items.iter().cloned().map(Entry::File));
+        v
+    }
+
+    fn visible(&self) -> Vec<Entry> {
+        let mut e = self.entries();
+        e.truncate(self.settings.limit.min(MAX_ITEMS));
+        e
     }
 
     fn request_thumbs(&mut self) {
-        let wanted: Vec<(PathBuf, SystemTime)> = self.items.iter().take(MAX_ITEMS).map(|i| (i.path.clone(), i.modified)).collect();
+        let wanted: Vec<(PathBuf, SystemTime)> = self.entries().iter().take(MAX_ITEMS).map(|e| (e.key(), e.stamp())).collect();
         self.fetch_thumbs(&wanted);
         // Keep memory flat: drop this folder's stale thumbnails. Other folders' stay,
         // so switching to them shows their pile at once (they're pruned when shown).
@@ -684,8 +805,9 @@ impl Stash {
         let c = &self.gfx.compositor;
         let brush = c.CreateRadialGradientBrush()?;
         let stops = brush.ColorStops()?;
-        stops.Append(&c.CreateColorGradientStopWithOffsetAndColor(0.0, Color { A: 150, R: 10, G: 132, B: 255 })?)?;
-        stops.Append(&c.CreateColorGradientStopWithOffsetAndColor(1.0, Color { A: 0, R: 10, G: 132, B: 255 })?)?;
+        // Stash orange
+        stops.Append(&c.CreateColorGradientStopWithOffsetAndColor(0.0, Color { A: 150, R: 242, G: 125, B: 46 })?)?;
+        stops.Append(&c.CreateColorGradientStopWithOffsetAndColor(1.0, Color { A: 0, R: 242, G: 125, B: 46 })?)?;
         let size = TILE * self.ik;
         self.glow.SetBrush(&brush)?;
         self.glow.SetSize(Vector2 { X: size, Y: size })?;
@@ -693,13 +815,19 @@ impl Stash {
     }
 
     /// The icon in the corner: a pile of the newest downloads, or the folder icon.
-    fn build_tile(&self) -> Result<()> {
+    fn build_tile(&mut self) -> Result<()> {
         let k = self.k;
         let children = self.stack.Children()?;
         children.RemoveAll()?;
         let stack_px = STACK * self.ik;
+        let entries = self.entries();
+        // a download that just started pops onto the top of the pile
+        let pop = match entries.first() {
+            Some(Entry::Job(j)) if !self.open && self.popping.contains_key(&j.id) && self.thumb(&job_key(j)).is_some() => Some(j.id),
+            _ => None,
+        };
         let pile: Vec<(&Pixels, &Layer)> = if self.settings.display == Display::Stack {
-            self.items.iter().take(3).zip(PILE.iter()).filter_map(|(it, l)| Some((self.thumb(&it.path)?, l))).collect()
+            entries.iter().take(3).zip(PILE.iter()).filter_map(|(e, l)| Some((self.thumb(&e.key())?, l))).collect()
         } else {
             Vec::new()
         };
@@ -726,8 +854,289 @@ impl Stash {
                 self.shadow(&v, 4.0, 2.0, 0.3)?;
             }
             children.InsertAtTop(&v)?;
+            if std::ptr::eq(l, &PILE[0]) && pop.is_some() {
+                let _ = self.pop_in(&v);
+            }
+        }
+        if let Some(id) = pop {
+            self.popping.remove(&id);
         }
         Ok(())
+    }
+
+    /// A new download drops onto the pile from above, overshoots a little and settles,
+    /// with a flash of the glow, like a file landing in a Dock stack.
+    fn pop_in(&self, v: &SpriteVisual) -> Result<()> {
+        let c = &self.gfx.compositor;
+        let base = v.Offset()?;
+        let ease = c.CreateCubicBezierEasingFunction(Vector2 { X: 0.2, Y: 0.9 }, Vector2 { X: 0.3, Y: 1.0 })?;
+        let settle = c.CreateCubicBezierEasingFunction(Vector2 { X: 0.4, Y: 0.0 }, Vector2 { X: 0.2, Y: 1.0 })?;
+        let s = c.CreateVector3KeyFrameAnimation()?;
+        s.InsertKeyFrame(0.0, Vector3 { X: 0.25, Y: 0.25, Z: 1.0 })?;
+        s.InsertKeyFrameWithEasingFunction(0.55, Vector3 { X: 1.16, Y: 1.16, Z: 1.0 }, &ease)?;
+        s.InsertKeyFrameWithEasingFunction(1.0, Vector3 { X: 1.0, Y: 1.0, Z: 1.0 }, &settle)?;
+        s.SetDuration(ms(560))?;
+        v.StartAnimation(&HSTRING::from("Scale"), &s)?;
+        let o = c.CreateVector3KeyFrameAnimation()?;
+        o.InsertKeyFrame(0.0, Vector3 { Y: base.Y - 44.0 * self.ik, ..base })?;
+        o.InsertKeyFrameWithEasingFunction(0.55, Vector3 { Y: base.Y + 3.0 * self.ik, ..base }, &ease)?;
+        o.InsertKeyFrameWithEasingFunction(1.0, base, &settle)?;
+        o.SetDuration(ms(560))?;
+        v.StartAnimation(&HSTRING::from("Offset"), &o)?;
+        let f = c.CreateScalarKeyFrameAnimation()?;
+        f.InsertKeyFrame(0.0, 0.0)?;
+        f.InsertKeyFrameWithEasingFunction(0.3, 1.0, &self.ease_out)?;
+        f.SetDuration(ms(560))?;
+        v.StartAnimation(&HSTRING::from("Opacity"), &f)?;
+        let g = c.CreateScalarKeyFrameAnimation()?;
+        g.InsertKeyFrame(0.0, 0.0)?;
+        g.InsertKeyFrameWithEasingFunction(0.45, 0.9, &self.ease_out)?;
+        g.InsertKeyFrameWithEasingFunction(1.0, 0.0, &self.ease_in)?;
+        g.SetDuration(ms(900))?;
+        self.glow.StartAnimation(&HSTRING::from("Opacity"), &g)
+    }
+
+    /// The speed pill and progress bar at the foot of the tile, while anything downloads.
+    fn update_dl_overlay(&mut self, snap: &Snapshot) -> Result<()> {
+        let active = snap.jobs.iter().any(|j| j.state == DlState::Active);
+        if !active {
+            if self.dl_shown {
+                self.dl_shown = false;
+                self.dl_text.clear();
+                self.animate_opacity(&self.dl_overlay.cast()?, 0.0, 220)?;
+            }
+            return Ok(());
+        }
+        let (k, ik) = (self.k, self.ik);
+        let tile = self.tile_px();
+        let bar_h = (4.0 * k).round().max(3.0);
+        let bar_w = (STACK * ik * 0.8).round();
+        let bx = ((tile - bar_w) / 2.0).round();
+        let by = (tile - (7.0 * ik).round() - bar_h).round();
+        if self.dl_text.is_empty() {
+            // (re)build the bar at this size
+            self.dl_track.SetBrush(&self.gfx.pill_brush(crate::gfx::color(20, 20, 22, 0.85), bar_h)?)?;
+            self.dl_track.SetSize(Vector2 { X: bar_w, Y: bar_h })?;
+            self.dl_track.SetOffset(Vector3 { X: bx, Y: by, Z: 0.0 })?;
+            self.dl_fill.SetBrush(&self.gfx.pill_brush(crate::paint::accent(), bar_h)?)?;
+            self.dl_fill.SetOffset(Vector3 { X: bx, Y: by, Z: 0.0 })?;
+            self.dl_fill.SetSize(Vector2 { X: bar_h, Y: bar_h })?;
+            self.shadow(&self.dl_track, 4.0, 1.0, 0.4)?;
+        }
+        let text = crate::paint::speed(snap.down);
+        if text != self.dl_text {
+            let (surface, w, h) = self.gfx.speed_pill(&text, k)?;
+            let brush = self.gfx.compositor.CreateSurfaceBrushWithSurface(&surface)?;
+            brush.SetStretch(CompositionStretch::Fill)?;
+            self.dl_pill.SetBrush(&brush)?;
+            self.dl_pill.SetSize(Vector2 { X: w, Y: h })?;
+            self.dl_pill.SetOffset(Vector3 { X: ((tile - w) / 2.0).round(), Y: (by - 3.0 * k - h).round(), Z: 0.0 })?;
+            self.dl_text = text;
+        }
+        // the fill glides to each new value on the compositor
+        let frac = snap.active_fraction().unwrap_or(0.0);
+        let target = Vector2 { X: (bar_w * frac).max(bar_h), Y: bar_h };
+        let c = &self.gfx.compositor;
+        let a = c.CreateVector2KeyFrameAnimation()?;
+        a.InsertExpressionKeyFrame(0.0, &HSTRING::from("this.StartingValue"))?;
+        a.InsertKeyFrameWithEasingFunction(1.0, target, &c.CreateLinearEasingFunction()?)?;
+        a.SetDuration(ms(520))?;
+        self.dl_fill.StartAnimation(&HSTRING::from("Size"), &a)?;
+        if !self.dl_shown {
+            self.dl_shown = true;
+            self.animate_opacity(&self.dl_overlay.cast()?, 1.0, 200)?;
+        }
+        Ok(())
+    }
+
+    /// The engine has news: new downloads pop into the stack, the overlay and the fan's
+    /// download rows update, and the downloads window refreshes.
+    fn on_downloads(&mut self) {
+        let Some(engine) = dl::engine_opt() else { return };
+        let snap = engine.snapshot();
+        manager::refresh();
+        let mut inflight: Vec<JobView> = snap.jobs.iter().filter(|j| !j.state.finished()).cloned().collect();
+        inflight.sort_by(|a, b| (b.state == DlState::Active).cmp(&(a.state == DlState::Active)).then(b.added.cmp(&a.added)).then(b.id.cmp(&a.id)));
+        let mut elsewhere = false;
+        for j in &snap.jobs {
+            let new = self.seen_jobs.insert(j.id);
+            if new && !self.first_snapshot && !j.state.finished() {
+                if same_dir(&j.dir, &self.dir) {
+                    self.popping.insert(j.id, std::time::Instant::now());
+                } else {
+                    elsewhere = true;
+                }
+            }
+        }
+        self.first_snapshot = false;
+        self.popping.retain(|_, t| t.elapsed().as_secs() < 4);
+        let shape = |v: &[JobView], dir: &Path| -> Vec<(u64, String, bool)> {
+            v.iter().filter(|j| same_dir(&j.dir, dir)).map(|j| (j.id, j.name.clone(), j.state == DlState::Active)).collect()
+        };
+        let changed = shape(&self.inflight, &self.dir) != shape(&inflight, &self.dir);
+        self.inflight = inflight;
+        if changed {
+            self.request_thumbs();
+            let _ = self.build_tile();
+            let _ = self.build_fan();
+        } else if self.fan_shown {
+            let _ = self.update_job_rows();
+        }
+        let _ = self.update_dl_overlay(&snap);
+        if elsewhere {
+            let _ = self.bounce();
+        }
+    }
+
+    /// Refresh the fan's download rows in place: label text and progress.
+    fn update_job_rows(&mut self) -> Result<()> {
+        let k = self.k;
+        let right = self.right();
+        let icon = ICON * self.ik;
+        for i in 0..self.rows.len() {
+            let Some(id) = self.rows[i].job else { continue };
+            let Some(j) = self.inflight.iter().find(|j| j.id == id).cloned() else { continue };
+            let text = job_label(&j);
+            if text != self.rows[i].text {
+                let (normal, lw, lh) = self.gfx.label(&text, k, false)?;
+                let (hover, _, _) = self.gfx.label(&text, k, true)?;
+                let c = &self.gfx.compositor;
+                let nb = c.CreateSurfaceBrushWithSurface(&normal)?;
+                nb.SetStretch(CompositionStretch::Fill)?;
+                let hb = c.CreateSurfaceBrushWithSurface(&hover)?;
+                hb.SetStretch(CompositionStretch::Fill)?;
+                let hovered = self.hover_row == Some(i);
+                let row = &mut self.rows[i];
+                let lx = if right { -(lw + 10.0 * k) } else { icon + 10.0 * k };
+                row.label.SetOffset(Vector3 { X: lx, Y: (icon - lh) / 2.0, Z: 0.0 })?;
+                row.label.SetSize(Vector2 { X: lw, Y: lh })?;
+                row.label.SetBrush(if hovered { &hb } else { &nb })?;
+                row.label_normal = nb;
+                row.label_hover = hb;
+                row.text = text;
+                let h = icon / 2.0;
+                let reach = h + 10.0 * k + lw;
+                row.extent = if right { (-reach, -h, h, h) } else { (-h, -h, reach, h) };
+            }
+            if let Some(bar) = self.rows[i].bar.clone() {
+                self.glide_bar(&bar, &j, icon)?;
+            }
+        }
+        self.update_fan_region();
+        Ok(())
+    }
+
+    /// A download row's progress fill glides to its new width.
+    fn glide_bar(&self, bar: &SpriteVisual, j: &JobView, width: f32) -> Result<()> {
+        let h = (4.0 * self.k).round().max(3.0);
+        let target = Vector2 { X: (width * j.fraction().unwrap_or(0.0)).max(h), Y: h };
+        let c = &self.gfx.compositor;
+        let a = c.CreateVector2KeyFrameAnimation()?;
+        a.InsertExpressionKeyFrame(0.0, &HSTRING::from("this.StartingValue"))?;
+        a.InsertKeyFrameWithEasingFunction(1.0, target, &c.CreateLinearEasingFunction()?)?;
+        a.SetDuration(ms(520))?;
+        bar.StartAnimation(&HSTRING::from("Size"), &a)
+    }
+
+    fn on_request(&mut self, r: ipc::Request) {
+        match r {
+            ipc::Request::Show => self.show_downloads(None),
+            ipc::Request::Open(links) => self.show_downloads(Some(links)),
+            ipc::Request::Add(list) => {
+                let dir = manager::default_dir(&self.settings);
+                for d in list {
+                    if !dl::is_source(&d.url) {
+                        continue;
+                    }
+                    dl::engine().add(dl::AddRequest { source: d.url.clone(), dir: dir.clone(), name: d.name(), headers: d.headers(), ..Default::default() });
+                }
+            }
+        }
+    }
+
+    fn show_downloads(&mut self, links: Option<Vec<String>>) {
+        self.close();
+        manager::show(&self.gfx, &self.settings, links);
+    }
+
+    /// A "dls:<key>[:<value>]" setting from the downloads window's Settings menu.
+    fn apply_dl_setting(&mut self, id: &str) -> Option<Blocking> {
+        let rest = id.strip_prefix("dls:")?;
+        let (key, value) = rest.split_once(':').unwrap_or((rest, ""));
+        let d = &mut self.settings.downloads;
+        match key {
+            "max" => d.max_active = value.parse().unwrap_or(3),
+            "conn" => d.connections = value.parse().unwrap_or(8),
+            "limit" => d.limit_kbps = value.parse().unwrap_or(0),
+            "seed" => d.seed = !d.seed,
+            "folder" if value == "choose" => return Some(Blocking::PickDownloadFolder),
+            "folder" => d.folder = None,
+            "window" => {
+                if let Some((w, h)) = value.split_once('x') {
+                    d.window = Some((w.parse().unwrap_or(880), h.parse().unwrap_or(560)));
+                }
+            }
+            "magnets" => shell::set_handles_magnets(!shell::handles_magnets()),
+            "bits" => d.bits = value == "1",
+            "binary" => d.binary = value == "1",
+            "browser" => {
+                let local = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join("browser"))).filter(|p| p.is_dir());
+                match local {
+                    Some(dir) => shell::open(&dir),
+                    None => shell::open(Path::new("https://github.com/frstycodes/stash/tree/main/browser")),
+                }
+            }
+            _ => {}
+        }
+        self.save_settings();
+        dl::engine().configure(self.settings.downloads.config());
+        crate::paint::set_units(self.settings.downloads.bits, self.settings.downloads.binary);
+        manager::set_settings(&self.settings);
+        None
+    }
+
+    /// Move the stack's Downloads folder (also where Stash saves downloads).
+    fn set_downloads_dir(&mut self, path: PathBuf) {
+        if path == self.downloads {
+            return;
+        }
+        let old = std::mem::replace(&mut self.downloads, path.clone());
+        self.settings.downloads.folder = Some(path.clone());
+        self.settings.folders.retain(|f| f != &path);
+        if let Some(w) = &mut self.watcher {
+            use notify::Watcher;
+            let _ = w.unwatch(&old);
+            let _ = w.watch(&path, notify::RecursiveMode::NonRecursive);
+        }
+        if self.dir == old {
+            self.set_folder(path, 1.0);
+        }
+        self.save_settings();
+        self.refresh_tray();
+    }
+
+    /// Settings commands for the stack's folders, from the Settings page.
+    fn folder_command(&mut self, id: &str) -> Option<Blocking> {
+        let (action, i) = id.strip_prefix("folder:")?.split_once(':')?;
+        let i: usize = i.parse().ok()?;
+        match action {
+            "remove" if i < self.settings.folders.len() => {
+                let gone = self.settings.folders.remove(i);
+                if let Some(w) = &mut self.watcher {
+                    use notify::Watcher;
+                    let _ = w.unwatch(&gone);
+                }
+                self.folder_icons.remove(&gone);
+                if self.dir == gone {
+                    self.set_folder(self.downloads.clone(), -1.0);
+                }
+                self.save_settings();
+                self.refresh_tray();
+                None
+            }
+            "change" => Some(Blocking::ChangeFolder(i)),
+            _ => None,
+        }
     }
 
     /// Where the tile's center sits inside the fan window.
@@ -751,13 +1160,14 @@ impl Stash {
         let (ox, oy) = self.fan_origin();
         let (_, fan_h) = self.fan_size;
         let fits = ((fan_h - TILE * ik / 2.0 - FIRST * ik - ICON * ik) / (STEP * ik)).floor().max(0.0) as usize + 1;
-        let visible: Vec<Item> = self.visible().to_vec();
+        let visible: Vec<Entry> = self.visible();
         let n = visible.len().min(fits);
-        let hidden = self.items.len() - n;
+        let hidden = self.entries().len() - n;
         let icon = ICON * ik;
         let h = icon / 2.0;
         let dir = if right { -1.0 } else { 1.0 };
         let mut rows = Vec::new();
+        let mut popped = Vec::new();
 
         let expr = |e: String, prop: &str, target: &Visual| -> Result<()> {
             let a = c.CreateExpressionAnimationWithExpression(&HSTRING::from(e))?;
@@ -823,19 +1233,22 @@ impl Stash {
                 angle: 0.0,
                 extent: if right { (-reach, -half, half, half) } else { (-half, -half, reach, half) },
                 path: None,
+                job: None,
+                bar: None,
+                text,
             });
         }
 
         // The arc's radius grows with the list, so the top row tilts at most MAX_TILT.
         let last_slot = n.saturating_sub(1) as f32;
         let r = (RADIUS * ik).max((FIRST + last_slot * STEP) * ik / MAX_TILT);
-        for (i, item) in visible[..n].iter().enumerate() {
+        for (i, entry) in visible[..n].iter().enumerate() {
             let s = (FIRST + i as f32 * STEP) * ik;
             let row = c.CreateContainerVisual()?;
             row.SetSize(Vector2 { X: icon, Y: icon })?;
             row.SetCenterPoint(Vector3 { X: icon / 2.0, Y: icon / 2.0, Z: 0.0 })?;
 
-            let thumb = self.thumb(&item.path);
+            let thumb = self.thumb(&entry.key());
             let pile_pose = (i < 3 && self.settings.display == Display::Stack && thumb.is_some()).then(|| &PILE[i]);
 
             let icon_visual = match thumb {
@@ -843,6 +1256,22 @@ impl Stash {
                     let v = self.sprite(&self.gfx.image_surface(px, icon, 0.0, 1.0, 1.0)?, icon, icon)?;
                     self.shadow(&v, 6.0, 3.0, 0.45)?;
                     row.Children()?.InsertAtTop(&v)?;
+                    if let Entry::Job(j) = entry {
+                        if j.state != DlState::Active {
+                            v.SetOpacity(0.55)?; // paused, waiting or failed
+                        }
+                        // started while the fan is open: it grows into its place
+                        if self.open && self.popping.contains_key(&j.id) {
+                            v.SetCenterPoint(Vector3 { X: icon / 2.0, Y: icon / 2.0, Z: 0.0 })?;
+                            let s = c.CreateVector3KeyFrameAnimation()?;
+                            s.InsertKeyFrame(0.0, Vector3 { X: 0.2, Y: 0.2, Z: 1.0 })?;
+                            s.InsertKeyFrameWithEasingFunction(0.6, Vector3 { X: 1.12, Y: 1.12, Z: 1.0 }, &self.ease_out)?;
+                            s.InsertKeyFrameWithEasingFunction(1.0, Vector3 { X: 1.0, Y: 1.0, Z: 1.0 }, &self.ease_out)?;
+                            s.SetDuration(ms(480))?;
+                            v.StartAnimation(&HSTRING::from("Scale"), &s)?;
+                            popped.push(j.id);
+                        }
+                    }
                     Some(v)
                 }
                 None => None,
@@ -861,7 +1290,35 @@ impl Stash {
                 _ => None,
             };
 
-            let (label, label_normal, label_hover, lw, lh) = make_label(&item.name)?;
+            let text = match entry {
+                Entry::File(item) => item.name.clone(),
+                Entry::Job(j) => job_label(j),
+            };
+            let (label, label_normal, label_hover, lw, lh) = make_label(&text)?;
+            // a download's progress, under its icon
+            let bar = match entry {
+                Entry::Job(j) if j.state != DlState::Failed => {
+                    let bh = (4.0 * k).round().max(3.0);
+                    let track = c.CreateSpriteVisual()?;
+                    track.SetBrush(&self.gfx.pill_brush(crate::gfx::color(20, 20, 22, 0.85), bh)?)?;
+                    track.SetSize(Vector2 { X: icon, Y: bh })?;
+                    track.SetOffset(Vector3 { X: 0.0, Y: icon + 4.0 * k, Z: 0.0 })?;
+                    let fill = c.CreateSpriteVisual()?;
+                    if j.state == DlState::Active {
+                        fill.SetBrush(&self.gfx.pill_brush(crate::paint::accent(), bh)?)?;
+                    } else {
+                        fill.SetBrush(&self.gfx.pill_brush(crate::gfx::color(160, 160, 166, 1.0), bh)?)?;
+                    }
+                    fill.SetSize(Vector2 { X: (icon * j.fraction().unwrap_or(0.0)).max(bh), Y: bh })?;
+                    fill.SetOffset(Vector3 { X: 0.0, Y: icon + 4.0 * k, Z: 0.0 })?;
+                    expr("p.Label".into(), "Opacity", &track.cast()?)?;
+                    expr("p.Label".into(), "Opacity", &fill.cast()?)?;
+                    row.Children()?.InsertAtTop(&track)?;
+                    row.Children()?.InsertAtTop(&fill)?;
+                    Some(fill)
+                }
+                _ => None,
+            };
             let lx = if right { -(lw + 10.0 * k) } else { icon + 10.0 * k };
             label.SetOffset(Vector3 { X: lx, Y: (icon - lh) / 2.0, Z: 0.0 })?;
             row.Children()?.InsertAtTop(&label)?;
@@ -902,8 +1359,20 @@ impl Stash {
                 center: (ox + dx, oy + dy),
                 angle: dir * s / r,
                 extent: if right { (-reach, -h, h, h) } else { (-h, -h, reach, h) },
-                path: Some(item.path.clone()),
+                path: match entry {
+                    Entry::File(item) => Some(item.path.clone()),
+                    Entry::Job(_) => None,
+                },
+                job: match entry {
+                    Entry::Job(j) => Some(j.id),
+                    _ => None,
+                },
+                bar,
+                text,
             });
+        }
+        for id in popped {
+            self.popping.remove(&id);
         }
         self.rows = rows;
         self.update_fan_region();
@@ -1117,6 +1586,7 @@ impl Stash {
         let hide = !visible && self.settings.display == Display::Stack;
         let _ = self.stack.StopAnimation(&HSTRING::from("Opacity"));
         let _ = self.stack.SetOpacity(if hide { 0.0 } else { 1.0 });
+        let _ = self.dl_overlay.SetIsVisible(visible);
     }
 
     fn pointer_over(&self) -> bool {
@@ -1310,7 +1780,7 @@ impl Stash {
                     let dragged = (x - at.x).abs().max((y - at.y).abs()) as f32 > 6.0 * self.k;
                     if wparam.0 & 0x0001 != 0 /* MK_LBUTTON */ && dragged {
                         self.press = None;
-                        if let Some(path) = self.rows.get(i).and_then(|r| r.path.clone()) {
+                        if let Some(path) = self.rows.get(i).filter(|r| r.job.is_none()).and_then(|r| r.path.clone()) {
                             return Some(Blocking::Drag(path));
                         }
                     }
@@ -1325,12 +1795,20 @@ impl Stash {
             WM_LBUTTONUP => {
                 if let (Some((i, _)), Some(r)) = (self.press.take(), row) {
                     if i == r {
-                        let path = self.rows[r].path.clone();
-                        self.activate(path);
+                        if self.rows[r].job.is_some() {
+                            self.show_downloads(None);
+                        } else {
+                            let path = self.rows[r].path.clone();
+                            self.activate(path);
+                        }
                     }
                 }
             }
             WM_RBUTTONUP => {
+                if let Some(id) = row.and_then(|r| self.rows[r].job) {
+                    let paused = self.inflight.iter().any(|j| j.id == id && matches!(j.state, DlState::Paused | DlState::Failed));
+                    return Some(Blocking::JobMenu { hwnd: self.fan, id, paused });
+                }
                 if let Some(path) = row.and_then(|r| self.rows[r].path.clone()) {
                     self.menu_target = Some(path);
                     return Some(Blocking::Menu { hwnd: self.fan, item: true });
@@ -1374,15 +1852,55 @@ impl Stash {
                 }
                 continue;
             }
+            if id.starts_with("dl:") {
+                manager::command(&id);
+                continue;
+            }
+            if id.starts_with("dls:") {
+                if let Some(b) = self.apply_dl_setting(&id) {
+                    blocking = Some(b);
+                }
+                continue;
+            }
+            if id.starts_with("folder:") {
+                if let Some(b) = self.folder_command(&id) {
+                    blocking = Some(b);
+                }
+                manager::set_settings(&self.settings);
+                continue;
+            }
             match id.as_str() {
+                ids::DOWNLOADS => self.show_downloads(None),
+
+                ids::NEW_DOWNLOAD => self.show_downloads(Some(Vec::new())),
                 ids::ADD_FOLDER => blocking = Some(Blocking::PickFolder),
                 ids::REMOVE_FOLDER => self.remove_folder(),
                 TRAY_CLICK => self.toggle_from_tray(),
                 ids::OPEN_FOLDER => self.activate(None),
-                ids::QUIT => unsafe { PostQuitMessage(0) },
+                "update:apply" => {
+                    // save where every download got to, start the new version, and go
+                    dl::engine().shutdown();
+                    match crate::update::apply() {
+                        Ok(()) => unsafe { PostQuitMessage(0) },
+                        Err(e) => log(format!("update failed: {e}")),
+                    }
+                }
+                "update:check" => crate::update::check_now(),
+                "noop" => {}
+                "update:auto" => {
+                    self.settings.auto_update = !self.settings.auto_update;
+                    crate::update::set_auto(self.settings.auto_update);
+                    self.save_settings();
+                    manager::set_settings(&self.settings);
+                }
+                ids::QUIT => {
+                    dl::engine().shutdown(); // saves where every download got to
+                    unsafe { PostQuitMessage(0) }
+                }
                 ids::LOGIN => {
                     shell::set_start_at_login(!shell::start_at_login());
                     self.refresh_tray();
+                    manager::set_settings(&self.settings);
                 }
                 ids::ITEM_OPEN => self.activate(target),
                 ids::ITEM_REVEAL => {
@@ -1415,6 +1933,7 @@ impl Stash {
                         }
                         self.reload(true);
                         self.prefetch(); // sort, count or size changed
+                        manager::set_settings(&self.settings);
                     }
                 }
             }
@@ -1430,7 +1949,8 @@ impl Stash {
 
     fn stack_menu(&self) -> tray_icon::menu::Menu {
         let names: Vec<String> = self.folders().iter().map(|f| shell::folder_name(f)).collect();
-        menu::stack_menu(&self.settings, shell::start_at_login(), &names, self.current_index())
+        let update = crate::update::self_updating().then(crate::update::status);
+        menu::stack_menu(&self.settings, shell::start_at_login(), &names, self.current_index(), update.as_ref())
     }
 
     // ---------- folders ----------
@@ -1827,6 +2347,49 @@ fn run_blocking(action: Blocking) {
                 s.restack();
             });
         }
+        Blocking::JobMenu { hwnd, id, paused } => {
+            with(|s| s.menu_open = true);
+            let menu = menu::job_menu(id, paused);
+            use tray_icon::menu::ContextMenu;
+            unsafe {
+                let _ = SetForegroundWindow(hwnd);
+                menu.show_context_menu_for_hwnd(hwnd.0 as isize, None);
+            }
+            with(|s| {
+                s.menu_open = false;
+                s.restack();
+            });
+        }
+        Blocking::PickDownloadFolder => {
+            if let Some(p) = shell::pick_folder() {
+                with(|s| {
+                    s.set_downloads_dir(p);
+                    manager::set_settings(&s.settings);
+                });
+            }
+        }
+        Blocking::ChangeFolder(i) => {
+            if let Some(p) = shell::pick_folder() {
+                with(|s| {
+                    if let Some(old) = s.settings.folders.get(i).cloned() {
+                        if !s.folders().contains(&p) {
+                            s.settings.folders[i] = p.clone();
+                            if let Some(w) = &mut s.watcher {
+                                use notify::Watcher;
+                                let _ = w.unwatch(&old);
+                                let _ = w.watch(&p, notify::RecursiveMode::NonRecursive);
+                            }
+                            if s.dir == old {
+                                s.set_folder(p, 1.0);
+                            }
+                            s.save_settings();
+                            s.refresh_tray();
+                        }
+                    }
+                    manager::set_settings(&s.settings);
+                });
+            }
+        }
         Blocking::PickFolder => {
             with(|s| s.menu_open = true);
             let picked = shell::pick_folder();
@@ -1836,6 +2399,7 @@ fn run_blocking(action: Blocking) {
                 if let Some(p) = picked {
                     s.add_folder(p);
                 }
+                manager::set_settings(&s.settings);
             });
         }
     }
@@ -1885,6 +2449,25 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_APP_FOLDER => {
             with(|s| s.on_folder_events());
             None
+        }
+        WM_APP_UPDATE => {
+            with(|s| s.refresh_tray());
+            manager::refresh_update();
+            None
+        }
+        WM_APP_DL => {
+            with(|s| s.on_downloads());
+            None
+        }
+        WM_COPYDATA if is_tile => {
+            if let Some(r) = ipc::receive(lparam) {
+                // reply first, so the sender isn't kept waiting on our UI
+                unsafe {
+                    let _ = ReplyMessage(LRESULT(1));
+                }
+                handle(r);
+            }
+            return LRESULT(1);
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_DPICHANGED if is_tile => {
             with(|s| s.relayout_if_needed());
