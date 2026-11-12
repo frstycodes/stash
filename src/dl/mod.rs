@@ -10,6 +10,21 @@ mod limiter;
 mod torrent;
 #[cfg(test)]
 mod bench;
+mod auth;
+mod batch;
+mod checksum;
+mod ftp;
+mod net;
+pub mod prefs;
+mod retry;
+mod schedule;
+pub mod sort;
+mod extra;
+
+pub use batch::{count as pattern_count, expand_all, links_in_text};
+pub use checksum::parse as parse_checksum;
+pub use extra::*;
+pub use prefs::Prefs;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -104,6 +119,14 @@ pub struct JobView {
     pub referrer: Option<String>,
     /// The link carries an expiry that has passed (signed links), so it can't be fetched again.
     pub expired: bool,
+    /// A checksum was given: whether the finished file matched it (None while unchecked).
+    pub verified: Option<bool>,
+    /// This download's own speed limit (bytes/s; 0 = none).
+    pub limit_bps: u64,
+    /// The site ("host:port") that wants a sign-in before this can go on.
+    pub needs_login: Option<String>,
+    /// Other links to the same file, tried when one fails.
+    pub mirrors: usize,
 }
 
 impl JobView {
@@ -125,6 +148,10 @@ pub struct Snapshot {
     pub up: u64,
     /// Bumps on every change, so the UI can skip identical snapshots.
     pub version: u64,
+    /// Why nothing starts right now (no network, metered, outside download hours).
+    pub held: Option<&'static str>,
+    /// Bumps each time everything on the list has finished (for "when done" actions).
+    pub queue_done: u64,
 }
 
 impl Snapshot {
@@ -151,6 +178,14 @@ pub struct AddRequest {
     pub name: Option<String>,
     /// Extra request headers (a browser's cookies and referrer), for downloads behind a sign-in.
     pub headers: Vec<(String, String)>,
+    /// A published checksum to check the finished file against ("sha256:…" or bare hex).
+    pub checksum: Option<String>,
+    /// More links to the same file, tried in turn when one fails.
+    pub mirrors: Vec<String>,
+    /// This download's own speed limit in bytes/s (0 = none).
+    pub limit_bps: u64,
+    /// The folder was picked for this download: don't sort it by type.
+    pub exact_dir: bool,
 }
 
 static ENGINE: std::sync::OnceLock<Engine> = std::sync::OnceLock::new();
@@ -188,16 +223,24 @@ enum Cmd {
     ClearFinished,
     Configure(Config),
     Shutdown(std::sync::mpsc::Sender<()>),
+    SetLimit(u64, u64),
+    Refresh(u64, String),
+    SignIn { id: u64, user: String, pass: String, remember: bool },
+    Prefs(Prefs),
 }
 
 /// Messages from running downloads back to the engine.
 pub(crate) enum Ev {
     /// The server told us the file's name and size.
-    HttpMeta { id: u64, name: String, total: Option<u64>, resumable: bool, temp: PathBuf },
+    HttpMeta { id: u64, name: String, total: Option<u64>, resumable: bool, temp: PathBuf, validator: Option<String>, dir: PathBuf },
     HttpDone { id: u64, path: PathBuf, total: u64 },
     TorrentMeta { id: u64, name: String, total: u64, info_hash: String, torrent_file: PathBuf, path: PathBuf },
     TorrentAdded { id: u64, handle: Arc<librqbit::ManagedTorrent> },
     Failed { id: u64, error: String },
+    /// An HTTP or FTP download failed, and how (worth retrying? needs a sign-in?).
+    HttpFailed { id: u64, failure: retry::Failure },
+    /// The finished file was checked against its checksum.
+    Verified { id: u64, result: Result<bool, String> },
 }
 
 pub fn is_source(s: &str) -> bool {
@@ -205,6 +248,7 @@ pub fn is_source(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
     lower.starts_with("http://")
         || lower.starts_with("https://")
+        || lower.starts_with("ftp://")
         || lower.starts_with("magnet:?")
         || (lower.ends_with(".torrent") && Path::new(s).is_file())
 }
@@ -279,7 +323,34 @@ struct Job {
     headers: Vec<(String, String)>,
     #[serde(default)]
     named_by_browser: bool,
+    #[serde(default)]
+    validator: Option<String>,
+    #[serde(default)]
+    checksum: Option<String>,
+    #[serde(default)]
+    verified: Option<bool>,
+    #[serde(default)]
+    limit_bps: u64,
+    #[serde(default)]
+    mirrors: Vec<String>,
+    #[serde(default)]
+    exact_dir: bool,
 
+    /// which of `source` and `mirrors` is in use (0: the source)
+    #[serde(skip)]
+    mirror: usize,
+    /// automatic retries so far, and when the next may start
+    #[serde(skip)]
+    tries: u32,
+    #[serde(skip)]
+    retry_at: Option<Instant>,
+    /// what a waiting download waits for (shown on its row)
+    #[serde(skip)]
+    wait: Option<&'static str>,
+    #[serde(skip)]
+    needs_login: Option<String>,
+    #[serde(skip)]
+    login_tries: u32,
     #[serde(skip)]
     speed: u64,
     #[serde(skip)]
@@ -309,7 +380,7 @@ impl Job {
             dir: self.dir.clone(),
             path: self.path.clone(),
             state: self.state,
-            phase: self.phase,
+            phase: if matches!(self.state, State::Queued | State::Paused) { self.wait } else { self.phase },
             priority: self.priority,
             total: self.total,
             done: self.done,
@@ -323,6 +394,10 @@ impl Job {
             finished_at: self.finished_at,
             referrer: self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("referer")).map(|(_, v)| v.clone()),
             expired: link_expired(&self.source),
+            verified: self.verified,
+            limit_bps: self.limit_bps,
+            needs_login: self.needs_login.clone(),
+            mirrors: self.mirrors.len(),
         }
     }
 }
@@ -403,6 +478,27 @@ impl Engine {
         self.send(Cmd::Configure(c));
     }
 
+    /// The newer settings (retry, schedule, proxy, sorting…).
+    pub fn set_prefs(&self, p: Prefs) {
+        self.send(Cmd::Prefs(p));
+    }
+
+    /// One download's own speed limit, in bytes/s (0: none).
+    pub fn set_limit(&self, id: u64, bps: u64) {
+        self.send(Cmd::SetLimit(id, bps));
+    }
+
+    /// A new link for a download whose link stopped working: it carries on with the
+    /// part already downloaded when the file is the same size, else starts over.
+    pub fn refresh_link(&self, id: u64, url: String) {
+        self.send(Cmd::Refresh(id, url));
+    }
+
+    /// The sign-in a site asked for; `remember` keeps it in Windows Credential Manager.
+    pub fn sign_in(&self, id: u64, user: String, pass: String, remember: bool) {
+        self.send(Cmd::SignIn { id, user, pass, remember });
+    }
+
     /// Save progress and stop every download (on quit). Waits up to a second.
     pub fn shutdown(&self) {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -414,6 +510,8 @@ impl Engine {
 struct Running {
     task: tokio::task::JoinHandle<()>,
     http: Option<Arc<http::Progress>>,
+    /// this download's own speed limit
+    limit: Option<Arc<Limiter>>,
 }
 
 struct Actor {
@@ -434,6 +532,7 @@ struct Actor {
     dirty: bool,
     last_save: Instant,
     last_tick: Instant,
+    x: extra::State,
 }
 
 impl Actor {
@@ -451,12 +550,8 @@ impl Actor {
         }
         let next_id = jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
         let next_order = jobs.iter().map(|j| j.order).max().unwrap_or(0) + 1;
-        let client = reqwest::Client::builder()
-            .user_agent(concat!("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Stash/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(20))
-            .read_timeout(Duration::from_secs(30))
-            .build()
-            .expect("http client");
+        let x = extra::State::new();
+        let client = extra::client(&x.prefs.proxy);
         Actor {
             limiter: Arc::new(Limiter::new(config.limit_bps)),
             config,
@@ -475,6 +570,7 @@ impl Actor {
             dirty: false,
             last_save: Instant::now(),
             last_tick: Instant::now(),
+            x,
         }
     }
 
@@ -484,8 +580,11 @@ impl Actor {
         self.publish();
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut slow = tokio::time::interval(extra::SLOW_TICK);
+        slow.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let busy = self.jobs.iter().any(|j| matches!(j.state, State::Active | State::Seeding));
+            let watching = self.watching();
             tokio::select! {
                 cmd = rx.recv() => {
                     let Some(cmd) = cmd else { break };
@@ -500,7 +599,11 @@ impl Actor {
                 Some(ev) = ev_rx.recv() => self.on_event(ev).await,
                 // only tick while something is moving: an idle engine does no work
                 _ = tick.tick(), if busy => self.on_tick().await,
+                // retries, download hours, the network: checked now and then, only while
+                // something waits on them
+                _ = slow.tick(), if watching => self.on_slow().await,
             }
+            self.after_change();
             self.schedule();
             self.publish();
             if self.dirty && (self.last_save.elapsed() >= SAVE_EVERY || !self.jobs.iter().any(|j| j.state == State::Active)) {
@@ -550,6 +653,10 @@ impl Actor {
                     paused: false,
                     name: old.named_by_browser.then(|| old.name.clone()),
                     headers: old.headers.clone(),
+                    checksum: old.checksum.clone(),
+                    mirrors: old.mirrors.clone(),
+                    limit_bps: old.limit_bps,
+                    exact_dir: old.exact_dir,
                 });
             }
             Cmd::Priority(id, p) => {
@@ -595,6 +702,10 @@ impl Actor {
                 self.config = c;
             }
             Cmd::Shutdown(_) => {}
+            Cmd::SetLimit(id, bps) => self.set_limit(id, bps),
+            Cmd::Refresh(id, url) => self.refresh(id, url).await,
+            Cmd::SignIn { id, user, pass, remember } => self.sign_in(id, user, pass, remember),
+            Cmd::Prefs(p) => self.set_prefs(p).await,
         }
     }
 
@@ -635,6 +746,18 @@ impl Actor {
             info_hash: None,
             named_by_browser: req.name.is_some(),
             headers: req.headers,
+            validator: None,
+            checksum: req.checksum.filter(|c| !c.trim().is_empty()),
+            verified: None,
+            limit_bps: req.limit_bps,
+            mirrors: req.mirrors.into_iter().map(|m| m.trim().to_string()).filter(|m| is_source(m)).collect(),
+            exact_dir: req.exact_dir,
+            mirror: 0,
+            tries: 0,
+            retry_at: None,
+            wait: None,
+            needs_login: None,
+            login_tries: 0,
             speed: 0,
             up_speed: 0,
             peers: None,
@@ -649,12 +772,16 @@ impl Actor {
 
     /// Start queued downloads, highest priority (then oldest) first, up to the limit.
     fn schedule(&mut self) {
+        if self.x.held.is_some() {
+            return;
+        }
         let active = self.jobs.iter().filter(|j| j.state == State::Active).count();
         let free = self.config.max_active.max(1).saturating_sub(active);
         if free == 0 {
             return;
         }
-        let mut queued: Vec<&Job> = self.jobs.iter().filter(|j| j.state == State::Queued).collect();
+        let now = Instant::now();
+        let mut queued: Vec<&Job> = self.jobs.iter().filter(|j| j.state == State::Queued && j.retry_at.is_none_or(|t| t <= now)).collect();
         queued.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.order.cmp(&b.order)));
         let ids: Vec<u64> = queued.iter().take(free).map(|j| j.id).collect();
         for id in ids {
@@ -676,6 +803,8 @@ impl Actor {
         }
         job.state = State::Active;
         job.error = None;
+        job.wait = None;
+        job.retry_at = None;
         job.speed = 0;
         job.last_done = job.done;
         self.dirty = true;
@@ -683,9 +812,30 @@ impl Actor {
             Kind::Http => {
                 job.phase = Some("Connecting…");
                 let progress = Arc::new(http::Progress::new(job.done, &job.remaining));
+                let own_limit = Arc::new(Limiter::new(job.limit_bps));
+                let sort = (self.x.prefs.auto_sort && !job.exact_dir && job.temp.is_none()).then(|| SortRule { overrides: self.x.prefs.sort_folders.clone() });
+                let url = job.url().to_string();
+                if url.to_ascii_lowercase().starts_with("ftp://") {
+                    let task = ftp::Task {
+                        id,
+                        url,
+                        dir: job.dir.clone(),
+                        name: (!job.name.is_empty()).then(|| job.name.clone()),
+                        temp: job.temp.clone().filter(|t| t.exists()),
+                        total: job.total,
+                        limiter,
+                        own_limit: own_limit.clone(),
+                        progress: progress.clone(),
+                        events,
+                        sort,
+                    };
+                    let handle = tokio::spawn(task.run());
+                    self.running.insert(id, Running { task: handle, http: Some(progress), limit: Some(own_limit) });
+                    return;
+                }
                 let task = http::Task {
                     id,
-                    url: job.source.clone(),
+                    url,
                     dir: job.dir.clone(),
                     name: (!job.name.is_empty()).then(|| job.name.clone()),
                     temp: job.temp.clone().filter(|t| t.exists()),
@@ -698,9 +848,12 @@ impl Actor {
                     limiter,
                     progress: progress.clone(),
                     events,
+                    validator: job.validator.clone(),
+                    own_limit: own_limit.clone(),
+                    sort,
                 };
                 let handle = tokio::spawn(task.run());
-                self.running.insert(id, Running { task: handle, http: Some(progress) });
+                self.running.insert(id, Running { task: handle, http: Some(progress), limit: Some(own_limit) });
             }
             Kind::Torrent => {
                 if let Some(handle) = self.torrents.get(&id).cloned() {
@@ -713,7 +866,7 @@ impl Actor {
                             let _ = s.unpause(&handle2).await;
                         }
                     });
-                    self.running.insert(id, Running { task, http: None });
+                    self.running.insert(id, Running { task, http: None, limit: None });
                     return;
                 }
                 job.phase = Some(if job.torrent_file.is_some() { "Checking files…" } else { "Fetching metadata…" });
@@ -728,16 +881,22 @@ impl Actor {
                     events,
                 };
                 let handle = tokio::spawn(task.run());
-                self.running.insert(id, Running { task: handle, http: None });
+                self.running.insert(id, Running { task: handle, http: None, limit: None });
             }
         }
     }
 
     async fn pause(&mut self, id: u64) {
-        self.persist_progress();
         if let Some(r) = self.running.remove(&id) {
-            if r.http.is_some() {
+            if let Some(p) = &r.http {
+                // stop it first, then save how far it got (and make that safe on disk)
                 r.task.abort();
+                let _ = r.task.await;
+                p.flush();
+                if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
+                    j.done = p.done.load(Ordering::Relaxed);
+                    j.remaining = p.remaining();
+                }
             }
         }
         if let (Some(h), Some(s)) = (self.torrents.get(&id).cloned(), self.session.get()) {
@@ -787,6 +946,9 @@ impl Actor {
         self.persist_progress();
         for (_, r) in self.running.drain() {
             r.task.abort();
+            if let Some(p) = &r.http {
+                p.flush();
+            }
         }
     }
 
@@ -796,6 +958,10 @@ impl Actor {
             if let Some(p) = self.running.get(&j.id).and_then(|r| r.http.as_ref()) {
                 j.done = p.done.load(Ordering::Relaxed);
                 j.remaining = p.remaining();
+                // what those ranges say is written goes to disk before the list is saved
+                // (off this thread: a flush can take a moment)
+                let p = p.clone();
+                tokio::task::spawn_blocking(move || p.flush());
             }
         }
     }
@@ -803,17 +969,23 @@ impl Actor {
     async fn on_event(&mut self, ev: Ev) {
         self.dirty = true;
         match ev {
-            Ev::HttpMeta { id, name, total, resumable, temp } => {
+            Ev::HttpMeta { id, name, total, resumable, temp, validator, dir } => {
                 if let Some(j) = self.job(id) {
                     j.name = name;
                     j.total = total;
                     j.resumable = resumable;
                     j.temp = Some(temp);
                     j.phase = None;
+                    j.validator = validator;
+                    j.dir = dir;
+                    j.needs_login = None;
                 }
             }
+            Ev::HttpFailed { id, failure } => self.on_http_failed(id, failure).await,
+            Ev::Verified { id, result } => self.on_verified(id, result),
             Ev::HttpDone { id, path, total } => {
                 self.running.remove(&id);
+                let events = self.ev_tx.clone();
                 if let Some(j) = self.job(id) {
                     j.state = State::Done;
                     j.name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -826,7 +998,18 @@ impl Actor {
                     j.connections = 0;
                     j.finished_at = Some(now());
                     j.forget_cookies();
+                    j.tries = 0;
+                    j.wait = None;
+                    // a published checksum: check the file before calling it done
+                    if let (Some(sum), Some(path)) = (j.checksum.clone(), j.path.clone()) {
+                        j.state = State::Active;
+                        j.phase = Some("Verifying…");
+                        tokio::task::spawn_blocking(move || {
+                            let _ = events.send(Ev::Verified { id, result: checksum::verify(&path, &sum) });
+                        });
+                    }
                 }
+                self.x.finished_in_run = true;
             }
             Ev::TorrentMeta { id, name, total, info_hash, torrent_file, path } => {
                 if let Some(j) = self.job(id) {
@@ -923,6 +1106,7 @@ impl Actor {
                         j.finished_at = Some(now());
                         j.speed = 0;
                         j.phase = None;
+                        self.x.finished_in_run = true;
                         if seed {
                             j.state = State::Seeding;
                         } else {
@@ -955,7 +1139,7 @@ impl Actor {
     fn publish(&mut self) {
         let jobs: Vec<JobView> = self.jobs.iter().map(Job::view).collect();
         let mut snap = self.shared.lock().unwrap();
-        if snap.jobs == jobs {
+        if snap.jobs == jobs && snap.held == self.x.held && snap.queue_done == self.x.queue_done {
             return;
         }
         self.version += 1;
@@ -963,6 +1147,8 @@ impl Actor {
         snap.up = jobs.iter().map(|j| j.up_speed).sum();
         snap.jobs = jobs;
         snap.version = self.version;
+        snap.held = self.x.held;
+        snap.queue_done = self.x.queue_done;
         drop(snap);
         (self.notify)();
     }

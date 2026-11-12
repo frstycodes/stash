@@ -16,6 +16,7 @@ use tokio::task::JoinSet;
 
 use super::Ev;
 use super::limiter::Limiter;
+use super::retry::Failure;
 
 /// A connection only takes over half of another's range when that half is at least this big.
 const MIN_SPLIT: u64 = 512 * 1024;
@@ -47,19 +48,54 @@ pub struct Progress {
     /// connection brings in (bytes/s): together, what taking over part of a range costs
     ttfb_ms: AtomicU64,
     conn_bps: AtomicU64,
+    /// the partial file, once open: flushed to disk when the download is paused or saved
+    file: Mutex<Option<Arc<std::fs::File>>>,
 }
 
 impl Progress {
     pub fn new(done: u64, remaining: &[(u64, u64)]) -> Self {
         let segs = remaining.iter().map(|&(pos, end)| Seg { pos, end, busy: false, asked: 0 }).collect();
-        Self { done: AtomicU64::new(done), connections: AtomicUsize::new(0), segs: Mutex::new(segs), ttfb_ms: AtomicU64::new(0), conn_bps: AtomicU64::new(0) }
+        Self { done: AtomicU64::new(done), connections: AtomicUsize::new(0), segs: Mutex::new(segs), ttfb_ms: AtomicU64::new(0), conn_bps: AtomicU64::new(0), file: Mutex::new(None) }
+    }
+
+    /// Make what's been written so far safe on disk (before its ranges are saved as done).
+    pub fn flush(&self) {
+        let f = self.file.lock().unwrap().clone();
+        if let Some(f) = f {
+            let _ = f.sync_data();
+        }
+    }
+
+    pub(super) fn set_file(&self, f: Arc<std::fs::File>) {
+        *self.file.lock().unwrap() = Some(f);
+    }
+
+    /// Where the first range left to fetch starts (FTP fetches one range, in order).
+    pub(super) fn first_pos(&self) -> Option<u64> {
+        self.segs.lock().unwrap().iter().find(|s| s.pos < s.end).map(|s| s.pos)
+    }
+
+    /// `n` more bytes written at the front of the first range.
+    pub(super) fn advance_first(&self, n: u64) {
+        let mut segs = self.segs.lock().unwrap();
+        if let Some(s) = segs.iter_mut().find(|s| s.pos < s.end) {
+            s.pos = (s.pos + n).min(s.end);
+        }
+        self.done.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// A range whose end wasn't known ends where the stream ended.
+    pub(super) fn close_open(&self) {
+        for s in self.segs.lock().unwrap().iter_mut().filter(|s| s.end == OPEN) {
+            s.end = s.pos;
+        }
     }
 
     pub fn remaining(&self) -> Vec<(u64, u64)> {
         self.segs.lock().unwrap().iter().filter(|s| s.pos < s.end).map(|s| (s.pos, s.end)).collect()
     }
 
-    fn reset(&self, total: Option<u64>) {
+    pub(super) fn reset(&self, total: Option<u64>) {
         *self.segs.lock().unwrap() = vec![Seg { pos: 0, end: total.unwrap_or(OPEN), busy: true, asked: OPEN }];
         self.done.store(0, Ordering::Relaxed);
     }
@@ -158,6 +194,12 @@ pub struct Task {
     pub limiter: Arc<Limiter>,
     pub progress: Arc<Progress>,
     pub events: UnboundedSender<Ev>,
+    /// The ETag or Last-Modified the partial file was fetched under (resume uses If-Range).
+    pub validator: Option<String>,
+    /// This download's own speed limit (on top of the shared one).
+    pub own_limit: Arc<Limiter>,
+    /// Where finished files go by type, when sorting is on.
+    pub sort: Option<super::SortRule>,
 }
 
 struct Fail {
@@ -165,18 +207,28 @@ struct Fail {
     fatal: bool,
     /// the server turned this connection away for now (429, 503)
     busy: bool,
+    /// our side failed (writing the file): no other connection can do better
+    local: bool,
+    /// a range request came back whole (200): the file changed on the server
+    changed: bool,
+    /// the server wants a sign-in (its WWW-Authenticate)
+    auth: Option<String>,
 }
 
 impl Fail {
     fn net(e: impl std::fmt::Display) -> Self {
-        Fail { msg: e.to_string(), fatal: false, busy: false }
+        Fail { msg: e.to_string(), fatal: false, busy: false, local: false, changed: false, auth: None }
     }
     fn fatal(e: impl std::fmt::Display) -> Self {
-        Fail { msg: e.to_string(), fatal: true, busy: false }
+        Fail { msg: e.to_string(), fatal: true, busy: false, local: true, changed: false, auth: None }
+    }
+    fn failure(self) -> Failure {
+        Failure { msg: self.msg, transient: !self.fatal || self.busy, retry_after: None, auth: self.auth, changed: self.changed }
     }
 }
 
 struct Ctx {
+    own_limit: Arc<Limiter>,
     url: String,
     headers: Vec<(String, String)>,
     client: reqwest::Client,
@@ -197,25 +249,44 @@ impl Task {
             Ok((path, total)) => {
                 let _ = events.send(Ev::HttpDone { id, path, total });
             }
-            Err(e) => {
-                let _ = events.send(Ev::Failed { id, error: e });
+            Err(failure) => {
+                let _ = events.send(Ev::HttpFailed { id, failure });
             }
         }
     }
 
-    async fn go(self) -> Result<(PathBuf, u64), String> {
+    async fn go(self) -> Result<(PathBuf, u64), Failure> {
         let first_remaining = self.progress.remaining().first().map(|r| r.0);
         let can_resume = self.resumable && self.temp.is_some() && self.total.is_some() && first_remaining.is_some();
 
         // Try to carry on from where we stopped; if the file on the server changed (or it
         // no longer serves ranges), start over.
+        // If-Range: the server sends the rest only if the file is still the one we have
+        // (a weak ETag can't be used for that; Last-Modified can)
+        let mut headers = self.headers.clone();
+        if let Some(v) = self.validator.as_ref().filter(|v| !v.starts_with("W/")) {
+            headers.push(("If-Range".into(), v.clone()));
+        }
         let mut resumed = None;
         if can_resume {
             let start = first_remaining.unwrap();
-            let resp = request(&self.client, &self.url, &self.headers, start, OPEN).await.map_err(|e| describe(&e))?;
-            let total = content_range_total(&resp);
-            if resp.status().as_u16() == 206 && total == self.total && ranges_add_up(&resp, start) {
-                resumed = Some((resp, start));
+            let mut tries = 0;
+            let resp = loop {
+                match request(&self.client, &self.url, &headers, start, OPEN).await {
+                    Ok(r) if r.status().as_u16() == 401 => return Err(auth_failure(&r)),
+                    Ok(r) if super::retry::transient_status(r.status().as_u16()) && tries < 3 => {}
+                    Ok(r) => break Some(r),
+                    Err(e) if tries < 3 && !e.is_builder() => {}
+                    Err(e) => return Err(Failure::transient(describe(&e))),
+                }
+                tries += 1;
+                tokio::time::sleep(Duration::from_secs(2 << tries)).await;
+            };
+            if let Some(resp) = resp {
+                let total = content_range_total(&resp);
+                if resp.status().as_u16() == 206 && total == self.total && ranges_add_up(&resp, start) {
+                    resumed = Some((resp, start));
+                }
             }
         }
 
@@ -224,7 +295,8 @@ impl Task {
                 let temp = self.temp.clone().unwrap();
                 let file = std::fs::OpenOptions::new().write(true).open(&temp).map_err(|e| e.to_string())?;
                 let name = self.name.clone().unwrap_or_else(|| "download".into());
-                let _ = self.events.send(Ev::HttpMeta { id: self.id, name, total: self.total, resumable: true, temp: temp.clone() });
+                let dir = temp.parent().map(PathBuf::from).unwrap_or(self.dir.clone());
+                let _ = self.events.send(Ev::HttpMeta { id: self.id, name, total: self.total, resumable: true, temp: temp.clone(), validator: self.validator.clone(), dir });
                 let i = self.progress.take_at(start).ok_or("lost track of the download")?;
                 (temp, self.total, true, file, (i, resp))
             }
@@ -244,28 +316,41 @@ impl Task {
                     _ => resp.content_length(),
                 };
                 let name = self.name.clone().filter(|_| self.from_browser).unwrap_or_else(|| file_name(&resp, &self.url));
-                std::fs::create_dir_all(&self.dir).map_err(|e| format!("Can't create the folder: {e}"))?;
-                let (temp, file) = claim(&self.dir, &name)?;
+                let dir = match &self.sort {
+                    Some(rule) => rule.dir_for(&self.dir, &name),
+                    None => self.dir.clone(),
+                };
+                std::fs::create_dir_all(&dir).map_err(|e| format!("Can't create the folder: {e}"))?;
+                let (temp, file) = claim(&dir, &name)?;
                 if let Some(t) = total {
                     file.set_len(t).map_err(|e| format!("Not enough disk space: {e}"))?;
                 }
                 set_hidden(&temp, true);
                 self.progress.reset(total);
-                let _ = self.events.send(Ev::HttpMeta { id: self.id, name, total, resumable: ranges, temp: temp.clone() });
+                let validator = validator_of(&resp);
+                let _ = self.events.send(Ev::HttpMeta { id: self.id, name, total, resumable: ranges, temp: temp.clone(), validator: validator.clone(), dir });
+                // later range requests ask for this same file
+                headers.retain(|(k, _)| !k.eq_ignore_ascii_case("if-range"));
+                if let Some(v) = validator.filter(|v| !v.starts_with("W/")) {
+                    headers.push(("If-Range".into(), v));
+                }
                 (temp, total, ranges, file, (0, resp))
             }
         };
 
         let url = resp_url(&first.1).unwrap_or(self.url.clone());
         // a site's cookies are for that site: not for wherever it redirects us
-        let headers = if same_site(&url, &self.url) { self.headers.clone() } else { without_credentials(&self.headers) };
+        let headers = if same_site(&url, &self.url) { headers } else { without_credentials(&headers) };
+        let file = Arc::new(file);
+        self.progress.set_file(file.clone());
         let ctx = Arc::new(Ctx {
+            own_limit: self.own_limit.clone(),
             url,
             headers,
             client: self.client.clone(),
             limiter: self.limiter.clone(),
             progress: self.progress.clone(),
-            file: Arc::new(file),
+            file,
             split: resumable && total.is_some(),
             workers: AtomicUsize::new(0),
             refused: Default::default(),
@@ -325,9 +410,9 @@ impl Task {
                             break;
                         }
                         Some(Ok(Ok(()))) => {}
-                        Some(Ok(Err(e))) => return Err(e.msg),
+                        Some(Ok(Err(e))) => return Err(e.failure()),
                         Some(Err(e)) if e.is_cancelled() => return Err("Stopped".into()),
-                        Some(Err(e)) => return Err(e.to_string()),
+                        Some(Err(e)) => return Err(e.to_string().into()),
                     }
                 }
                 _ = tick.tick(), if ctx.split => {
@@ -369,14 +454,16 @@ impl Task {
             }
         }
         if !self.progress.remaining().is_empty() {
-            return Err("The download stopped before the end".into());
+            return Err(Failure::transient("The download stopped before the end"));
         }
         let done = self.progress.done.load(Ordering::Relaxed);
         let host_url = ctx.url.clone();
         drop(ctx);
+        *self.progress.file.lock().unwrap() = None;
         set_hidden(&temp, false);
         let final_name = temp.file_name().unwrap().to_string_lossy().trim_end_matches(".stashpart").to_string();
-        let dest = finish(&temp, &self.dir, &final_name)?;
+        let dir = temp.parent().map(PathBuf::from).unwrap_or(self.dir.clone());
+        let dest = finish(&temp, &dir, &final_name)?;
         let referrer = self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("referer")).map(|(_, v)| v.as_str());
         mark_from_internet(&dest, &host_url, referrer);
         // the real file has its own icon or thumbnail now
@@ -542,6 +629,11 @@ async fn worker(ctx: Arc<Ctx>, mut first: Option<(usize, reqwest::Response)>) ->
                 }
                 served = true;
             }
+            // a connection the server won't serve (a CDN refusing one more range, say)
+            // leaves the rest to the others; the download only fails with the last one
+            Err(e) if e.fatal && !e.local && !e.changed && e.auth.is_none() && ctx.workers.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n > 1).then(|| n - 1)).is_ok() => {
+                return Ok(());
+            }
             Err(e) if e.fatal => return Err(e),
             Err(e) => {
                 // turned away before it ever got going: the server allows fewer
@@ -589,9 +681,14 @@ async fn attempt(ctx: &Ctx, i: usize, seg: Seg, resp: Option<reqwest::Response>)
             ctx.progress.answered_in(asked.elapsed());
             let ok = if seg.pos == 0 && seg.end == OPEN { r.status().is_success() } else { r.status().as_u16() == 206 };
             if !ok {
-                let busy = matches!(r.status().as_u16(), 429 | 503);
+                let code = r.status().as_u16();
+                let busy = matches!(code, 429 | 503);
                 let fatal = !busy && (r.status().is_client_error() || r.status().is_success());
-                return Err(Fail { msg: format!("The server answered {}", status_text(r.status())), fatal, busy });
+                // a whole file for a range request: it changed since we started (If-Range)
+                let changed = r.status().is_success() && ctx.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("if-range"));
+                let auth = (code == 401).then(|| www_authenticate(&r)).flatten();
+                let msg = if changed { "The file changed on the server".to_string() } else { format!("The server answered {}", status_text(r.status())) };
+                return Err(Fail { msg, fatal, busy, local: false, changed, auth });
             }
             r
         }
@@ -608,16 +705,16 @@ async fn pump(ctx: &Ctx, i: usize, resp: reqwest::Response) -> Result<(), Fail> 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| Fail::net(describe(&e)))?;
         ctx.limiter.acquire(chunk.len()).await;
+        ctx.own_limit.acquire(chunk.len()).await;
         let mut from = 0;
         while from < chunk.len() {
-            let (off, n, finished) = {
-                let mut segs = ctx.progress.segs.lock().unwrap();
-                let s = &mut segs[i];
-                let n = ((chunk.len() - from) as u64).min(s.end.saturating_sub(s.pos)) as usize;
-                let off = s.pos;
-                s.pos += n as u64;
-                (off, n, s.pos >= s.end)
+            let (off, n) = {
+                let segs = ctx.progress.segs.lock().unwrap();
+                let s = &segs[i];
+                (s.pos, ((chunk.len() - from) as u64).min(s.end.saturating_sub(s.pos)) as usize)
             };
+            // write first, then count it: the ranges saved for resuming never claim bytes
+            // that aren't in the file yet
             let mut written = 0;
             while written < n {
                 let w = ctx.file.seek_write(&chunk[from + written..from + n], off + written as u64).map_err(|e| Fail::fatal(format!("Can't write the file: {e}")))?;
@@ -626,7 +723,17 @@ async fn pump(ctx: &Ctx, i: usize, resp: reqwest::Response) -> Result<(), Fail> 
                 }
                 written += w;
             }
-            ctx.progress.done.fetch_add(n as u64, Ordering::Relaxed);
+            let (moved, finished) = {
+                let mut segs = ctx.progress.segs.lock().unwrap();
+                let s = &mut segs[i];
+                // another connection may have taken over the back of this range meanwhile:
+                // those bytes are the same either way, but only count what's still ours
+                let new = (off + n as u64).min(s.end).max(s.pos);
+                let moved = new - s.pos;
+                s.pos = new;
+                (moved, s.pos >= s.end)
+            };
+            ctx.progress.done.fetch_add(moved, Ordering::Relaxed);
             from += n;
             if finished && !ctx.progress.read_on(i) {
                 return Ok(());
@@ -675,23 +782,25 @@ fn host_limit(url: &str) -> usize {
 }
 
 /// The first request, retried through brief outages and "too many requests".
-async fn first_request(client: &reqwest::Client, url: &str, headers: &[(String, String)]) -> Result<reqwest::Response, String> {
+async fn first_request(client: &reqwest::Client, url: &str, headers: &[(String, String)]) -> Result<reqwest::Response, Failure> {
     let mut tries = 0;
     loop {
         let err = match request(client, url, headers, 0, OPEN).await {
             Ok(r) if r.status().is_success() => return Ok(r),
+            Ok(r) if r.status().as_u16() == 401 => return Err(auth_failure(&r)),
             Ok(r) => {
                 let s = r.status();
                 let busy = s.as_u16() == 429 || s.is_server_error() || s.as_u16() == 408;
-                if !busy || tries >= 4 {
-                    return Err(format!("The server answered {}", status_text(s)));
-                }
                 // honor Retry-After (in seconds), within reason
-                let wait = r.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+                let wait = r.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(super::retry::parse_retry_after);
+                if !busy || tries >= 4 {
+                    return Err(Failure::status(s.as_u16(), status_text(s), wait));
+                }
                 (format!("The server answered {}", status_text(s)), wait)
             }
             Err(e) if tries < 4 && !e.is_builder() => (describe(&e), None),
-            Err(e) => return Err(describe(&e)),
+            Err(e) if e.is_builder() => return Err(Failure::fatal(describe(&e))),
+            Err(e) => return Err(Failure::transient(describe(&e))),
         };
         tries += 1;
         let wait = err.1.unwrap_or(2 << tries).min(30);
@@ -705,7 +814,31 @@ async fn request(client: &reqwest::Client, url: &str, headers: &[(String, String
     for (k, v) in headers {
         req = req.header(k.as_str(), v.as_str());
     }
+    // a sign-in the user gave for this site (only ever sent to that site)
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("authorization")) {
+        if let Some(h) = super::auth::header_for(url) {
+            req = req.header(reqwest::header::AUTHORIZATION, h);
+        }
+    }
     req.header(RANGE, range).send().await
+}
+
+fn www_authenticate(r: &reqwest::Response) -> Option<String> {
+    r.headers().get_all(reqwest::header::WWW_AUTHENTICATE).iter().filter_map(|v| v.to_str().ok()).find(|v| super::auth::supported(v)).map(String::from)
+}
+
+/// A 401: the server wants a sign-in we can give (Basic or Digest), or one we can't.
+fn auth_failure(r: &reqwest::Response) -> Failure {
+    match www_authenticate(r) {
+        Some(ch) => Failure { msg: "This site needs you to sign in".into(), auth: Some(ch), ..Default::default() },
+        None => Failure::fatal(format!("The server answered {}", status_text(r.status()))),
+    }
+}
+
+/// What identifies this version of the file: its ETag, else its Last-Modified date.
+fn validator_of(r: &reqwest::Response) -> Option<String> {
+    let h = |name: reqwest::header::HeaderName| r.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+    h(reqwest::header::ETAG).filter(|e| !e.starts_with("W/")).or_else(|| h(reqwest::header::LAST_MODIFIED))
 }
 
 fn describe(e: &reqwest::Error) -> String {
@@ -830,7 +963,7 @@ fn ext_for_type(t: &str) -> Option<&'static str> {
 /// Reserve a name for a new download: `<name>.stashpart`, where neither it nor the
 /// finished `<name>` exists yet ("name (2).zip" otherwise). Created here, so two downloads
 /// can't pick the same one.
-fn claim(dir: &Path, name: &str) -> Result<(PathBuf, std::fs::File), String> {
+pub(super) fn claim(dir: &Path, name: &str) -> Result<(PathBuf, std::fs::File), String> {
     let (stem, ext) = split_name(name);
     for n in 1..10_000 {
         let candidate = if n == 1 { name.to_string() } else { format!("{stem} ({n}){ext}") };
@@ -855,7 +988,7 @@ fn split_name(name: &str) -> (String, String) {
 }
 
 /// Move the finished download to its real name, never over a file that's there already.
-fn finish(temp: &Path, dir: &Path, name: &str) -> Result<PathBuf, String> {
+pub(super) fn finish(temp: &Path, dir: &Path, name: &str) -> Result<PathBuf, String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::{MOVE_FILE_FLAGS, MoveFileExW};
     let wide = |p: &Path| p.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
@@ -904,7 +1037,7 @@ fn without_credentials(h: &[(String, String)]) -> Vec<(String, String)> {
     h.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("cookie") && !k.eq_ignore_ascii_case("authorization")).cloned().collect()
 }
 
-fn set_hidden(path: &Path, hidden: bool) {
+pub(super) fn set_hidden(path: &Path, hidden: bool) {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL, SetFileAttributesW};
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
