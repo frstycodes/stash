@@ -20,7 +20,7 @@ notify = "8"
 tray-icon = "0.21"
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Download engine: one small tokio runtime off the UI thread runs HTTP and torrents.
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "process", "io-util"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # Schannel (the Windows TLS stack) instead of rustls/aws-lc: smaller, no C toolchain.
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "stream", "http2", "charset", "system-proxy"] }
@@ -62,6 +62,7 @@ features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
+    "Win32_System_JobObjects",
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_SystemServices",
