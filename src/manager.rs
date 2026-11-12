@@ -1962,6 +1962,8 @@ impl Manager {
         };
         let speed = if active > 0 { Some(paint::speed(down)) } else { None };
         let status = if self.picked.len() > 1 { format!("{} selected  \u{b7}  Esc to clear", self.picked.len()) } else { status };
+        // gaming mode holds downloads back: say why they're slow
+        let status = if active > 0 && self.picked.len() <= 1 && dl::gaming::active() { format!("{}  \u{b7}  {status}", dl::gaming::NOTE) } else { status };
         let values = self.speeds.clone();
         let status_w = cw - 24.0 - 22.0 - 4.0 * 48.0;
         self.sprite_from(&self.dock_status, status_w, DOCK_H, |p| {

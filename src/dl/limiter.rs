@@ -18,12 +18,13 @@ impl Limiter {
     }
 
     pub fn limited(&self) -> bool {
-        self.bps.load(Ordering::Relaxed) > 0
+        super::gaming::effective(self.bps.load(Ordering::Relaxed)) > 0
     }
 
     /// Wait until `n` bytes may be taken. Free when there's no limit.
     pub async fn acquire(&self, n: usize) {
-        let bps = self.bps.load(Ordering::Relaxed);
+        // gaming mode may hold it lower than the user's own limit
+        let bps = super::gaming::effective(self.bps.load(Ordering::Relaxed));
         if bps == 0 {
             return;
         }

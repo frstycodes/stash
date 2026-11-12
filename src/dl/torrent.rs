@@ -46,7 +46,21 @@ impl Lazy {
 }
 
 pub fn set_limit(s: &Session, bps: u64) {
-    s.ratelimits.set_download_bps(NonZeroU32::new(bps.min(u32::MAX as u64) as u32));
+    // gaming mode may hold the download lower and the upload hard
+    let (down, up) = super::gaming::torrent_limits(bps);
+    APPLIED.store(super::gaming::effective(0), std::sync::atomic::Ordering::Relaxed);
+    s.ratelimits.set_download_bps(NonZeroU32::new(down.min(u32::MAX as u64) as u32));
+    s.ratelimits.set_upload_bps(NonZeroU32::new(up.min(u32::MAX as u64) as u32));
+}
+
+/// Gaming mode's cap when the session's limits were last set.
+static APPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Re-set the session's limits when gaming mode's cap moved (every engine tick).
+pub fn follow_gaming(s: &Session, bps: u64) {
+    if APPLIED.load(std::sync::atomic::Ordering::Relaxed) != super::gaming::effective(0) {
+        set_limit(s, bps);
+    }
 }
 
 pub struct Task {

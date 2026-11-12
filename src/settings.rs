@@ -113,11 +113,18 @@ pub struct DlSettings {
     pub bits: bool,
     /// Sizes in binary units (MiB, 1024) instead of decimal (MB, 1000).
     pub binary: bool,
+    /// Gaming mode: slow down while an online game runs, to keep its ping low.
+    #[serde(default = "yes")]
+    pub gaming: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Default for DlSettings {
     fn default() -> Self {
-        Self { max_active: 3, connections: 8, limit_kbps: 0, seed: false, folder: None, window: None, bits: false, binary: false }
+        Self { max_active: 3, connections: 8, limit_kbps: 0, seed: false, folder: None, window: None, bits: false, binary: false, gaming: true }
     }
 }
 

@@ -5,6 +5,7 @@
 //! commands and reads a snapshot back; the engine calls `notify` when the snapshot
 //! changes (at most a few times a second while something downloads, never when idle).
 
+pub mod gaming;
 mod http;
 mod limiter;
 mod torrent;
@@ -157,7 +158,10 @@ static ENGINE: std::sync::OnceLock<Engine> = std::sync::OnceLock::new();
 
 /// Start the engine once, at launch.
 pub fn init(config: Config, notify: impl Fn() + Send + Sync + 'static) {
-    ENGINE.get_or_init(|| Engine::start(config, notify));
+    let notify = Arc::new(notify);
+    let poke = notify.clone();
+    ENGINE.get_or_init(|| Engine::start(config, move || notify()));
+    gaming::start(move || poke());
 }
 
 pub fn engine_opt() -> Option<&'static Engine> {
@@ -457,6 +461,7 @@ impl Actor {
             .read_timeout(Duration::from_secs(30))
             .build()
             .expect("http client");
+        gaming::set_user_limit(config.limit_bps);
         Actor {
             limiter: Arc::new(Limiter::new(config.limit_bps)),
             config,
@@ -576,6 +581,7 @@ impl Actor {
                 }
             }
             Cmd::Configure(c) => {
+                gaming::set_user_limit(c.limit_bps);
                 if c.limit_bps != self.config.limit_bps {
                     self.limiter.set(c.limit_bps);
                     if let Some(s) = self.session.get() {
@@ -938,6 +944,7 @@ impl Actor {
             }
         }
         if let Some(s) = self.session.get() {
+            torrent::follow_gaming(&s, self.config.limit_bps);
             for id in failed {
                 if let Some(h) = self.torrents.remove(&id) {
                     let _ = s.delete(librqbit::api::TorrentIdOrHash::Id(h.id()), false).await;
