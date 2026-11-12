@@ -1,0 +1,29 @@
+{
+ "label": "jsdelivr after fix",
+ "rows": [
+  {
+   "case": "jsdelivr",
+   "tool": "stash",
+   "note": "12 files, 0.5-10 MB, HTTP/2 CDN",
+   "runs": 2,
+   "of": 2,
+   "wall": 4.877,
+   "avg": 9239317.102622565,
+   "peak": 12406454.0,
+   "cpu": 1.008,
+   "mem": 17537024.0
+  },
+  {
+   "case": "jsdelivr",
+   "tool": "browser",
+   "note": "12 files, 0.5-10 MB, HTTP/2 CDN",
+   "runs": 2,
+   "of": 2,
+   "wall": 4.0215,
+   "avg": 11203586.397235002,
+   "peak": 14703645.0,
+   "cpu": 1.0230000000000001,
+   "mem": 17504256.0
+  }
+ ]
+}

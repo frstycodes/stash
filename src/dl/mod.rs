@@ -8,6 +8,8 @@
 mod http;
 mod limiter;
 mod torrent;
+#[cfg(test)]
+mod bench;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

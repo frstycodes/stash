@@ -17,6 +17,10 @@ impl Limiter {
         self.bps.store(bps, Ordering::Relaxed);
     }
 
+    pub fn limited(&self) -> bool {
+        self.bps.load(Ordering::Relaxed) > 0
+    }
+
     /// Wait until `n` bytes may be taken. Free when there's no limit.
     pub async fn acquire(&self, n: usize) {
         let bps = self.bps.load(Ordering::Relaxed);
