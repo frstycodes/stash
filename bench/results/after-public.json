@@ -1,0 +1,137 @@
+{
+ "label": "after public",
+ "rows": [
+  {
+   "case": "github",
+   "tool": "stash",
+   "note": "33 MB GitHub release (redirect, Azure blob)",
+   "runs": 2,
+   "of": 2,
+   "wall": 3.3955,
+   "avg": 9927712.855869032,
+   "peak": 16264107.5,
+   "cpu": 0.6950000000000001,
+   "mem": 17786880.0
+  },
+  {
+   "case": "github",
+   "tool": "browser",
+   "note": "33 MB GitHub release (redirect, Azure blob)",
+   "runs": 2,
+   "of": 2,
+   "wall": 3.3695,
+   "avg": 10003798.985037956,
+   "peak": 16471279.0,
+   "cpu": 0.5545,
+   "mem": 17577984.0
+  },
+  {
+   "case": "github",
+   "tool": "curl",
+   "note": "33 MB GitHub release (redirect, Azure blob)",
+   "runs": 2,
+   "of": 2,
+   "wall": 3.3671398000005865,
+   "avg": 10010865.484089693,
+   "peak": null,
+   "cpu": 0.6171875,
+   "mem": 9674752.0
+  },
+  {
+   "case": "github",
+   "tool": "aria2c",
+   "note": "33 MB GitHub release (redirect, Azure blob)",
+   "runs": 2,
+   "of": 2,
+   "wall": 4.028258899999855,
+   "avg": 8375182.027825307,
+   "peak": null,
+   "cpu": 1.0078125,
+   "mem": 26941440.0
+  },
+  {
+   "case": "python",
+   "tool": "stash",
+   "note": "26 MB from Fastly",
+   "runs": 2,
+   "of": 2,
+   "wall": 2.5389999999999997,
+   "avg": 10453362.415013082,
+   "peak": 12310601.0,
+   "cpu": 0.492,
+   "mem": 16746496.0
+  },
+  {
+   "case": "python",
+   "tool": "browser",
+   "note": "26 MB from Fastly",
+   "runs": 2,
+   "of": 2,
+   "wall": 2.464,
+   "avg": 10770415.584415585,
+   "peak": 12214980.5,
+   "cpu": 0.547,
+   "mem": 16431104.0
+  },
+  {
+   "case": "python",
+   "tool": "curl",
+   "note": "26 MB from Fastly",
+   "runs": 2,
+   "of": 2,
+   "wall": 2.4339005499996347,
+   "avg": 10903610.824779905,
+   "peak": null,
+   "cpu": 0.359375,
+   "mem": 9533440.0
+  },
+  {
+   "case": "python",
+   "tool": "aria2c",
+   "note": "26 MB from Fastly",
+   "runs": 2,
+   "of": 2,
+   "wall": 2.7505430500004877,
+   "avg": 9648453.763842065,
+   "peak": null,
+   "cpu": 0.859375,
+   "mem": 29372416.0
+  },
+  {
+   "case": "jsdelivr",
+   "tool": "stash",
+   "note": "12 files, 0.5-10 MB, HTTP/2 CDN",
+   "runs": 2,
+   "of": 2,
+   "wall": 0.8295,
+   "avg": 8756746.794536091,
+   "peak": null,
+   "cpu": 0.2425,
+   "mem": 17020928.0
+  },
+  {
+   "case": "jsdelivr",
+   "tool": "browser",
+   "note": "12 files, 0.5-10 MB, HTTP/2 CDN",
+   "runs": 2,
+   "of": 2,
+   "wall": 0.7545,
+   "avg": 9618104.952834332,
+   "peak": null,
+   "cpu": 0.258,
+   "mem": 17108992.0
+  },
+  {
+   "case": "jsdelivr",
+   "tool": "curl",
+   "failed": true,
+   "note": "12 files, 0.5-10 MB, HTTP/2 CDN"
+  },
+  {
+   "case": "jsdelivr",
+   "tool": "aria2c",
+   "failed": true,
+   "note": "12 files, 0.5-10 MB, HTTP/2 CDN"
+  }
+ ]
+}

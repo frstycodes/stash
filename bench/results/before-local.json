@@ -1,0 +1,77 @@
+{
+ "label": "0.5.0",
+ "rows": [
+  {
+   "case": "local-big",
+   "tool": "stash",
+   "note": "300 MB, 6 MB/s per connection, 100 MB/s link",
+   "runs": 3,
+   "of": 3,
+   "wall": 6.846,
+   "avg": 45949868.5363716,
+   "peak": 68008478,
+   "cpu": 0.172,
+   "mem": 15130624
+  },
+  {
+   "case": "local-norange",
+   "tool": "stash",
+   "note": "100 MB, no ranges, 6 MB/s per connection",
+   "runs": 3,
+   "of": 3,
+   "wall": 16.711,
+   "avg": 6274765.124768117,
+   "peak": 7742899,
+   "cpu": 0.094,
+   "mem": 12234752
+  },
+  {
+   "case": "local-slowstart",
+   "tool": "stash",
+   "note": "100 MB, 1.5 s to first byte per request",
+   "runs": 3,
+   "of": 3,
+   "wall": 7.604,
+   "avg": 13789794.844818516,
+   "peak": 47205441,
+   "cpu": 0.031,
+   "mem": 14635008
+  },
+  {
+   "case": "local-maxconn4",
+   "tool": "stash",
+   "failed": true,
+   "note": "100 MB, 429 past 4 connections"
+  },
+  {
+   "case": "local-reqlimit",
+   "tool": "stash",
+   "failed": true,
+   "note": "100 MB, 429 past 3 requests in 5 s"
+  },
+  {
+   "case": "local-small",
+   "tool": "stash",
+   "note": "30 x 2 MB, 80 ms to first byte",
+   "runs": 3,
+   "of": 3,
+   "wall": 11.577,
+   "avg": 5434444.156517233,
+   "peak": 6945572,
+   "cpu": 0.047,
+   "mem": 13504512
+  },
+  {
+   "case": "local-unlimited",
+   "tool": "stash",
+   "note": "1 GB, no per-connection cap (CPU/disk bound)",
+   "runs": 3,
+   "of": 3,
+   "wall": 10.471,
+   "avg": 102544343.80670422,
+   "peak": 135249307,
+   "cpu": 0.078,
+   "mem": 17399808
+  }
+ ]
+}

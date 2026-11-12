@@ -1,0 +1,41 @@
+{
+ "label": "after (final ramp)",
+ "rows": [
+  {
+   "case": "local-big",
+   "tool": "stash",
+   "note": "300 MB, 6 MB/s per connection, 100 MB/s link",
+   "runs": 3,
+   "of": 3,
+   "wall": 3.972,
+   "avg": 79197583.081571,
+   "peak": 105496469,
+   "cpu": 0.047,
+   "mem": 20287488
+  },
+  {
+   "case": "local-slowstart",
+   "tool": "stash",
+   "note": "100 MB, 1.5 s to first byte per request",
+   "runs": 3,
+   "of": 3,
+   "wall": 5.832,
+   "avg": 17979698.216735255,
+   "peak": 48788480,
+   "cpu": 0.094,
+   "mem": 16314368
+  },
+  {
+   "case": "local-unlimited",
+   "tool": "stash",
+   "note": "1 GB, no per-connection cap (CPU/disk bound)",
+   "runs": 3,
+   "of": 3,
+   "wall": 11.152,
+   "avg": 96282444.76327117,
+   "peak": 128073596,
+   "cpu": 0.781,
+   "mem": 21471232
+  }
+ ]
+}

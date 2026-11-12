@@ -1,0 +1,41 @@
+{
+ "label": "0.5.0 public",
+ "rows": [
+  {
+   "case": "github",
+   "tool": "stash",
+   "note": "33 MB GitHub release (redirect, Azure blob)",
+   "runs": 2,
+   "of": 2,
+   "wall": 3.6479999999999997,
+   "avg": 9261632.850008678,
+   "peak": 13114716.5,
+   "cpu": 0.703,
+   "mem": 17543168.0
+  },
+  {
+   "case": "python",
+   "tool": "stash",
+   "note": "26 MB from Fastly",
+   "runs": 2,
+   "of": 2,
+   "wall": 2.616,
+   "avg": 10144613.103176683,
+   "peak": 12302897.0,
+   "cpu": 0.477,
+   "mem": 16566272.0
+  },
+  {
+   "case": "jsdelivr",
+   "tool": "stash",
+   "note": "12 files, 0.5-10 MB, HTTP/2 CDN",
+   "runs": 2,
+   "of": 2,
+   "wall": 4.452,
+   "avg": 1630073.189580921,
+   "peak": 2779560.0,
+   "cpu": 0.3125,
+   "mem": 16912384.0
+  }
+ ]
+}

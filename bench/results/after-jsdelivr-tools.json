@@ -1,0 +1,29 @@
+{
+ "label": "jsdelivr tools",
+ "rows": [
+  {
+   "case": "jsdelivr",
+   "tool": "curl",
+   "note": "12 files, 0.5-10 MB, HTTP/2 CDN",
+   "runs": 2,
+   "of": 2,
+   "wall": 3.959709250000742,
+   "avg": 11378621.581118539,
+   "peak": null,
+   "cpu": 1.0546875,
+   "mem": 10237952.0
+  },
+  {
+   "case": "jsdelivr",
+   "tool": "aria2c",
+   "note": "12 files, 0.5-10 MB, HTTP/2 CDN",
+   "runs": 2,
+   "of": 2,
+   "wall": 4.281629350001822,
+   "avg": 10577965.952665798,
+   "peak": null,
+   "cpu": 1.234375,
+   "mem": 14921728.0
+  }
+ ]
+}

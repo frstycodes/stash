@@ -1,0 +1,29 @@
+{
+ "label": "after hetzner",
+ "rows": [
+  {
+   "case": "hetzner",
+   "tool": "stash",
+   "note": "100 MB, HTTP/1.1, ranges",
+   "runs": 1,
+   "of": 1,
+   "wall": 14.416,
+   "avg": 7273695.8934517205,
+   "peak": 12401727,
+   "cpu": 1.234,
+   "mem": 16347136
+  },
+  {
+   "case": "hetzner",
+   "tool": "browser",
+   "note": "100 MB, HTTP/1.1, ranges",
+   "runs": 1,
+   "of": 1,
+   "wall": 13.219,
+   "avg": 7932339.81390423,
+   "peak": 13002490,
+   "cpu": 1.328,
+   "mem": 15933440
+  }
+ ]
+}
