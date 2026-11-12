@@ -1,6 +1,6 @@
 [package]
 name = "stash"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 description = "A download manager (HTTP and BitTorrent) and macOS-style Downloads stack for Windows"
 authors = ["Sandesh Pandey"]
