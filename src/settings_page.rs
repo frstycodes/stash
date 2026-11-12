@@ -449,6 +449,39 @@ impl SettingsPage {
             foot: None,
         });
 
+        // the downloads list: sort, grouping, auto-clear
+        let l = &s.list;
+        sections.push(Section {
+            title: "Downloads list",
+            keys: "list history",
+            rows: vec![
+                Row::new(
+                    "Sort by",
+                    Some("Date added shows the history by day."),
+                    "sort order name size site type date added newest",
+                    Ctl::Seg {
+                        id: "lsort",
+                        opts: crate::list_prefs::SORTS.iter().map(|(_, _, label)| label.replace("Date Added", "Added")).collect(),
+                        sel: crate::list_prefs::SORTS.iter().position(|(by, _, _)| *by == l.sort),
+                        custom: None,
+                    },
+                ),
+                Row::new("Group by site", Some("Downloads from the same site sit together."), "group site domain source website", Ctl::Switch { id: "lgroup", on: l.group_site, enabled: true }),
+                Row::new(
+                    "Clear finished downloads after",
+                    Some("Takes them off the list. Their files stay where they are."),
+                    "auto clear remove old history cleanup forget days week month",
+                    Ctl::Seg {
+                        id: "lclear",
+                        opts: crate::list_prefs::CLEAR_AFTER.iter().map(|(_, label)| label.to_string()).collect(),
+                        sel: crate::list_prefs::CLEAR_AFTER.iter().position(|(d, _)| *d == l.auto_clear_days),
+                        custom: None,
+                    },
+                ),
+            ],
+            foot: None,
+        });
+
         // units
         sections.push(Section {
             title: "Units",
@@ -933,6 +966,8 @@ impl SettingsPage {
                     "sort" => cmd(format!("sort:{}", ["added", "modified", "name", "kind"][*i])),
                     "count" => cmd(format!("limit:{}", val?)),
                     "size" => cmd(format!("size:{}", ["small", "medium", "large", "extra-large"][*i])),
+                    "lsort" => cmd(format!("dlw:sort:{}", crate::list_prefs::SORTS.get(*i)?.1)),
+                    "lclear" => cmd(format!("dlw:clear:{}", crate::list_prefs::CLEAR_AFTER.get(*i)?.0)),
                     _ => None,
                 }
             }
@@ -955,6 +990,7 @@ impl SettingsPage {
                 "show-stack" => cmd("show-stack:flip".into()),
                 "arrivals" => cmd("arrivals:flip".into()),
                 "autoupdate" => cmd("update:auto".into()),
+                "lgroup" => cmd("dlw:group".into()),
                 _ => None,
             },
             Hit::Button(id) => cmd(id.clone()),

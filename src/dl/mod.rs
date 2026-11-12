@@ -188,6 +188,8 @@ enum Cmd {
     ClearFinished,
     Configure(Config),
     Shutdown(std::sync::mpsc::Sender<()>),
+    /// A finished download's file was renamed (by the window): it's at `path` now.
+    Renamed { id: u64, path: PathBuf },
 }
 
 /// Messages from running downloads back to the engine.
@@ -402,6 +404,10 @@ impl Engine {
     pub fn configure(&self, c: Config) {
         self.send(Cmd::Configure(c));
     }
+    /// A finished download's file has a new name (the window renamed it on disk).
+    pub fn renamed(&self, id: u64, path: PathBuf) {
+        self.send(Cmd::Renamed { id, path });
+    }
 
     /// Save progress and stop every download (on quit). Waits up to a second.
     pub fn shutdown(&self) {
@@ -595,6 +601,14 @@ impl Actor {
                 self.config = c;
             }
             Cmd::Shutdown(_) => {}
+            Cmd::Renamed { id, path } => {
+                if let Some(j) = self.job(id).filter(|j| j.state.finished()) {
+                    if let Some(name) = path.file_name() {
+                        j.name = name.to_string_lossy().into_owned();
+                    }
+                    j.path = Some(path);
+                }
+            }
         }
     }
 
