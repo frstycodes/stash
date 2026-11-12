@@ -517,6 +517,7 @@ pub fn clipboard_text() -> Option<String> {
 }
 
 pub fn set_clipboard_text(text: &str) {
+    crate::clipwatch::note_own(text);
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
     use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};

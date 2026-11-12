@@ -97,6 +97,35 @@ pub struct Settings {
     /// The downloads list: its sort, grouping and auto-clear.
     #[serde(default)]
     pub list: crate::list_prefs::ListSettings,
+    /// A Windows notification when a download finishes or fails.
+    #[serde(default = "on")]
+    pub notify: bool,
+    /// The shortcut that opens the stack from anywhere ("Ctrl+Alt+D"; "" = none).
+    #[serde(default = "default_hotkey")]
+    pub hotkey: String,
+    /// Offer to download links to files when you copy them.
+    #[serde(default)]
+    pub watch_clipboard: bool,
+    /// How the stack opens: a fan or a grid.
+    #[serde(default)]
+    pub view: View,
+}
+
+fn on() -> bool {
+    true
+}
+
+fn default_hotkey() -> String {
+    crate::hotkey::DEFAULT.to_string()
+}
+
+/// How the stack shows its files when opened (macOS: View content as).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum View {
+    #[default]
+    Fan,
+    Grid,
 }
 
 /// The download manager's settings.
@@ -162,6 +191,10 @@ impl Default for Settings {
             downloads: DlSettings::default(),
             auto_update: true,
             list: Default::default(),
+            notify: true,
+            hotkey: default_hotkey(),
+            watch_clipboard: false,
+            view: View::Fan,
         }
     }
 }
