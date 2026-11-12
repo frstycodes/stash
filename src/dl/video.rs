@@ -923,8 +923,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Network test: downloads Big Buck Bunny's trailer-length clip (Creative Commons,
-    /// Blender Foundation) as audio and at 480p, through the engine.
+    /// Network test: downloads Big Buck Bunny (Creative Commons, Blender Foundation) as
+    /// audio and at 480p through the engine, pausing and resuming the video on the way.
+    /// The tools go to STASH_TOOLS if set (to keep them between runs).
     /// `cargo test dl::video::tests::end_to_end -- --ignored --nocapture`
     #[test]
     #[ignore]
@@ -939,16 +940,29 @@ mod tests {
         let info = crate::tools::runtime().block_on(probe(&url)).expect("probe");
         println!("{} {:?} {:?}", info.title, info.duration.map(duration_text), info.sizes);
         let engine = Engine::start(Config { max_active: 2, connections: 4, limit_bps: 0, seed: false }, || {});
-        for q in [Quality::AudioM4a, Quality::P480] {
+        for (i, q) in [Quality::AudioM4a, Quality::P480].into_iter().enumerate() {
             let spec = Spec { quality: q, title: info.title.clone(), expected: info.size(q), thumbnail: info.thumbnail.clone() };
-            engine.add(AddRequest { source: info.url.clone(), dir: dir.join(q.label().replace(['(', ')', ' '], "")), video: Some(spec), ..Default::default() });
+            // (the same link twice would be one download)
+            let source = if i == 0 { info.url.clone() } else { format!("{}&stash={i}", info.url) };
+            engine.add(AddRequest { source, dir: dir.join(q.label().replace(['(', ')', ' '], "")), video: Some(spec), ..Default::default() });
         }
         let start = std::time::Instant::now();
+        let mut paused = false;
         loop {
             std::thread::sleep(Duration::from_secs(1));
             let s = engine.snapshot();
             for j in &s.jobs {
                 println!("{:?} {:?} {} {}/{:?} {} B/s {:?}", j.state, j.phase, j.name, j.done, j.total, j.speed, j.error);
+            }
+            // pause the video part-way, then carry on from its part files
+            if let Some(j) = s.jobs.get(1).filter(|j| !paused && j.state == State::Active && j.done > 3_000_000) {
+                paused = true;
+                let before = j.done;
+                engine.pause(j.id);
+                std::thread::sleep(Duration::from_secs(2));
+                assert_eq!(engine.snapshot().jobs[1].state, State::Paused);
+                engine.resume(j.id);
+                println!("paused at {before}, resumed");
             }
             if s.jobs.len() == 2 && s.jobs.iter().all(|j| matches!(j.state, State::Done | State::Failed)) || start.elapsed().as_secs() > 600 {
                 for j in &s.jobs {
@@ -963,6 +977,7 @@ mod tests {
                     let names: Vec<String> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
                     assert_eq!(names.len(), 1, "{names:?}");
                 }
+                assert!(paused, "never got to pause the video");
                 break;
             }
         }

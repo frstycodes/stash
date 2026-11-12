@@ -855,6 +855,7 @@ impl Actor {
                     j.remaining.clear();
                     j.speed = 0;
                     j.connections = 0;
+                    j.phase = None;
                     j.finished_at = Some(now());
                     j.forget_cookies();
                 }
