@@ -1008,7 +1008,7 @@ fn video_section() -> Section {
         let part = |name: &str, v: &Option<String>| format!("{name} {}", v.as_deref().unwrap_or("not yet"));
         format!("{} · {}", part("yt-dlp", &t.ytdlp), part("ffmpeg", &t.ffmpeg))
     } else {
-        "Not here yet. Stash gets them the first time you download a video.".into()
+        "Not here yet. They come with your first video.".into()
     };
     let buttons = if t.fetching.is_some() {
         Vec::new()
