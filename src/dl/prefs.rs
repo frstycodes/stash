@@ -29,13 +29,6 @@ pub struct Proxy {
     pub user: String,
 }
 
-impl Proxy {
-    /// "host:port" as typed, or empty.
-    pub fn address(&self) -> String {
-        if self.host.is_empty() { String::new() } else { format!("{}:{}", self.host, self.port) }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum WhenDone {
@@ -52,7 +45,7 @@ impl WhenDone {
             WhenDone::Nothing => "",
             WhenDone::Sleep => "go to sleep",
             WhenDone::ShutDown => "shut down",
-            WhenDone::Quit => "quit Stash",
+            WhenDone::Quit => "quit",
         }
     }
 }

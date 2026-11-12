@@ -113,11 +113,14 @@ pub struct DlSettings {
     pub bits: bool,
     /// Sizes in binary units (MiB, 1024) instead of decimal (MB, 1000).
     pub binary: bool,
+    /// Retries, download hours, proxy, sorting, what to do when done.
+    #[serde(default)]
+    pub engine: crate::dl::Prefs,
 }
 
 impl Default for DlSettings {
     fn default() -> Self {
-        Self { max_active: 3, connections: 8, limit_kbps: 0, seed: false, folder: None, window: None, bits: false, binary: false }
+        Self { max_active: 3, connections: 8, limit_kbps: 0, seed: false, folder: None, window: None, bits: false, binary: false, engine: crate::dl::Prefs::default() }
     }
 }
 

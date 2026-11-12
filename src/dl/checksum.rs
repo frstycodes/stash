@@ -12,16 +12,6 @@ pub enum Algo {
     Sha256,
 }
 
-impl Algo {
-    pub fn name(self) -> &'static str {
-        match self {
-            Algo::Md5 => "MD5",
-            Algo::Sha1 => "SHA-1",
-            Algo::Sha256 => "SHA-256",
-        }
-    }
-}
-
 /// What was typed: a bare hex digest (its length says which kind) or one with a prefix
 /// ("sha256:…", "SHA-1 …", "md5=…"). Returns the kind and the lowercase digest.
 pub fn parse(s: &str) -> Option<(Algo, String)> {

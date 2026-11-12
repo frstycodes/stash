@@ -575,6 +575,10 @@ impl Stash {
         APP.with(|a| *a.borrow_mut() = Some(state));
         // The download engine: its own thread; it pokes us when there's news.
         let dl_config = with(|s| s.settings.downloads.config()).unwrap_or_default();
+        // the newer engine settings apply from the very start (download hours, proxy)
+        if let Some(p) = with(|s| s.settings.downloads.engine.clone()) {
+            dl::preset_prefs(p);
+        }
         dl::init(dl_config, || post(WM_APP_DL));
         // updates for the GitHub builds: checked daily, downloaded in the background
         crate::update::set_auto(with(|s| s.settings.auto_update).unwrap_or(true));
@@ -996,6 +1000,11 @@ impl Stash {
         let Some(engine) = dl::engine_opt() else { return };
         let snap = engine.snapshot();
         manager::refresh();
+        // everything finished: sleep, shut down or quit, if asked (after a countdown)
+        if manager::queue_finished(&snap, &self.settings) {
+            self.show_downloads(None);
+            manager::start_countdown(self.settings.downloads.engine.when_done);
+        }
         let mut inflight: Vec<JobView> = snap.jobs.iter().filter(|j| !j.state.finished()).cloned().collect();
         inflight.sort_by(|a, b| (b.state == DlState::Active).cmp(&(a.state == DlState::Active)).then(b.added.cmp(&a.added)).then(b.id.cmp(&a.id)));
         let mut elsewhere = false;
@@ -2089,6 +2098,15 @@ impl Stash {
             if id.starts_with("dls:") {
                 if let Some(b) = self.apply_dl_setting(&id) {
                     blocking = Some(b);
+                }
+                continue;
+            }
+            // the download engine's settings (Settings > Download Engine)
+            if id.starts_with("dle:") {
+                if manager::apply_engine_command(&id, &mut self.settings.downloads.engine) {
+                    self.save_settings();
+                    dl::engine().set_prefs(self.settings.downloads.engine.clone());
+                    manager::set_settings(&self.settings);
                 }
                 continue;
             }

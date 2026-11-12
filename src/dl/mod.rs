@@ -25,6 +25,7 @@ pub use batch::{count as pattern_count, expand_all, links_in_text};
 pub use checksum::parse as parse_checksum;
 pub use extra::*;
 pub use prefs::Prefs;
+pub use net::{shut_down as shut_down_now, sleep as sleep_now};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1405,6 +1406,48 @@ mod tests {
                 break;
             }
             assert!(j.state != State::Failed && j.state != State::Done && start.elapsed().as_secs() < 30, "no preview: {:?} {:?}", j.state, j.error);
+        }
+    }
+
+    /// Network test: pause part-way, resume (If-Range), and check the file against its
+    /// checksum. `STASH_TEST_URL=<url> STASH_TEST_SHA256=<hex> cargo test dl::tests::resume_and_verify -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn resume_and_verify() {
+        let dir = std::env::temp_dir().join("stash-dl-test-resume");
+        unsafe { std::env::set_var("STASH_DATA", dir.join("data")) };
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = std::env::var("STASH_TEST_URL").expect("STASH_TEST_URL");
+        let sum = std::env::var("STASH_TEST_SHA256").expect("STASH_TEST_SHA256");
+        let engine = Engine::start(Config { max_active: 1, connections: 4, limit_bps: 3_000_000, seed: false }, || {});
+        engine.add(AddRequest { source: url, dir: dir.clone(), checksum: Some(format!("sha256:{sum}")), ..Default::default() });
+        let start = Instant::now();
+        let mut paused = false;
+        loop {
+            std::thread::sleep(Duration::from_millis(300));
+            let s = engine.snapshot();
+            let j = s.jobs.last().unwrap().clone();
+            if !paused && j.done > 2_000_000 {
+                engine.pause(j.id);
+                std::thread::sleep(Duration::from_secs(1));
+                let p = engine.snapshot().jobs.last().unwrap().clone();
+                println!("paused at {} of {:?}", p.done, p.total);
+                assert_eq!(p.state, State::Paused);
+                engine.configure(Config { max_active: 1, connections: 4, limit_bps: 0, seed: false });
+                engine.resume(j.id);
+                paused = true;
+                continue;
+            }
+            if j.state == State::Done && j.verified.is_some() {
+                println!("done: {:?} verified={:?} {:?}", j.path, j.verified, j.error);
+                assert!(paused, "finished before it could be paused");
+                assert_eq!(j.verified, Some(true), "{:?}", j.error);
+                engine.remove(j.id, true);
+                std::thread::sleep(Duration::from_millis(500));
+                break;
+            }
+            assert!(j.state != State::Failed && start.elapsed().as_secs() < 120, "{:?} {:?}", j.state, j.error);
         }
     }
 

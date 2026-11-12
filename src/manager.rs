@@ -39,6 +39,9 @@ use crate::settings::Settings;
 use crate::settings_page::{self, SettingsPage, Values};
 use crate::shell;
 
+mod forms;
+pub use forms::{apply_engine_command, queue_finished, start_countdown};
+
 // ---------- geometry (logical pixels) ----------
 
 const SIDEBAR: f32 = 212.0;
@@ -136,6 +139,8 @@ enum Hit {
     Cancel,
     Ok,
     AlsoDelete,
+    /// the download engine's form sheets (and the New Download sheet's extra links)
+    Form(forms::FHit),
 }
 
 /// A single-line text field: the search box and the New Download link field.
@@ -279,6 +284,8 @@ enum SheetKind {
     /// `permanent`: Shift+Delete, which deletes the files for good after asking.
     /// `cancel`: stopping several unfinished downloads (their partial files go too).
     Remove { ids: Vec<u64>, name: String, path: String, delete: bool, permanent: bool, cancel: bool },
+    /// The download engine's small forms (sign-in, speed limit, settings...).
+    Form(Box<forms::Form>),
 }
 
 /// The right-click menu while it's open: for `ids` (the selection), at (x, y) in DIPs.
@@ -303,6 +310,7 @@ struct Sheet {
 enum Blocking {
     PickFolder,
     PickTorrent,
+    ImportList,
 }
 
 pub struct Manager {
@@ -510,6 +518,8 @@ impl Manager {
                 }
             }
             "add" => self.open_add(Some("https://example.com/files/big-archive.zip".into())),
+            // the download engine's forms ("form-proxy", "form-signin"...)
+            other if other.starts_with("form-") => self.debug_form(&other[5..]),
             "cancel" => {
                 // the Cancel Downloads sheet, as for two downloads stopped part-way
                 let ids: Vec<u64> = self.jobs.iter().take(2).map(|j| j.id).collect();
@@ -1010,6 +1020,7 @@ impl Manager {
 
     fn on_snapshot(&mut self, force: bool) {
         let snap = dl::engine().snapshot();
+        self.check_prompts(&snap);
         let changed = snap.version != self.version;
         if !changed && !force {
             return;
@@ -2440,6 +2451,7 @@ impl Manager {
                 }
             }
             Hit::UpdateCard => crate::stash::queue("update:apply".into()),
+            Hit::Form(h) => return self.form_click(h),
             Hit::Field | Hit::Sheet | Hit::Caption | Hit::Dock | Hit::CapMin | Hit::CapMax | Hit::CapClose => {}
         }
         None
@@ -2509,6 +2521,12 @@ impl Manager {
                     if self.job(*id).is_some_and(|j| matches!(j.state, State::Paused | State::Failed)) {
                         e.resume(*id);
                     }
+                }
+            }
+            "limit" => self.open_limit(ids.to_vec()),
+            "refresh" => {
+                if let Some(id) = ids.first() {
+                    self.open_refresh(*id);
                 }
             }
             "again" => {
@@ -2614,6 +2632,13 @@ impl Manager {
                 };
                 items.push(Item::Action { id: id.into(), label: label.into(), icon: icon(glyph), keys: Some("Space"), enabled: true, danger: false });
                 items.push(action("now", "Start Now".into(), None, j.state == State::Queued));
+                if j.kind == Kind::Http {
+                    let limit = if j.limit_bps > 0 { format!("Speed Limit ({} KB/s)\u{2026}", j.limit_bps / 1024) } else { "Speed Limit\u{2026}".to_string() };
+                    items.push(Item::Action { id: "limit".into(), label: limit, icon: None, keys: None, enabled: true, danger: false });
+                    if matches!(j.state, State::Failed | State::Paused) || j.expired {
+                        items.push(Item::Action { id: "refresh".into(), label: "Refresh Link\u{2026}".into(), icon: icon("copy"), keys: None, enabled: true, danger: false });
+                    }
+                }
                 items.push(Item::Priority(Some(j.priority)));
                 items.push(Item::Sep);
             }
@@ -3016,6 +3041,9 @@ impl Manager {
     }
 
     fn on_char(&mut self, ch: char) {
+        if self.form_char(ch) {
+            return;
+        }
         if let Some(Sheet { kind: SheetKind::Add { field, error, .. }, .. }) = &mut self.sheet {
             field.insert(&ch.to_string());
             *error = None;
@@ -3067,6 +3095,7 @@ impl Manager {
             // no switch to show when it's a permanent delete
             SheetKind::Remove { permanent: true, .. } | SheetKind::Remove { cancel: true, .. } => (420.0, REMOVE_H - 46.0),
             SheetKind::Remove { .. } => (420.0, REMOVE_H),
+            SheetKind::Form(f) => f.size(),
         }
     }
 
@@ -3171,7 +3200,11 @@ impl Manager {
         }
         let inside = |l: f32, t: f32, rw: f32, rh: f32| x >= l && x < l + rw && y >= t && y < t + rh;
         match &s.kind {
+            SheetKind::Form(_) => return self.form_hit(x, y).map(Hit::Form).unwrap_or(Hit::Sheet),
             SheetKind::Add { .. } => {
+                if let Some(h) = self.add_sheet_links(x, y) {
+                    return Hit::Form(h);
+                }
                 if inside(24.0, 76.0, w - 48.0, 36.0) {
                     return Hit::Field;
                 }
@@ -3220,6 +3253,9 @@ impl Manager {
     }
 
     fn paint_sheet(&mut self) -> Result<()> {
+        if self.is_form() {
+            return self.paint_form();
+        }
         let prio = self.prio_seg();
         let k = self.k;
         let hover = self.hover.clone();
@@ -3241,7 +3277,7 @@ impl Manager {
                 let (scroll_x, all, priority) = (field.scroll_x, field.all, *priority);
                 let error = error.clone();
                 let folder = dir.display().to_string();
-                let count = text.split_whitespace().filter(|t| dl::is_source(t)).count();
+                let count: usize = text.split_whitespace().filter(|t| dl::is_source(t)).map(dl::pattern_count).sum();
                 let ok_label = if count > 1 { format!("Download {count}") } else { "Download".to_string() };
                 let full_w = paint::advance(&dw, &text, FIELD_TEXT * k) / k;
                 let draw = |p: &P| {
@@ -3279,6 +3315,7 @@ impl Manager {
                     let hot = [Priority::Low, Priority::Normal, Priority::High].iter().position(|x| hover == Hit::Prio(*x));
                     crate::ui::paint_seg(p, *rect, parts, &["Low", "Normal", "High"], sel, hot, false);
                     crate::ui::link(p, 26.0, 232.0, "Open Torrent File…", Some(icons::TORRENT), hover == Hit::Torrent);
+                    Manager::paint_add_sheet_links(p, &hover);
                     let ok_x = w - 24.0 - 120.0;
                     let cancel_x = ok_x - 10.0 - 92.0;
                     let bh = crate::ui::BUTTON_H;
@@ -3392,6 +3429,7 @@ impl Manager {
                     settings_page::place_switch(&self.gfx, track, knob, r, delete, true, k, flip)?;
                 }
             }
+            SheetKind::Form(_) => {}
         }
         Ok(())
     }
@@ -3408,6 +3446,9 @@ impl Manager {
             }
             return true;
         }
+        if self.is_form() {
+            return self.form_key(vk, ctrl);
+        }
         let Some(Sheet { kind: SheetKind::Add { field, error, .. }, .. }) = &mut self.sheet else { return false };
         if !field.key(vk, ctrl) {
             return false;
@@ -3418,6 +3459,9 @@ impl Manager {
     }
 
     fn submit_sheet(&mut self) {
+        if self.is_form() {
+            return self.submit_form(None);
+        }
         let Some(s) = &mut self.sheet else { return };
         match &mut s.kind {
             SheetKind::Add { field, dir, priority, error } => {
@@ -3433,15 +3477,16 @@ impl Manager {
                     let _ = self.paint_sheet();
                     return;
                 }
-                for l in &links {
-                    dl::engine().add(AddRequest { source: l.to_string(), dir: dir.clone(), priority: *priority, ..Default::default() });
-                }
+                let links: Vec<String> = links.iter().map(|l| l.to_string()).collect();
+                let template = AddRequest { dir: dir.clone(), priority: *priority, ..Default::default() };
                 if self.view == Page::List(Filter::Completed) || self.view == Page::Settings {
                     self.set_view(Page::List(Filter::All));
                 }
                 self.scroll = 0.0;
                 self.close_sheet();
                 self.clamp_scroll(true);
+                // patterns expanded, and a question first for what's already here
+                self.add_links(links, template);
             }
             SheetKind::Remove { ids, delete, permanent, cancel, .. } => {
                 let (ids, delete, permanent, cancel) = (ids.clone(), *delete, *permanent, *cancel);
@@ -3468,6 +3513,7 @@ impl Manager {
                 };
                 self.show_toast(&note);
             }
+            SheetKind::Form(_) => {}
         }
     }
 
@@ -3665,6 +3711,15 @@ fn paint_row(p: &P, j: &JobView, rw: f32, selected: bool, hovered: bool, hover_b
             p.glyph(icons::WARNING, 75.0, meta_y + 8.0, 9.5, paint::warn_text());
             let w1 = p.text("Moved or deleted", 86.0, meta_y, 12.5, MEDIUM, paint::warn_text(), 160.0);
             p.text(&format!("  ·  {size}  ·  {from}"), 86.0 + w1, meta_y, 12.5, REGULAR, paint::dim(), right - 86.0 - w1);
+        } else if j.verified == Some(false) {
+            // the file isn't the one its checksum says
+            p.glyph(icons::WARNING, 75.0, meta_y + 8.0, 9.5, paint::red());
+            let w1 = p.text("Checksum doesn't match", 86.0, meta_y, 12.5, MEDIUM, paint::red(), 200.0);
+            p.text(&format!("  ·  {size}  ·  {from}"), 86.0 + w1, meta_y, 12.5, REGULAR, paint::dim(), right - 86.0 - w1);
+        } else if j.verified == Some(true) {
+            p.glyph(icons::CHECK, 75.0, meta_y + 8.0, 9.5, paint::green());
+            let w1 = p.text("Verified", 86.0, meta_y, 12.5, MEDIUM, paint::green(), 120.0);
+            p.text(&format!("  ·  {size}  ·  {from}"), 86.0 + w1, meta_y, 12.5, REGULAR, paint::dim(), right - 86.0 - w1);
         } else {
             p.text(&format!("{size}  ·  {from}"), 68.0, meta_y, 12.5, REGULAR, paint::dim(), right - 68.0);
         }
@@ -3674,6 +3729,8 @@ fn paint_row(p: &P, j: &JobView, rw: f32, selected: bool, hovered: bool, hover_b
             None => paint::bytes(j.done),
         };
         let left = match j.state {
+            // why it waits (no network, download hours, a retry, a sign-in), if it says
+            State::Queued | State::Paused if j.phase.is_some() => format!("{}  ·  {size}", j.phase.unwrap_or_default()),
             State::Queued => format!("Waiting  ·  {size}"),
             State::Paused => format!("Paused  ·  {size}"),
             State::Failed => format!("Failed  ·  {}", j.error.clone().unwrap_or_default()),
@@ -3765,6 +3822,11 @@ fn run_blocking(_hwnd: HWND, b: Blocking) {
                 });
             }
         }
+        Blocking::ImportList => {
+            if let Some(file) = forms::pick_list() {
+                with(|m| m.import_list(&file));
+            }
+        }
         Blocking::PickTorrent => {
             if let Some(file) = shell::pick_torrent() {
                 with(|m| {
@@ -3845,7 +3907,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 let h = m.hit(x as f32 / m.k, y as f32 / m.k);
                 let cursor = match &h {
-                    Hit::Search | Hit::Field => IDC_IBEAM,
+                    Hit::Search | Hit::Field | Hit::Form(forms::FHit::Field(_)) => IDC_IBEAM,
                     Hit::None | Hit::Caption | Hit::Row(_) | Hit::Sheet | Hit::Backdrop | Hit::Dock | Hit::Menu(_) | Hit::MenuOff => IDC_ARROW,
                     Hit::Page(settings_page::Hit::None) => IDC_ARROW,
                     _ => IDC_HAND,
@@ -4011,6 +4073,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let _ = KillTimer(Some(hwnd), T_VIEW);
             }
             with(|m| m.view_later());
+            return LRESULT(0);
+        }
+        WM_TIMER if wparam.0 == forms::T_FORM => {
+            with(|m| m.form_tick());
             return LRESULT(0);
         }
         WM_TIMER if wparam.0 == T_TIP => {
