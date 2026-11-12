@@ -9,6 +9,7 @@ pub mod gaming;
 mod http;
 mod limiter;
 mod torrent;
+pub mod video;
 #[cfg(test)]
 mod bench;
 mod auth;
@@ -59,6 +60,8 @@ pub enum Priority {
 pub enum Kind {
     Http,
     Torrent,
+    /// A video from a web page, fetched by yt-dlp (see `video.rs`).
+    Video,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +194,8 @@ pub struct AddRequest {
     pub limit_bps: u64,
     /// The folder was picked for this download: don't sort it by type.
     pub exact_dir: bool,
+    /// A video from a web page (the New Download sheet read it with yt-dlp).
+    pub video: Option<video::Spec>,
 }
 
 static ENGINE: std::sync::OnceLock<Engine> = std::sync::OnceLock::new();
@@ -390,6 +395,9 @@ struct Job {
     seeded_secs: u64,
     #[serde(skip)]
     last_uploaded: u64,
+    // Video: what to fetch, and how
+    #[serde(default)]
+    video: Option<video::Spec>,
 }
 
 impl Job {
@@ -415,7 +423,7 @@ impl Job {
             up_speed: self.up_speed,
             peers: self.peers,
             connections: self.connections,
-            resumable: self.resumable || self.kind == Kind::Torrent,
+            resumable: self.resumable || self.kind != Kind::Http,
             error: self.error.clone(),
             added: self.added,
             finished_at: self.finished_at,
@@ -708,6 +716,7 @@ impl Actor {
                     mirrors: old.mirrors.clone(),
                     limit_bps: old.limit_bps,
                     exact_dir: old.exact_dir,
+                    video: old.video.clone(),
                 });
             }
             Cmd::Priority(id, p) => {
@@ -780,8 +789,8 @@ impl Actor {
             }
             return;
         }
-        let kind = if is_torrent_source(&source) { Kind::Torrent } else { Kind::Http };
-        let name = req.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| guess_name(&source));
+        let kind = if req.video.is_some() { Kind::Video } else if is_torrent_source(&source) { Kind::Torrent } else { Kind::Http };
+        let name = req.name.clone().filter(|n| !n.trim().is_empty()).or_else(|| req.video.as_ref().map(|v| v.file_name())).unwrap_or_else(|| guess_name(&source));
         let job = Job {
             id: self.next_id,
             kind,
@@ -791,7 +800,7 @@ impl Actor {
             priority: req.priority,
             state: if req.paused { State::Paused } else { State::Queued },
             order: self.next_order,
-            total: None,
+            total: req.video.as_ref().and_then(|v| v.expected),
             done: 0,
             added: now(),
             finished_at: None,
@@ -827,6 +836,7 @@ impl Actor {
             uploaded: 0,
             seeded_secs: 0,
             last_uploaded: 0,
+            video: req.video,
         };
         self.next_id += 1;
         self.next_order += 1;
@@ -949,6 +959,22 @@ impl Actor {
                 let handle = tokio::spawn(task.run());
                 self.running.insert(id, Running { task: handle, http: None, limit: None });
             }
+            Kind::Video => {
+                job.phase = Some("Starting…");
+                let task = video::Task {
+                    id,
+                    url: job.source.clone(),
+                    dir: job.dir.clone(),
+                    name: job.name.clone(),
+                    claim: job.temp.clone(),
+                    spec: job.video.clone().unwrap_or_default(),
+                    limit_bps: self.config.limit_bps,
+                    connections,
+                    events,
+                };
+                let handle = tokio::spawn(task.run());
+                self.running.insert(id, Running { task: handle, http: None, limit: None });
+            }
         }
     }
 
@@ -956,7 +982,12 @@ impl Actor {
         self.persist_progress();
         // a file question still open: the torrent asks again when it's resumed
         self.choosing.remove(&id);
+        let video = self.jobs.iter().any(|j| j.id == id && j.kind == Kind::Video);
         if let Some(r) = self.running.remove(&id) {
+            // (stopping a video's task stops yt-dlp; it carries on from its part files later)
+            if video {
+                r.task.abort();
+            }
             if let Some(p) = &r.http {
                 // stop it first, then save how far it got (and make that safe on disk)
                 r.task.abort();
@@ -1000,6 +1031,9 @@ impl Actor {
         }
         if let Some(f) = &job.torrent_file {
             let _ = std::fs::remove_file(f);
+        }
+        if job.kind == Kind::Video && !job.state.finished() {
+            video::clean_partials(&job.dir, &job.name);
         }
         // a finished download's file (or a torrent's folder) goes to the Recycle Bin,
         // unless the user asked for it to go for good (Shift+Delete, after a confirmation)
@@ -1067,6 +1101,7 @@ impl Actor {
                     j.remaining.clear();
                     j.speed = 0;
                     j.connections = 0;
+                    j.phase = None;
                     j.finished_at = Some(now());
                     j.forget_cookies();
                     j.tries = 0;
@@ -1151,6 +1186,17 @@ impl Actor {
                     // smooth the speed so the number (and the time left) doesn't jitter
                     j.speed = if j.speed == 0 { instant as u64 } else { (j.speed as f64 * 0.7 + instant * 0.3) as u64 };
                     j.last_done = j.done;
+                }
+                Kind::Video => {
+                    let Some(p) = video::live(j.id) else { continue };
+                    j.done = p.done.load(Ordering::Relaxed);
+                    let total = p.total.load(Ordering::Relaxed);
+                    if total > 0 {
+                        j.total = Some(total);
+                    }
+                    let instant = p.speed.load(Ordering::Relaxed) as f64;
+                    j.speed = if j.speed == 0 || instant == 0.0 { instant as u64 } else { (j.speed as f64 * 0.6 + instant * 0.4) as u64 };
+                    j.phase = p.phase();
                 }
                 Kind::Torrent => {
                     let Some(h) = self.torrents.get(&j.id) else { continue };

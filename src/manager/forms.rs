@@ -391,18 +391,20 @@ impl Manager {
             return Some(FHit::ImportList);
         }
         let more = mw("More Options\u{2026}");
-        if x >= w - 26.0 - more - 4.0 && x < w - 20.0 && (174.0..200.0).contains(&y) {
+        // (it sits on the priority row, which a video card pushes down)
+        let dy = self.vsheet.extra_h();
+        if x >= w - 26.0 - more - 4.0 && x < w - 20.0 && (174.0 + dy..200.0 + dy).contains(&y) {
             return Some(FHit::MoreOptions);
         }
         None
     }
 
-    pub(super) fn paint_add_sheet_links(p: &P, hover: &Hit) {
+    pub(super) fn paint_add_sheet_links(p: &P, hover: &Hit, dy: f32) {
         let w = SHEET_W;
         let import = p.measure("Import List\u{2026}", 13.0, MEDIUM);
         crate::ui::link(p, w - 26.0 - import, 28.0, "Import List\u{2026}", None, *hover == Hit::Form(FHit::ImportList));
         let more = p.measure("More Options\u{2026}", 13.0, MEDIUM);
-        crate::ui::link(p, w - 26.0 - more, 187.0, "More Options\u{2026}", None, *hover == Hit::Form(FHit::MoreOptions));
+        crate::ui::link(p, w - 26.0 - more, 187.0 + dy, "More Options\u{2026}", None, *hover == Hit::Form(FHit::MoreOptions));
     }
 
     pub(super) fn paint_form(&mut self) -> Result<()> {

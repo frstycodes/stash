@@ -143,6 +143,7 @@ enum Hit {
     Form(forms::FHit),
     /// The Choose Files sheet (see torrent_sheet).
     Files(crate::torrent_sheet::FHit),
+    Video(crate::video_sheet::Hit),
 }
 
 /// A single-line text field: the search box and the New Download link field.
@@ -386,6 +387,8 @@ pub struct Manager {
     speeds: Vec<f32>,
     settings: Settings,
     toast_text: String,
+    /// The New Download sheet's video (read from the pasted page).
+    vsheet: crate::video_sheet::State,
 }
 
 thread_local! {
@@ -395,6 +398,14 @@ thread_local! {
 static MGR_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static THUMBS_DONE: std::sync::Mutex<Vec<crate::thumbs::Done>> = std::sync::Mutex::new(Vec::new());
 const WM_APP_THUMBS: u32 = WM_APP + 40;
+/// A pasted page has been read, or the video tools' status changed.
+const WM_APP_VIDEO: u32 = WM_APP + 41;
+
+fn wake_video() {
+    unsafe {
+        let _ = PostMessageW(Some(HWND(MGR_HWND.load(std::sync::atomic::Ordering::Relaxed) as *mut _)), WM_APP_VIDEO, WPARAM(0), LPARAM(0));
+    }
+}
 
 fn with<R>(f: impl FnOnce(&mut Manager) -> R) -> Option<R> {
     MGR.with(|m| m.try_borrow_mut().ok()?.as_mut().map(f))
@@ -495,6 +506,9 @@ pub fn show(gfx: &Gfx, settings: &Settings, links: Option<Vec<String>>) {
                         let _ = SetTimer(Some(m.hwnd), T_VIEW, 3000, None);
                     }
                 }
+            } else if let Some(link) = view.strip_prefix("add:") {
+                // "add:<link>" opens New Download with that link (a video page, say)
+                m.open_add(Some(link.to_string()));
             } else if let Some(q) = view.strip_prefix("search:") {
                 m.focus_search(true);
                 m.search.set(q);
@@ -709,6 +723,7 @@ impl Manager {
             )?
         };
         MGR_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
+        crate::tools::set_notify(wake_video);
         // Dark frame, Mica over the whole window (Windows 11), the caption folded into it.
         let mica = unsafe {
             let dark: u32 = (!settings.theme.is_light()) as u32;
@@ -870,6 +885,7 @@ impl Manager {
             speeds: vec![0.0; 40],
             settings,
             toast_text: String::new(),
+            vsheet: Default::default(),
         })
     }
 
@@ -1758,7 +1774,7 @@ impl Manager {
         let source = if j.state.finished() {
             j.path.clone().filter(|_| !missing)
         } else {
-            dl::early_picture(j.id).filter(|_| j.kind == Kind::Http)
+            dl::early_picture(j.id).filter(|_| j.kind != Kind::Torrent)
         };
         if let Some(p) = &source {
             if !self.file_icons.contains_key(p) && self.icon_pending.insert(p.clone()) {
@@ -2443,6 +2459,8 @@ impl Manager {
                         self.build_page(true);
                     } else if cmd == "update:check" {
                         crate::update::check_now();
+                    } else if let Some(what) = cmd.strip_prefix("video:") {
+                        self.video_tools(what);
                     } else if cmd == "update:store" {
                         shell::open(std::path::Path::new(crate::update::STORE));
                     } else {
@@ -2454,6 +2472,11 @@ impl Manager {
             Hit::Ok => self.submit_sheet(),
             Hit::Folder => return Some(Blocking::PickFolder),
             Hit::Torrent => return Some(Blocking::PickTorrent),
+            Hit::Video(h) => {
+                self.vsheet.click(&h);
+                let _ = self.place_sheet();
+                let _ = self.paint_sheet();
+            }
             Hit::Prio(p) => {
                 if let Some(Sheet { kind: SheetKind::Add { priority, .. }, .. }) = &mut self.sheet {
                     *priority = p;
@@ -3087,7 +3110,7 @@ impl Manager {
         if let Some(Sheet { kind: SheetKind::Add { field, error, .. }, .. }) = &mut self.sheet {
             field.insert(&ch.to_string());
             *error = None;
-            let _ = self.paint_sheet();
+            self.video_link_changed();
             return;
         }
         if self.sheet.is_some() {
@@ -3100,6 +3123,24 @@ impl Manager {
         if self.search_focus {
             self.search.insert(&ch.to_string());
             self.on_query_changed();
+        }
+    }
+
+    /// The Settings row's Update and Remove for the video tools.
+    fn video_tools(&mut self, what: &str) {
+        let busy = self.jobs.iter().any(|j| j.kind == Kind::Video && j.state == State::Active);
+        match what {
+            "update" => {
+                crate::tools::runtime().spawn(async {
+                    let _ = crate::tools::update_all().await;
+                });
+            }
+            "remove" if busy => self.show_toast("Pause your video downloads first"),
+            "remove" => {
+                crate::tools::runtime().spawn(crate::tools::remove());
+                self.show_toast("Video tools removed. Stash gets them again when needed.");
+            }
+            _ => {}
         }
     }
 
@@ -3131,7 +3172,7 @@ impl Manager {
 
     fn sheet_size(&self, kind: &SheetKind) -> (f32, f32) {
         match kind {
-            SheetKind::Add { .. } => (SHEET_W, ADD_H),
+            SheetKind::Add { .. } => (SHEET_W, ADD_H + self.vsheet.extra_h()),
             // no switch to show when it's a permanent delete
             SheetKind::Remove { permanent: true, .. } | SheetKind::Remove { cancel: true, .. } => (420.0, REMOVE_H - 46.0),
             SheetKind::Remove { .. } => (420.0, REMOVE_H),
@@ -3204,7 +3245,7 @@ impl Manager {
             if let Some(t) = text {
                 field.set(&t);
             }
-            let _ = self.paint_sheet();
+            self.video_link_changed();
             return;
         }
         // a copied link fills itself in
@@ -3216,6 +3257,36 @@ impl Manager {
         field.set(&text);
         field.all = !text.is_empty();
         self.open_sheet(SheetKind::Add { field, dir: default_dir(&self.settings), priority: Priority::Normal, error: None });
+        self.video_link_changed();
+    }
+
+    /// The link field changed: read the page for a video (in the background), and redraw.
+    fn video_link_changed(&mut self) {
+        if let Some(Sheet { kind: SheetKind::Add { field, .. }, .. }) = &self.sheet {
+            let text = field.string();
+            self.vsheet.link_changed(&text, wake_video);
+        }
+        let _ = self.place_sheet();
+        let _ = self.paint_sheet();
+    }
+
+    /// A page was read (or the video tools' status changed).
+    fn on_video(&mut self) {
+        let fresh = self.vsheet.take_answer();
+        if matches!(self.sheet, Some(Sheet { kind: SheetKind::Add { .. }, .. })) && (fresh || self.vsheet.looking()) {
+            let _ = self.place_sheet();
+            let _ = self.paint_sheet();
+        }
+        if self.view == Page::Settings {
+            self.build_page(false);
+        }
+    }
+
+    /// How much wider than usual the sheet's Download button is ("Download 24 Videos").
+    fn ok_extra(&self) -> f32 {
+        let Some(label) = self.vsheet.ok_label() else { return 0.0 };
+        let k = self.k;
+        (paint::advance(&self.gfx.dwrite, &label, 13.5 * k) / k + 40.0 - 120.0).max(0.0)
     }
 
     fn open_remove(&mut self, id: u64) {
@@ -3233,6 +3304,7 @@ impl Manager {
     }
 
     fn close_sheet(&mut self) {
+        self.vsheet.reset();
         if let Some(s) = self.sheet.take() {
             let _ = self.root.Children().and_then(|c| c.Remove(&s.root));
         }
@@ -3256,7 +3328,13 @@ impl Manager {
                 if inside(24.0, 76.0, w - 48.0, 36.0) {
                     return Hit::Field;
                 }
-                if inside(w - 100.0, 136.0, 80.0, 26.0) {
+                let dy = self.vsheet.extra_h();
+                let dw = self.gfx.dwrite.clone();
+                let k = self.k;
+                if let Some(h) = self.vsheet.hit(x, y, &|t: &str| paint::advance(&dw, t, 13.0 * k) / k) {
+                    return Hit::Video(h);
+                }
+                if inside(w - 100.0, 136.0 + dy, 80.0, 26.0) {
                     return Hit::Folder;
                 }
                 let (_, parts) = self.prio_seg();
@@ -3265,13 +3343,14 @@ impl Manager {
                         return Hit::Prio(p);
                     }
                 }
-                if inside(18.0, 214.0, 150.0, 34.0) {
+                if inside(18.0, 214.0 + dy, 150.0, 34.0) {
                     return Hit::Torrent;
                 }
-                if inside(w - 24.0 - 120.0 - 10.0 - 92.0, 214.0, 92.0, 36.0) {
+                let ok_extra = self.ok_extra();
+                if inside(w - 24.0 - 120.0 - ok_extra - 10.0 - 92.0, 214.0 + dy, 92.0, 36.0) {
                     return Hit::Cancel;
                 }
-                if inside(w - 24.0 - 120.0, 214.0, 120.0, 36.0) {
+                if inside(w - 24.0 - 120.0 - ok_extra, 214.0 + dy, 120.0 + ok_extra, 36.0) {
                     return Hit::Ok;
                 }
             }
@@ -3306,7 +3385,7 @@ impl Manager {
         let dw = self.gfx.dwrite.clone();
         let k = self.k;
         let widths = crate::ui::seg_widths(&["Low", "Normal", "High"], |t| paint::advance(&dw, t, 13.0 * k) / k + 14.0);
-        crate::ui::seg_layout(104.0, 187.0, &widths)
+        crate::ui::seg_layout(104.0, 187.0 + self.vsheet.extra_h(), &widths)
     }
 
     fn paint_sheet(&mut self) -> Result<()> {
@@ -3317,6 +3396,9 @@ impl Manager {
         let k = self.k;
         let hover = self.hover.clone();
         let dw = self.gfx.dwrite.clone();
+        let dy = self.vsheet.extra_h();
+        let ok_extra = self.ok_extra();
+        let vsheet = &self.vsheet;
         let Some(s) = &mut self.sheet else { return Ok(()) };
         let (card, caret_v, live_switch) = (s.card.clone(), s.caret.clone(), s.switch.clone());
         match &mut s.kind {
@@ -3335,12 +3417,16 @@ impl Manager {
                 let error = error.clone();
                 let folder = dir.display().to_string();
                 let count: usize = text.split_whitespace().filter(|t| dl::is_source(t)).map(dl::pattern_count).sum();
-                let ok_label = if count > 1 { format!("Download {count}") } else { "Download".to_string() };
+                let looking = vsheet.looking();
+                let note = if error.is_none() { vsheet.note() } else { None };
+                let ok_label = vsheet.ok_label().unwrap_or_else(|| if count > 1 { format!("Download {count}") } else { "Download".to_string() });
+                let vhover = if let Hit::Video(h) = &hover { Some(h.clone()) } else { None };
+                let h = ADD_H + dy;
                 let full_w = paint::advance(&dw, &text, FIELD_TEXT * k) / k;
                 let draw = |p: &P| {
-                    p.popover(0.0, 0.0, w, ADD_H, 26.0);
+                    p.popover(0.0, 0.0, w, h, 26.0);
                     p.text("New Download", 24.0, 19.0, 17.0, SEMIBOLD, paint::text(), 300.0);
-                    p.text("Paste one or more links: web addresses or magnet links.", 24.0, 46.0, 12.5, REGULAR, paint::dim(), w - 48.0);
+                    p.text("Paste one or more links: web addresses, video pages or magnet links.", 24.0, 46.0, 12.5, REGULAR, paint::dim(), w - 48.0);
                     p.round(24.0, 76.0, w - 48.0, 36.0, 13.0, paint::well(0.25));
                     p.round_stroke(24.0, 76.0, w - 48.0, 36.0, 13.0, paint::rgb(paint::ORANGE, 0.75), 1.5);
                     unsafe {
@@ -3359,32 +3445,36 @@ impl Manager {
                     }
                     if let Some(e) = &error {
                         p.text(e, 26.0, 116.0, 11.5, REGULAR, paint::red(), w - 48.0);
+                    } else if let Some((n, bad)) = &note {
+                        p.text(n, 26.0, 116.0, 11.5, REGULAR, if *bad { paint::red() } else { paint::dim() }, w - 48.0);
                     }
-                    p.text_mid("Save to", 24.0, 149.0, 13.0, REGULAR, paint::dim(), 80.0);
-                    p.glyph(icons::FOLDER, 112.0, 149.0, 12.0, paint::dim());
-                    p.text_mid(&folder, 126.0, 149.0, 13.0, REGULAR, paint::text(), w - 126.0 - 110.0);
+                    vsheet.paint(p, w, vhover.as_ref());
+                    p.text_mid("Save to", 24.0, 149.0 + dy, 13.0, REGULAR, paint::dim(), 80.0);
+                    p.glyph(icons::FOLDER, 112.0, 149.0 + dy, 12.0, paint::dim());
+                    p.text_mid(&folder, 126.0, 149.0 + dy, 13.0, REGULAR, paint::text(), w - 126.0 - 110.0);
                     let change_w = p.measure("Change…", 13.0, MEDIUM);
-                    crate::ui::link(p, w - 26.0 - change_w, 149.0, "Change…", None, hover == Hit::Folder);
-                    p.text_mid("Priority", 24.0, 187.0, 13.0, REGULAR, paint::dim(), 80.0);
+                    crate::ui::link(p, w - 26.0 - change_w, 149.0 + dy, "Change…", None, hover == Hit::Folder);
+                    p.text_mid("Priority", 24.0, 187.0 + dy, 13.0, REGULAR, paint::dim(), 80.0);
                     // the app's segmented control; its selection is a sprite that slides
                     let (rect, parts) = &prio;
                     let sel = [Priority::Low, Priority::Normal, Priority::High].iter().position(|x| *x == priority);
                     let hot = [Priority::Low, Priority::Normal, Priority::High].iter().position(|x| hover == Hit::Prio(*x));
                     crate::ui::paint_seg(p, *rect, parts, &["Low", "Normal", "High"], sel, hot, false);
-                    crate::ui::link(p, 26.0, 232.0, "Open Torrent File…", Some(icons::TORRENT), hover == Hit::Torrent);
-                    Manager::paint_add_sheet_links(p, &hover);
-                    let ok_x = w - 24.0 - 120.0;
+                    crate::ui::link(p, 26.0, 232.0 + dy, "Open Torrent File…", Some(icons::TORRENT), hover == Hit::Torrent);
+                    Manager::paint_add_sheet_links(p, &hover, dy);
+                    // a longer label ("Download 24 Videos") widens the button leftward
+                    let ok_x = w - 24.0 - 120.0 - ok_extra;
                     let cancel_x = ok_x - 10.0 - 92.0;
                     let bh = crate::ui::BUTTON_H;
-                    crate::ui::button(p, settings_page::Rect::new(cancel_x, 214.0, 92.0, bh), "Cancel", None, crate::ui::Kind::Secondary, hover == Hit::Cancel, true);
-                    crate::ui::button(p, settings_page::Rect::new(ok_x, 214.0, 120.0, bh), &ok_label, None, crate::ui::Kind::Primary, hover == Hit::Ok, count > 0);
+                    crate::ui::button(p, settings_page::Rect::new(cancel_x, 214.0 + dy, 92.0, bh), "Cancel", None, crate::ui::Kind::Secondary, hover == Hit::Cancel, true);
+                    crate::ui::button(p, settings_page::Rect::new(ok_x, 214.0 + dy, 120.0 + ok_extra, bh), &ok_label, None, crate::ui::Kind::Primary, hover == Hit::Ok, count > 0 && !looking);
                 };
                 let k2 = self.k;
-                let surface = self.gfx.surface(w * k2, ADD_H * k2, |dc| unsafe {
+                let surface = self.gfx.surface(w * k2, h * k2, |dc| unsafe {
                     dc.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
                     draw(&P { dc, dw: &dw, k: k2 });
                 })?;
-                set_surface(&self.gfx, &card, &surface, w * k2, ADD_H * k2)?;
+                set_surface(&self.gfx, &card, &surface, w * k2, h * k2)?;
                 // slide the selection to the priority (set in place when the sheet opens)
                 if let Some(Sheet { slider: Some((v, shown)), .. }) = &mut self.sheet {
                     let i = [Priority::Low, Priority::Normal, Priority::High].iter().position(|x| *x == priority).unwrap_or(1);
@@ -3527,13 +3617,31 @@ impl Manager {
             return false;
         }
         *error = None;
-        let _ = self.paint_sheet();
+        self.video_link_changed();
         true
     }
 
     fn submit_sheet(&mut self) {
         if self.is_form() {
             return self.submit_form(None);
+        }
+        // a video page: its video (or its whole playlist) with the chosen quality
+        if let Some(Sheet { kind: SheetKind::Add { field, dir, priority, .. }, .. }) = &self.sheet {
+            if self.vsheet.looking() {
+                return;
+            }
+            if let Some(reqs) = self.vsheet.requests(&field.string(), dir, *priority) {
+                for r in reqs {
+                    dl::engine().add(r);
+                }
+                if self.view == Page::List(Filter::Completed) || self.view == Page::Settings {
+                    self.set_view(Page::List(Filter::All));
+                }
+                self.scroll = 0.0;
+                self.close_sheet();
+                self.clamp_scroll(true);
+                return;
+            }
         }
         let Some(s) = &mut self.sheet else { return };
         match &mut s.kind {
@@ -4152,6 +4260,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         WM_APP_THUMBS => {
             with(|m| m.on_thumbs());
+            return LRESULT(0);
+        }
+        WM_APP_VIDEO => {
+            with(|m| m.on_video());
             return LRESULT(0);
         }
         WM_TIMER if wparam.0 == T_VIEW => {

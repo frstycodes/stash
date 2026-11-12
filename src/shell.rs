@@ -419,9 +419,16 @@ pub fn already_running() -> bool {
     use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
     use windows::Win32::System::Threading::CreateMutexW;
     unsafe {
-        // a test copy (STASH_DATA) runs beside the real one
-        let name = if std::env::var_os("STASH_DATA").is_some() { w!("Local\\StashDownloadsStackTest") } else { w!("Local\\StashDownloadsStack") };
-        let handle = CreateMutexW(None, true, name);
+        // a test copy (STASH_DATA) runs beside the real one, and beside test copies of
+        // other folders
+        let name = match std::env::var("STASH_DATA") {
+            Ok(d) => windows::core::HSTRING::from(format!(
+                "Local\\StashDownloadsStackTest-{:x}",
+                d.to_lowercase().bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+            )),
+            Err(_) => windows::core::HSTRING::from("Local\\StashDownloadsStack"),
+        };
+        let handle = CreateMutexW(None, true, &name);
         let exists = GetLastError() == ERROR_ALREADY_EXISTS;
         match handle {
             // not ours: let it go, so asking again (after the other copy exits) can succeed

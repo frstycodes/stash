@@ -531,6 +531,8 @@ impl SettingsPage {
             foot: None,
         });
 
+        sections.push(video_section());
+
         // stack
         let sort = [Sort::Added, Sort::Modified, Sort::Name, Sort::Kind].iter().position(|z| *z == s.sort);
         let counts = [5usize, 8, 10, 12];
@@ -1047,5 +1049,38 @@ impl SettingsPage {
                 self.inner.SetOffset(to)
             }
         })();
+    }
+}
+
+/// Video downloads: the helper programs (yt-dlp and ffmpeg) Stash fetches when it first
+/// needs them, their versions, and Update / Remove.
+fn video_section() -> Section {
+    let t = crate::tools::status();
+    let have = t.ytdlp.is_some() || t.ffmpeg.is_some() || crate::tools::has_ytdlp();
+    let desc = if let Some(f) = &t.fetching {
+        match f.total {
+            Some(total) => format!("Getting {}… {} of {}", f.name, paint::bytes(f.done), paint::bytes(total)),
+            None => format!("Getting {}… {}", f.name, paint::bytes(f.done)),
+        }
+    } else if let Some(e) = &t.error {
+        e.clone()
+    } else if have {
+        let part = |name: &str, v: &Option<String>| format!("{name} {}", v.as_deref().unwrap_or("not yet"));
+        format!("{} · {}", part("yt-dlp", &t.ytdlp), part("ffmpeg", &t.ffmpeg))
+    } else {
+        "Not here yet. They come with your first video.".into()
+    };
+    let buttons = if t.fetching.is_some() {
+        Vec::new()
+    } else if have {
+        vec![("video:remove".to_string(), "Remove".to_string(), None, 84.0, false), ("video:update".to_string(), "Update".to_string(), None, 80.0, false)]
+    } else {
+        vec![("video:update".to_string(), "Get Now".to_string(), None, 86.0, false)]
+    };
+    Section {
+        title: "Video downloads",
+        keys: "video youtube",
+        rows: vec![Row::new("Video tools", Some(&desc), "video youtube yt-dlp ytdlp ffmpeg tools update remove audio mp3", Ctl::Buttons(buttons))],
+        foot: Some("Paste a video page's link into New Download. yt-dlp reads the video and ffmpeg joins its picture and sound; both are free and open source, and Stash looks for a newer yt-dlp every week.".into()),
     }
 }
