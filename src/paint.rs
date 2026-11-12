@@ -21,15 +21,51 @@ pub const REGULAR: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT(400);
 pub const MEDIUM: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT(500);
 pub const SEMIBOLD: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT(600);
 
-// The palette: dark, like the stack's pills.
+// The palette follows the theme (light or dark, set from Settings or the system).
+static LIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_light(on: bool) {
+    LIGHT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn light() -> bool {
+    LIGHT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The foreground at `a`: white over the dark Mica, a warm near-black over the light.
+/// Hovers, selections, tracks and hairlines are this at a low alpha.
+pub fn ink(a: f32) -> D2D1_COLOR_F {
+    if light() { color(28, 25, 32, a) } else { color(255, 255, 255, a) }
+}
 pub fn text() -> D2D1_COLOR_F {
-    color(255, 255, 255, 0.92)
+    ink(if light() { 0.9 } else { 0.92 })
 }
 pub fn dim() -> D2D1_COLOR_F {
-    color(255, 255, 255, 0.55)
+    ink(if light() { 0.6 } else { 0.55 })
 }
 pub fn faint() -> D2D1_COLOR_F {
-    color(255, 255, 255, 0.32)
+    ink(if light() { 0.42 } else { 0.32 })
+}
+/// A raised surface (menus, sheets, the toast, sticky labels) at `a`.
+pub fn raised(a: f32) -> D2D1_COLOR_F {
+    if light() { color(252, 251, 253, a) } else { color(44, 42, 47, a) }
+}
+/// A sunken well (fields, segmented controls' tracks) at the dark theme's `a`.
+pub fn well(a: f32) -> D2D1_COLOR_F {
+    if light() { color(0, 0, 0, a * 0.22) } else { color(0, 0, 0, a) }
+}
+/// Orange text (speeds, links), red text and the warning's amber, readable on either.
+pub fn accent_text() -> D2D1_COLOR_F {
+    if light() { color(196, 86, 16, 1.0) } else { color(255, 182, 133, 1.0) }
+}
+/// The emphasised part of orange text (a filter's completion), stronger than `accent_text`.
+pub fn accent_strong() -> D2D1_COLOR_F {
+    if light() { color(140, 52, 6, 1.0) } else { color(255, 220, 196, 1.0) }
+}
+pub fn danger_text() -> D2D1_COLOR_F {
+    if light() { color(196, 43, 48, 1.0) } else { color(245, 120, 124, 1.0) }
+}
+pub fn warn_text() -> D2D1_COLOR_F {
+    if light() { color(184, 92, 20, 1.0) } else { color(245, 169, 122, 1.0) }
 }
 // Stash's own colors: the four bars of the icon, a sunset from gold to plum.
 pub const GOLD: (u8, u8, u8) = (249, 199, 79);
@@ -183,12 +219,25 @@ impl P<'_> {
         }
     }
 
+    /// Every popover's card (menus, suggestions, tooltips, the toast, sheets): the raised
+    /// surface with a hairline edge. Only the corner radius differs, by size.
+    pub fn popover(&self, x: f32, y: f32, w: f32, h: f32, r: f32) {
+        self.round(x, y, w, h, r, raised(0.985));
+        self.round_stroke(x, y, w, h, r, ink(if light() { 0.1 } else { 0.08 }), 1.0);
+    }
+
     /// The Stash logo pressed into the surface: its bars a shade lighter than the
     /// background under a thin dark rim, no color.
     pub fn logo_imprint(&self, cx: f32, cy: f32, size: f32) {
         // a dark rim just above, the bars a touch lighter than the surface: pressed in
-        self.logo_with(cx, cy - 1.2, size, Some(color(0, 0, 0, 0.32)));
-        self.logo_with(cx, cy, size, Some(color(255, 255, 255, 0.075)));
+        if light() {
+            // light: a white lip below, the bars a shade darker than the surface
+            self.logo_with(cx, cy + 1.2, size, Some(color(255, 255, 255, 0.9)));
+            self.logo_with(cx, cy, size, Some(color(0, 0, 0, 0.07)));
+        } else {
+            self.logo_with(cx, cy - 1.2, size, Some(color(0, 0, 0, 0.32)));
+            self.logo_with(cx, cy, size, Some(color(255, 255, 255, 0.075)));
+        }
     }
 
     /// The Stash icon: four rounded bars fanning out, `size` across, centered on (cx, cy).

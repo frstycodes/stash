@@ -15,7 +15,7 @@ use std::time::SystemTime;
 use windows::Foundation::TimeSpan;
 use windows::UI::Color;
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
-use windows::UI::Composition::{
+use windows::UI::Composition::{CompositionEasingFunction, 
     CompositionDrawingSurface, CompositionDropShadowSourcePolicy, CompositionPropertySet,
     CompositionStretch, CompositionSurfaceBrush, ContainerVisual, CubicBezierEasingFunction,
     SpriteVisual, Visual,
@@ -115,6 +115,12 @@ const T_BADGE: usize = 7;   // start fading the folder badge out
 const T_BADGE_HIDE: usize = 8;
 const T_BOUNCE: usize = 9;  // a file arrived in another watched folder (debounced)
 const T_OUTGOING: usize = 10; // drop the old pile once it has slid out
+const T_DROP_DONE: usize = 11; // a new download's icon has landed: hide its window
+const T_ANNOUNCE_END: usize = 12; // a stack raised to show a new download goes back under the windows
+const T_ANNOUNCE_LOWER: usize = 13;
+const T_ANNOUNCE_TEST: usize = 14;
+const ANNOUNCE_MS: u32 = 2600; // how long a raised stack stays up to show the download starting
+const DROP_HEIGHT: f32 = 230.0; // how far above the stack a new download's icon starts
 
 // Switching folders with the wheel
 const WHEEL_STEP: i32 = 120;     // one notch; touchpads send smaller deltas that add up
@@ -132,6 +138,7 @@ const FADE_OUT_DELAY_MS: i64 = 110;
 
 static TILE_HWND: AtomicIsize = AtomicIsize::new(0);
 static BADGE_HWND: AtomicIsize = AtomicIsize::new(0);
+static DROP_HWND: AtomicIsize = AtomicIsize::new(0);
 /// File-system changes from the watcher thread: (path, whether something arrived there).
 static FOLDER_EVENTS: Mutex<Vec<(PathBuf, bool)>> = Mutex::new(Vec::new());
 static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
@@ -281,7 +288,12 @@ pub struct Stash {
     tile: HWND,
     fan: HWND,
     badge: HWND, // the folder name + dots shown while switching
-    _targets: (DesktopWindowTarget, DesktopWindowTarget, DesktopWindowTarget),
+    drop: HWND,  // a new download's icon falling into the stack
+    _targets: (DesktopWindowTarget, DesktopWindowTarget, DesktopWindowTarget, DesktopWindowTarget),
+    drop_root: ContainerVisual,
+    drop_size: (f32, f32),
+    announcing: bool, // raised above the windows to show a download starting
+    debug_turn: usize, // Settings > Debug: which download plays next
     _drop_target: IDropTarget,
     tile_root: ContainerVisual,
     stack: ContainerVisual,
@@ -391,13 +403,18 @@ impl Stash {
         let tile = create_window(w!("StashTile"), desktop)?;
         let fan = create_window(w!("StashFan"), desktop)?;
         let badge = create_window(w!("StashBadge"), desktop)?;
+        let drop = create_window(w!("StashDrop"), desktop)?;
         TILE_HWND.store(tile.0 as isize, Ordering::Relaxed);
         BADGE_HWND.store(badge.0 as isize, Ordering::Relaxed);
+        DROP_HWND.store(drop.0 as isize, Ordering::Relaxed);
 
         let c = &gfx.compositor;
         let tile_target = gfx.target(tile)?;
         let fan_target = gfx.target(fan)?;
         let badge_target = gfx.target(badge)?;
+        let drop_target_v = gfx.target(drop)?;
+        let drop_root = c.CreateContainerVisual()?;
+        drop_target_v.SetRoot(&drop_root)?;
         let tile_root = c.CreateContainerVisual()?;
         let fan_root = c.CreateContainerVisual()?;
         let fan_layer = c.CreateContainerVisual()?;
@@ -494,7 +511,12 @@ impl Stash {
             tile,
             fan,
             badge,
-            _targets: (tile_target, fan_target, badge_target),
+            drop,
+            _targets: (tile_target, fan_target, badge_target, drop_target_v),
+            drop_root,
+            drop_size: (1.0, 1.0),
+            announcing: false,
+            debug_turn: 0,
             _drop_target: drop_target,
             tile_root,
             stack,
@@ -565,6 +587,12 @@ impl Stash {
             s.prefetch();
             s.ready = true;
             s.on_downloads();
+            // STASH_ANNOUNCE (with STASH_DATA): play a new download's arrival after 2.5 s
+            if std::env::var_os("STASH_ANNOUNCE").is_some() && std::env::var_os("STASH_DATA").is_some() {
+                unsafe {
+                    let _ = SetTimer(Some(s.tile), T_ANNOUNCE_TEST, 2500, None);
+                }
+            }
             if demo.is_some() {
                 s.topmost = true;
                 s.restack();
@@ -629,6 +657,10 @@ impl Stash {
         shell::place(self.tile, None, tx, wa.bottom - m - t, t, t, true);
         // the fan sits directly beneath the tile, so items emerge from behind it
         shell::place(self.fan, Some(self.tile), fx, wa.bottom - m - fh, fw, fh, false);
+        // the falling icon's window: centered over the tile, reaching up above it
+        let (dw, dh) = ((t as f32 * 2.2).round() as i32, t + (DROP_HEIGHT * k).round() as i32);
+        self.drop_size = (dw as f32, dh as f32);
+        shell::place(self.drop, None, tx + t / 2 - dw / 2, wa.bottom - m - dh, dw, dh, false);
 
         self.drop_outgoing(true);
         let _ = self.setup_stack(&self.stack);
@@ -693,7 +725,8 @@ impl Stash {
             return;
         }
         let before: HashSet<&Path> = self.items.iter().map(|i| i.path.as_path()).collect();
-        let fresh = new.iter().any(|i| !before.contains(i.path.as_path()) && !files::is_partial(&i.name));
+        // only a download landing hops the stack; files saved there any other way just appear
+        let fresh = new.iter().any(|i| !before.contains(i.path.as_path()) && !files::is_partial(&i.name) && is_download(&i.path));
         self.items = new;
         self.request_thumbs();
         let _ = self.build_tile();
@@ -930,6 +963,7 @@ impl Stash {
             brush.SetStretch(CompositionStretch::Fill)?;
             self.dl_pill.SetBrush(&brush)?;
             self.dl_pill.SetSize(Vector2 { X: w, Y: h })?;
+            self.dl_pill.SetCenterPoint(Vector3 { X: w / 2.0, Y: h, Z: 0.0 })?;
             self.dl_pill.SetOffset(Vector3 { X: ((tile - w) / 2.0).round(), Y: (by - 3.0 * k - h).round(), Z: 0.0 })?;
             self.dl_text = text;
         }
@@ -958,15 +992,20 @@ impl Stash {
         let mut inflight: Vec<JobView> = snap.jobs.iter().filter(|j| !j.state.finished()).cloned().collect();
         inflight.sort_by(|a, b| (b.state == DlState::Active).cmp(&(a.state == DlState::Active)).then(b.added.cmp(&a.added)).then(b.id.cmp(&a.id)));
         let mut elsewhere = false;
+        let mut arrived: Option<JobView> = None;
         for j in &snap.jobs {
             let new = self.seen_jobs.insert(j.id);
             if new && !self.first_snapshot && !j.state.finished() {
                 if same_dir(&j.dir, &self.dir) {
                     self.popping.insert(j.id, std::time::Instant::now());
+                    arrived.get_or_insert_with(|| j.clone());
                 } else {
                     elsewhere = true;
                 }
             }
+        }
+        if let Some(j) = arrived {
+            self.announce(&j);
         }
         self.first_snapshot = false;
         self.popping.retain(|_, t| t.elapsed().as_secs() < 4);
@@ -986,6 +1025,119 @@ impl Stash {
         if elsewhere {
             let _ = self.bounce();
         }
+    }
+
+    /// A download just started: the stack comes up over the windows (fading in, not
+    /// popping), the file's icon falls into it like a file landing in a Dock stack, and
+    /// the stack takes it with a squash and a flash of its glow. After a moment it goes
+    /// back under the windows, unless you've opened it meanwhile.
+    fn announce(&mut self, j: &JobView) {
+        if self.demo.is_some() {
+            return;
+        }
+        let covered = !self.topmost && !self.open && shell::covered(self.tile);
+        if covered {
+            self.announcing = true;
+            self.topmost = true;
+            self.set_opacity(0.0);
+            self.restack();
+            self.fade(1.0, FADE_IN_MS, 30);
+        }
+        if self.announcing {
+            unsafe {
+                let _ = KillTimer(Some(self.tile), T_ANNOUNCE_LOWER);
+                let _ = SetTimer(Some(self.tile), T_ANNOUNCE_END, ANNOUNCE_MS, None);
+            }
+        }
+        log(format!("announce {} (raised: {covered})", j.name));
+        if let Err(e) = self.drop_in(j, if covered { 120 } else { 0 }) {
+            log(format!("drop failed: {e}"));
+        }
+    }
+
+    fn drop_in(&self, j: &JobView, delay: i64) -> Result<()> {
+        let ik = self.ik;
+        let folder = j.kind == dl::Kind::Torrent && Path::new(&j.name).extension().is_none();
+        let name = if j.name.is_empty() { "download" } else { &j.name };
+        let size = (STACK * ik * 0.92).round();
+        let Some(px) = shell::type_icon(name, folder, (size * 1.5) as i32) else { return Ok(()) };
+        let surface = self.gfx.image_surface(&px, size, 0.0, 1.0, 1.0)?;
+        let v = self.sprite(&surface, size, size)?;
+        self.shadow(&v, 10.0, 5.0, 0.45)?;
+        v.SetCenterPoint(Vector3 { X: size / 2.0, Y: size / 2.0, Z: 0.0 })?;
+        let children = self.drop_root.Children()?;
+        children.RemoveAll()?;
+        children.InsertAtTop(&v)?;
+        let (dw, dh) = self.drop_size;
+        let t = self.tile_px();
+        // from above and a little inward (toward the screen), down into the pile
+        let inward = if self.right() { -1.0 } else { 1.0 };
+        let (ex, ey) = (dw / 2.0 - size / 2.0, dh - t / 2.0 - size / 2.0);
+        let (sx, sy) = (ex + inward * 54.0 * ik, 10.0 * self.k);
+        let c = &self.gfx.compositor;
+        let appear = 150i64;
+        let fall = 560i64;
+        let total = appear + fall;
+        let at = |t: i64| t as f32 / total as f32;
+        v.SetOffset(Vector3 { X: sx, Y: sy, Z: 0.0 })?;
+        v.SetOpacity(0.0)?;
+        let lin = c.CreateLinearEasingFunction()?;
+        let gravity = c.CreateCubicBezierEasingFunction(Vector2 { X: 0.5, Y: 0.0 }, Vector2 { X: 0.85, Y: 0.45 })?;
+        let drift = c.CreateCubicBezierEasingFunction(Vector2 { X: 0.3, Y: 0.6 }, Vector2 { X: 0.5, Y: 1.0 })?;
+        let anim = |prop: &str, frames: &[(f32, f32, &CompositionEasingFunction)]| -> Result<()> {
+            let a = c.CreateScalarKeyFrameAnimation()?;
+            for (f, val, ease) in frames {
+                a.InsertKeyFrameWithEasingFunction(*f, *val, *ease)?;
+            }
+            a.SetDuration(ms(total))?;
+            a.SetDelayTime(ms(delay))?;
+            a.SetDelayBehavior(windows::UI::Composition::AnimationDelayBehavior::SetInitialValueBeforeDelay)?;
+            v.StartAnimation(&HSTRING::from(prop), &a)
+        };
+        let ease_out: CompositionEasingFunction = self.ease_out.cast()?;
+        let lin: CompositionEasingFunction = lin.cast()?;
+        let gravity: CompositionEasingFunction = gravity.cast()?;
+        let drift: CompositionEasingFunction = drift.cast()?;
+        // appear with a small lift, then fall
+        anim("Opacity", &[(0.0, 0.0, &lin), (at(appear), 1.0, &ease_out), (0.9, 1.0, &lin), (1.0, 0.0, &lin)])?;
+        anim("Offset.Y", &[(0.0, sy + 8.0 * ik, &lin), (at(appear), sy, &ease_out), (1.0, ey, &gravity)])?;
+        anim("Offset.X", &[(0.0, sx, &lin), (at(appear), sx, &lin), (1.0, ex, &drift)])?;
+        let sc = c.CreateVector3KeyFrameAnimation()?;
+        sc.InsertKeyFrameWithEasingFunction(0.0, Vector3 { X: 0.7, Y: 0.7, Z: 1.0 }, &lin)?;
+        sc.InsertKeyFrameWithEasingFunction(at(appear), Vector3 { X: 1.06, Y: 1.06, Z: 1.0 }, &ease_out)?;
+        sc.InsertKeyFrameWithEasingFunction(1.0, Vector3 { X: 0.62, Y: 0.62, Z: 1.0 }, &gravity)?;
+        sc.SetDuration(ms(total))?;
+        sc.SetDelayTime(ms(delay))?;
+        sc.SetDelayBehavior(windows::UI::Composition::AnimationDelayBehavior::SetInitialValueBeforeDelay)?;
+        v.StartAnimation(&HSTRING::from("Scale"), &sc)?;
+        // the stack takes it: a squash, a rebound, and the glow
+        let land = delay + total - 40;
+        let center = Vector3 { X: STACK * ik / 2.0, Y: STACK * ik, Z: 0.0 };
+        self.stack.SetCenterPoint(center)?;
+        let sq = c.CreateVector3KeyFrameAnimation()?;
+        sq.InsertKeyFrame(0.0, Vector3 { X: 1.0, Y: 1.0, Z: 1.0 })?;
+        sq.InsertKeyFrameWithEasingFunction(0.25, Vector3 { X: 1.08, Y: 0.9, Z: 1.0 }, &self.ease_out)?;
+        sq.InsertKeyFrameWithEasingFunction(0.6, Vector3 { X: 0.97, Y: 1.05, Z: 1.0 }, &self.ease_out)?;
+        sq.InsertKeyFrameWithEasingFunction(1.0, Vector3 { X: 1.0, Y: 1.0, Z: 1.0 }, &self.ease_out)?;
+        sq.SetDuration(ms(420))?;
+        sq.SetDelayTime(ms(land))?;
+        self.stack.StartAnimation(&HSTRING::from("Scale"), &sq)?;
+        let g = c.CreateScalarKeyFrameAnimation()?;
+        g.InsertKeyFrame(0.0, 0.0)?;
+        g.InsertKeyFrameWithEasingFunction(0.3, 0.9, &self.ease_out)?;
+        g.InsertKeyFrameWithEasingFunction(1.0, 0.0, &self.ease_in)?;
+        g.SetDuration(ms(900))?;
+        g.SetDelayTime(ms(land))?;
+        g.SetDelayBehavior(windows::UI::Composition::AnimationDelayBehavior::SetInitialValueBeforeDelay)?;
+        self.glow.StartAnimation(&HSTRING::from("Opacity"), &g)?;
+        // the icon's window: above everything while it falls
+        shell::raise_topmost(self.drop);
+        unsafe {
+            let _ = ShowWindow(self.drop, SW_SHOWNOACTIVATE);
+            let slow = std::env::var("STASH_SLOW").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(1.0);
+            let _ = SetTimer(Some(self.tile), T_DROP_DONE, ((delay + total + 80) as f64 * slow) as u32, None);
+        }
+        Ok(())
     }
 
     /// Refresh the fan's download rows in place: label text and progress.
@@ -1480,6 +1632,11 @@ impl Stash {
         if self.open {
             return;
         }
+        if self.announcing {
+            // it stays up while open; closing it lowers it as after a tray open
+            self.announcing = false;
+            self.fade(1.0, FADE_IN_MS, 0);
+        }
         self.open = true;
         self.outside_ms = 0;
         unsafe {
@@ -1586,7 +1743,27 @@ impl Stash {
         let hide = !visible && self.settings.display == Display::Stack;
         let _ = self.stack.StopAnimation(&HSTRING::from("Opacity"));
         let _ = self.stack.SetOpacity(if hide { 0.0 } else { 1.0 });
-        let _ = self.dl_overlay.SetIsVisible(visible);
+        // the progress bar stays with the download; only the speed steps aside while open
+        let _ = (|| -> Result<()> {
+            let c = &self.gfx.compositor;
+            let o = c.CreateScalarKeyFrameAnimation()?;
+            o.InsertExpressionKeyFrame(0.0, &HSTRING::from("this.StartingValue"))?;
+            o.InsertKeyFrameWithEasingFunction(1.0, if visible { 1.0 } else { 0.0 }, &self.ease_out)?;
+            o.SetDuration(ms(if visible { 220 } else { 140 }))?;
+            if visible {
+                o.SetDelayTime(ms(120))?;
+            }
+            self.dl_pill.StartAnimation(&HSTRING::from("Opacity"), &o)?;
+            let sc = c.CreateVector3KeyFrameAnimation()?;
+            sc.InsertExpressionKeyFrame(0.0, &HSTRING::from("this.StartingValue"))?;
+            let to = if visible { 1.0 } else { 0.85 };
+            sc.InsertKeyFrameWithEasingFunction(1.0, Vector3 { X: to, Y: to, Z: 1.0 }, &self.ease_out)?;
+            sc.SetDuration(ms(if visible { 260 } else { 140 }))?;
+            if visible {
+                sc.SetDelayTime(ms(120))?;
+            }
+            self.dl_pill.StartAnimation(&HSTRING::from("Scale"), &sc)
+        })();
     }
 
     fn pointer_over(&self) -> bool {
@@ -1712,6 +1889,52 @@ impl Stash {
                     let _ = KillTimer(Some(self.tile), T_BOUNCE);
                 }
                 let _ = self.bounce();
+            }
+            T_ANNOUNCE_TEST => {
+                unsafe {
+                    let _ = KillTimer(Some(self.tile), T_ANNOUNCE_TEST);
+                }
+                // a different download each time, for its icon
+                let jobs = dl::engine_opt().map(|e| e.snapshot().jobs).unwrap_or_default();
+                if !jobs.is_empty() {
+                    self.debug_turn = (self.debug_turn + 1) % jobs.len();
+                    let j = jobs[self.debug_turn].clone();
+                    self.announce(&j);
+                }
+            }
+            T_DROP_DONE => {
+                unsafe {
+                    let _ = KillTimer(Some(self.tile), T_DROP_DONE);
+                    let _ = ShowWindow(self.drop, SW_HIDE);
+                }
+                let _ = self.drop_root.Children().and_then(|c| c.RemoveAll());
+            }
+            T_ANNOUNCE_END => {
+                unsafe {
+                    let _ = KillTimer(Some(self.tile), T_ANNOUNCE_END);
+                }
+                // opened (or pinned from the tray) meanwhile: it stays, and closing lowers it
+                if self.announcing && !self.open && !self.pinned {
+                    self.fade(0.0, FADE_OUT_MS, 0);
+                    unsafe {
+                        let _ = SetTimer(Some(self.tile), T_ANNOUNCE_LOWER, (FADE_OUT_MS + 40) as u32, None);
+                    }
+                } else {
+                    self.announcing = false;
+                }
+            }
+            T_ANNOUNCE_LOWER => {
+                unsafe {
+                    let _ = KillTimer(Some(self.tile), T_ANNOUNCE_LOWER);
+                }
+                if self.announcing && !self.open && !self.pinned {
+                    self.announcing = false;
+                    self.topmost = false;
+                    self.restack();
+                    unsafe {
+                        let _ = SetTimer(Some(self.tile), T_UNFADE, 100, None);
+                    }
+                }
             }
             T_UNFADE => {
                 unsafe {
@@ -1886,6 +2109,21 @@ impl Stash {
                     }
                 }
                 "update:check" => crate::update::check_now(),
+                // Settings > Debug: a download arriving, for trying the animation
+                "debug:drop" | "debug:drop:slow" | "debug:drop:later" => {
+                    let slow = id == "debug:drop:slow";
+                    unsafe {
+                        if slow {
+                            std::env::set_var("STASH_SLOW", "4");
+                        } else {
+                            std::env::remove_var("STASH_SLOW");
+                        }
+                    }
+                    let delay = if id == "debug:drop:later" { 1000 } else { 1 };
+                    unsafe {
+                        let _ = SetTimer(Some(self.tile), T_ANNOUNCE_TEST, delay, None);
+                    }
+                }
                 "noop" => {}
                 "update:auto" => {
                     self.settings.auto_update = !self.settings.auto_update;
@@ -2254,7 +2492,7 @@ impl Stash {
                 reload = true;
             } else if arrived && self.folders().iter().any(|f| f == parent) {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                elsewhere |= !files::is_partial(&name) && path.exists();
+                elsewhere |= !files::is_partial(&name) && path.exists() && is_download(&path);
             }
         }
         unsafe {
@@ -2267,6 +2505,11 @@ impl Stash {
             }
         }
     }
+}
+
+/// Whether a file that just appeared is one of Stash's downloads (finished there).
+fn is_download(path: &Path) -> bool {
+    dl::engine_opt().is_some_and(|e| e.snapshot().jobs.iter().any(|j| j.path.as_deref().is_some_and(|p| p == path)))
 }
 
 fn track_leave(hwnd: HWND) {
@@ -2420,7 +2663,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     let x = (lparam.0 & 0xffff) as i16 as i32;
     let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
     let is_tile = hwnd.0 as isize == TILE_HWND.load(Ordering::Relaxed);
-    if hwnd.0 as isize == BADGE_HWND.load(Ordering::Relaxed) {
+    if hwnd.0 as isize == BADGE_HWND.load(Ordering::Relaxed) || hwnd.0 as isize == DROP_HWND.load(Ordering::Relaxed) {
         // the badge is only a picture: clicks go through to whatever is beneath
         return match msg {
             WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),

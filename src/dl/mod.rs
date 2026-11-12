@@ -209,6 +209,23 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
+/// A downloading app's icon, read early: a copy of just its headers and icon resources
+/// (see `http::early_icon`), which the shell reads like the real file.
+pub fn app_icon(id: u64) -> PathBuf {
+    data_dir().join("icons").join(format!("{id}.exe"))
+}
+
+/// A downloading photo's preview, read early: the small picture a camera or phone puts
+/// at the start of a JPEG (its EXIF thumbnail), saved as a JPEG of its own.
+pub fn photo_preview(id: u64) -> PathBuf {
+    data_dir().join("icons").join(format!("{id}.jpg"))
+}
+
+/// Whichever early picture a download has so far (an app's icon, a photo's preview).
+pub fn early_picture(id: u64) -> Option<PathBuf> {
+    [app_icon(id), photo_preview(id)].into_iter().find(|p| p.exists())
+}
+
 pub fn data_dir() -> PathBuf {
     // STASH_DATA moves the download list and torrent state elsewhere (tests)
     if let Some(d) = std::env::var_os("STASH_DATA") {
@@ -1046,6 +1063,71 @@ mod tests {
                 std::thread::sleep(Duration::from_secs(1));
                 break;
             }
+        }
+    }
+
+    /// Network test: an app shows its own icon while it's still downloading.
+    /// `cargo test --release dl::tests::early_icon -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn early_icon() {
+        let dir = std::env::temp_dir().join("stash-dl-test-icon");
+        unsafe { std::env::set_var("STASH_DATA", dir.join("data")) };
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = std::env::var("STASH_TEST_URL").unwrap_or("https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe".into());
+        // slow enough that the icon must come before the end
+        let engine = Engine::start(Config { max_active: 1, connections: 4, limit_bps: 1_500_000, seed: false }, || {});
+        engine.add(AddRequest { source: url, dir: dir.clone(), ..Default::default() });
+        let start = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(250));
+            let s = engine.snapshot();
+            let j = s.jobs.last().unwrap();
+            let icon = app_icon(j.id);
+            if icon.exists() {
+                println!("icon after {:?} at {}/{:?}: {} bytes on disk", start.elapsed(), j.done, j.total, std::fs::metadata(&icon).unwrap().len());
+                assert_ne!(j.state, State::Done, "the icon should come before the download ends");
+                crate::shell::init_com_thread();
+                assert!(crate::shell::thumbnail(&icon, 48).is_some(), "the shell can't read an icon from it");
+                engine.remove(j.id, true);
+                std::thread::sleep(Duration::from_secs(1));
+                break;
+            }
+            assert!(j.state != State::Failed && start.elapsed().as_secs() < 60, "no icon: {:?} {:?}", j.state, j.error);
+        }
+    }
+
+    /// Network test: a camera photo shows its own preview while it's still downloading.
+    /// `cargo test dl::tests::early_photo -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn early_photo() {
+        let dir = std::env::temp_dir().join("stash-dl-test-photo");
+        unsafe { std::env::set_var("STASH_DATA", dir.join("data")) };
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = std::env::var("STASH_TEST_URL").unwrap_or("https://raw.githubusercontent.com/ianare/exif-samples/master/jpg/Nikon_D70.jpg".into());
+        // a trickle, so the preview must come first
+        let engine = Engine::start(Config { max_active: 1, connections: 1, limit_bps: 2_000, seed: false }, || {});
+        engine.add(AddRequest { source: url, dir: dir.clone(), ..Default::default() });
+        let start = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(200));
+            let s = engine.snapshot();
+            let j = s.jobs.last().unwrap();
+            let preview = photo_preview(j.id);
+            if preview.exists() {
+                println!("preview after {:?} at {}/{:?}: {} bytes", start.elapsed(), j.done, j.total, std::fs::metadata(&preview).unwrap().len());
+                assert_ne!(j.state, State::Done, "the preview should come before the download ends");
+                crate::shell::init_com_thread();
+                let px = crate::shell::thumbnail(&preview, 64).expect("the shell can't read the preview");
+                println!("preview picture: {}x{}", px.width, px.height);
+                engine.remove(j.id, true);
+                std::thread::sleep(Duration::from_secs(1));
+                break;
+            }
+            assert!(j.state != State::Failed && j.state != State::Done && start.elapsed().as_secs() < 30, "no preview: {:?} {:?}", j.state, j.error);
         }
     }
 

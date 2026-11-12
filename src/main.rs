@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod blur;
 mod dl;
 mod droptarget;
 mod files;
@@ -9,6 +10,7 @@ mod ipc;
 mod manager;
 mod menu;
 mod paint;
+mod popup;
 mod search;
 mod settings;
 mod settings_page;
@@ -51,7 +53,7 @@ fn main() {
         let _ = OleInitialize(None);
     }
     // let the browser extensions find us (the Store build can't write these keys)
-    if !shell::is_packaged() {
+    if !shell::is_packaged() && std::env::var_os("STASH_DATA").is_none() {
         std::thread::spawn(ipc::register_native_host);
     }
     if let Err(e) = stash::Stash::start() {
@@ -61,6 +63,8 @@ fn main() {
     // Launched with a magnet link or a .torrent file: ask about it straight away.
     if let ipc::Request::Open(_) = request {
         stash::handle(request);
+    } else if std::env::var_os("STASH_VIEW").is_some() {
+        stash::handle(ipc::Request::Show); // (for screenshots)
     }
     let mut msg = MSG::default();
     unsafe {

@@ -14,7 +14,7 @@ use windows_numerics::{Vector2, Vector3};
 use crate::gfx::Gfx;
 use crate::icons;
 use crate::paint::{self, MEDIUM, P, REGULAR, SEMIBOLD};
-use crate::settings::{Corner, Display, IconSize, Settings, Sort};
+use crate::settings::{Corner, Display, IconSize, Settings, Sort, Theme};
 use crate::shell;
 
 const PAD: f32 = 24.0;
@@ -40,7 +40,7 @@ pub struct Rect {
 }
 
 impl Rect {
-    fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
+    pub fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
         Rect { x, y, w, h }
     }
     pub fn contains(&self, px: f32, py: f32) -> bool {
@@ -181,6 +181,72 @@ pub struct SettingsPage {
     k: f32,
     w: f32,
     view_h: f32,
+    /// Where the page starts in `root`: under the header (the content scrolls on up behind it).
+    pub top: f32,
+}
+
+/// A switch's live parts (the orange "on" track and the knob) in `parent`; the off track
+/// is painted under them. Every switch in the app is made here, so they all look and move
+/// the same.
+pub fn new_switch(gfx: &Gfx, parent: &windows::UI::Composition::VisualCollection, k: f32) -> Result<(SpriteVisual, SpriteVisual)> {
+    let c = &gfx.compositor;
+    let track = c.CreateSpriteVisual()?;
+    let knob = c.CreateSpriteVisual()?;
+    parent.InsertAtTop(&track)?;
+    parent.InsertAtTop(&knob)?;
+    let shadow = c.CreateDropShadow()?;
+    shadow.SetBlurRadius(4.0 * k)?;
+    shadow.SetOffset(Vector3 { X: 0.0, Y: 1.0 * k, Z: 0.0 })?;
+    shadow.SetOpacity(0.35)?;
+    shadow.SetSourcePolicy(windows::UI::Composition::CompositionDropShadowSourcePolicy::InheritFromVisualContent)?;
+    knob.SetShadow(&shadow)?;
+    Ok((track, knob))
+}
+
+/// The off track a switch's parts sit on (paint it under them).
+pub fn paint_switch_track(p: &P, r: Rect, enabled: bool) {
+    p.capsule(r.x, r.y, r.w, r.h, paint::ink(if enabled { 0.16 } else { 0.08 }));
+}
+
+/// A switch's size.
+pub const SWITCH: (f32, f32) = (SW_W, SW_H);
+
+/// Put a switch at `r` (DIPs, in its parent) showing `on`, sliding there if `animate`.
+#[allow(clippy::too_many_arguments)]
+pub fn place_switch(gfx: &Gfx, track: &SpriteVisual, knob: &SpriteVisual, r: Rect, on: bool, enabled: bool, k: f32, animate: bool) -> Result<()> {
+    let c = &gfx.compositor;
+    // switches are true capsules (circular ends): track radius 11, knob 11 - 2 = 9
+    track.SetBrush(&gfx.pill_brush(paint::accent(), r.h * k)?)?;
+    track.SetSize(Vector2 { X: r.w * k, Y: r.h * k })?;
+    track.SetOffset(Vector3 { X: r.x * k, Y: r.y * k, Z: 0.0 })?;
+    let to = if on { 1.0 } else { 0.0 };
+    if animate {
+        let a = c.CreateScalarKeyFrameAnimation()?;
+        a.InsertExpressionKeyFrame(0.0, &HSTRING::from("this.StartingValue"))?;
+        a.InsertKeyFrame(1.0, to)?;
+        a.SetDuration(ms(200))?;
+        track.StartAnimation(&HSTRING::from("Opacity"), &a)?;
+    } else {
+        track.StopAnimation(&HSTRING::from("Opacity"))?;
+        track.SetOpacity(to)?;
+    }
+    // the knob: a white capsule, wider than tall, as on current iOS
+    let (kw, kh) = (24.0, SW_H - SW_PAD * 2.0);
+    knob.SetBrush(&gfx.pill_brush(paint::color(255, 255, 255, if enabled { 1.0 } else { 0.5 }), KNOB_R * 2.0 * k)?)?;
+    knob.SetSize(Vector2 { X: kw * k, Y: kh * k })?;
+    knob.SetCenterPoint(Vector3 { X: kw * k / 2.0, Y: kh * k / 2.0, Z: 0.0 })?;
+    let x = if on { r.x + r.w - kw - SW_PAD } else { r.x + SW_PAD };
+    let to = Vector3 { X: x * k, Y: (r.y + SW_PAD) * k, Z: 0.0 };
+    if !animate {
+        knob.StopAnimation(&HSTRING::from("Offset"))?;
+        return knob.SetOffset(to);
+    }
+    // the same sprung glide as the segmented controls
+    let a = c.CreateVector3KeyFrameAnimation()?;
+    a.InsertExpressionKeyFrame(0.0, &HSTRING::from("this.StartingValue"))?;
+    a.InsertKeyFrameWithEasingFunction(1.0, to, &c.CreateCubicBezierEasingFunction(Vector2 { X: 0.3, Y: 1.18 }, Vector2 { X: 0.6, Y: 1.0 })?)?;
+    a.SetDuration(ms(420))?;
+    knob.StartAnimation(&HSTRING::from("Offset"), &a)
 }
 
 fn ms(v: i64) -> TimeSpan {
@@ -191,7 +257,6 @@ impl SettingsPage {
     pub fn new(gfx: &Gfx) -> Result<Self> {
         let c = &gfx.compositor;
         let root = c.CreateContainerVisual()?;
-        root.SetClip(&c.CreateInsetClip()?)?;
         let inner = c.CreateContainerVisual()?;
         let surface = c.CreateSpriteVisual()?;
         inner.Children()?.InsertAtTop(&surface)?;
@@ -215,6 +280,7 @@ impl SettingsPage {
             k: 1.0,
             w: 0.0,
             view_h: 0.0,
+            top: 0.0,
         })
     }
 
@@ -277,6 +343,20 @@ impl SettingsPage {
             o
         };
         let mut sections = Vec::new();
+
+        // appearance
+        let theme = [Theme::System, Theme::Light, Theme::Dark].iter().position(|t| *t == s.theme);
+        sections.push(Section {
+            title: "Appearance",
+            keys: "appearance look",
+            rows: vec![Row::new(
+                "Theme",
+                Some("System follows your Windows light or dark mode."),
+                "theme light dark mode appearance color colour night",
+                Ctl::Seg { id: "theme", opts: vec!["System".into(), "Light".into(), "Dark".into()], sel: theme, custom: None },
+            )],
+            foot: None,
+        });
 
         // folders in the stack
         let mut rows = vec![Row {
@@ -443,6 +523,29 @@ impl SettingsPage {
             ));
         }
         sections.push(Section { title: "About", keys: "about", rows, foot: None });
+        // development builds and test copies (STASH_DATA) only
+        if cfg!(debug_assertions) || std::env::var_os("STASH_DATA").is_some() {
+            let play = |id: &str, label: &str, w: f32, primary: bool| (id.to_string(), label.to_string(), None, w, primary);
+            sections.push(Section {
+                title: "Debug",
+                keys: "debug test developer animation",
+                rows: vec![
+                    Row::new(
+                        "New download animation",
+                        Some("Plays a download arriving in the stack. Behind a window, the stack comes up first."),
+                        "debug animation drop stack arrive",
+                        Ctl::Buttons(vec![play("debug:drop:slow", "Slow", 64.0, false), play("debug:drop", "Play", 64.0, true)]),
+                    ),
+                    Row::new(
+                        "From behind this window",
+                        Some("Waits a second, so you can put another window over the stack first."),
+                        "debug animation delay covered",
+                        Ctl::Buttons(vec![play("debug:drop:later", "Play in 1 s", 104.0, false)]),
+                    ),
+                ],
+                foot: None,
+            });
+        }
         sections
     }
 
@@ -538,8 +641,8 @@ impl SettingsPage {
                     Op::Section(t, y) => {
                         p.text_mid(t, PAD + 6.0, *y, 13.0, SEMIBOLD, paint::dim(), 300.0);
                     }
-                    Op::Card(y, ch) => p.round(PAD, *y, w - PAD * 2.0, *ch, CARD_R, paint::color(255, 255, 255, 0.045)),
-                    Op::Line(y) => p.fill(PAD + 20.0, *y, w - PAD * 2.0 - 40.0, 1.0, paint::color(255, 255, 255, 0.07)),
+                    Op::Card(y, ch) => p.round(PAD, *y, w - PAD * 2.0, *ch, CARD_R, paint::ink(0.045)),
+                    Op::Line(y) => p.fill(PAD + 20.0, *y, w - PAD * 2.0 - 40.0, 1.0, paint::ink(0.07)),
                     Op::Text { title, desc, y } => {
                         let max = (w - PAD * 2.0) * 0.5;
                         match (title.is_empty(), desc) {
@@ -558,14 +661,14 @@ impl SettingsPage {
                     }
                     Op::Folder { name, path, downloads, y } => {
                         let cy = *y + ROW_H / 2.0;
-                        p.round(PAD + 16.0, cy - 18.0, 36.0, 36.0, 12.0, paint::color(255, 255, 255, 0.06));
+                        p.round(PAD + 16.0, cy - 18.0, 36.0, 36.0, 12.0, paint::ink(0.06));
                         p.glyph(if *downloads { icons::DOWNLOAD } else { icons::FOLDER }, PAD + 34.0, cy, 14.0, paint::text());
                         let nw = p.text(name, PAD + 64.0, *y + 13.0, 14.0, MEDIUM, paint::text(), 220.0);
                         if *downloads {
                             let label = "Saves downloads";
                             let bw = p.measure(label, 11.5, SEMIBOLD) + 14.0;
                             p.round(PAD + 64.0 + nw + 8.0, *y + 14.0, bw, 18.0, 6.0, paint::rgb(paint::ORANGE, 0.16));
-                            p.text_mid(label, PAD + 64.0 + nw + 15.0, *y + 23.0, 11.5, SEMIBOLD, paint::color(255, 182, 133, 1.0), bw);
+                            p.text_mid(label, PAD + 64.0 + nw + 15.0, *y + 23.0, 11.5, SEMIBOLD, paint::accent_text(), bw);
                         }
                         p.text(path, PAD + 64.0, *y + 34.0, 12.5, REGULAR, paint::dim(), w - PAD * 2.0 - 64.0 - 160.0);
                     }
@@ -589,7 +692,7 @@ impl SettingsPage {
             }
             // segmented controls: the track and the labels (the selection squircle is a sprite)
             for s in &self.segs {
-                p.round(s.rect.x, s.rect.y, s.rect.w, s.rect.h, SEG_R, paint::color(0, 0, 0, 0.25));
+                p.round(s.rect.x, s.rect.y, s.rect.w, s.rect.h, SEG_R, paint::well(0.25));
                 for (i, (r, label)) in s.parts.iter().zip(&s.opts).enumerate() {
                     let on = s.sel == Some(i);
                     let hot = hover == Hit::Seg(s.id, i);
@@ -599,7 +702,7 @@ impl SettingsPage {
                             let c = paint::text();
                             for (rr, glyph, h) in [(s.minus, "−", Hit::StepDown(s.id)), (s.plus, "+", Hit::StepUp(s.id))] {
                                 if hover == h {
-                                    p.round(rr.x, rr.y, rr.w, rr.h, 8.0, paint::color(255, 255, 255, 0.10));
+                                    p.round(rr.x, rr.y, rr.w, rr.h, 8.0, paint::ink(0.10));
                                 }
                                 let gw = p.measure(glyph, 14.0, MEDIUM);
                                 p.text_mid(glyph, rr.x + (rr.w - gw) / 2.0, rr.y + rr.h / 2.0, 14.0, MEDIUM, c, rr.w);
@@ -618,8 +721,7 @@ impl SettingsPage {
             }
             // switches: the off track (the on track and the knob are sprites)
             for sw in &self.switches {
-                let a = if sw.enabled { 0.16 } else { 0.08 };
-                p.capsule(sw.rect.x, sw.rect.y, sw.rect.w, sw.rect.h, paint::color(255, 255, 255, a));
+                paint_switch_track(&p, sw.rect, sw.enabled);
             }
             // buttons: ghost squircles, a fill on hover
             for b in &self.buttons {
@@ -631,7 +733,7 @@ impl SettingsPage {
                     p.text_mid(&b.label, r.x + (r.w - lw) / 2.0, r.y + r.h / 2.0, 13.0, SEMIBOLD, paint::color(255, 255, 255, 1.0), r.w);
                     continue;
                 }
-                p.round(r.x, r.y, r.w, r.h, 12.0, paint::color(255, 255, 255, if hot { 0.14 } else { 0.07 }));
+                p.round(r.x, r.y, r.w, r.h, 12.0, paint::ink(if hot { 0.14 } else { 0.07 }));
                 match (b.icon, b.label.is_empty()) {
                     (Some(icon), true) => p.glyph(icon, r.x + r.w / 2.0, r.y + r.h / 2.0, 11.0, if hot { paint::text() } else { paint::dim() }),
                     (icon, false) => {
@@ -697,7 +799,7 @@ impl SettingsPage {
             // the squircle's look: a soft white fill, redrawn at this scale
             let r = s.parts[s.sel.unwrap_or(0)];
             let h = r.h * k;
-            slider.SetBrush(&self.gfx.shape_brush(paint::color(255, 255, 255, 0.13), r.h, SEG_IN_R, k)?)?;
+            slider.SetBrush(&self.gfx.shape_brush(paint::ink(0.13), r.h, SEG_IN_R, k)?)?;
             slider.SetOpacity(if s.sel.is_some() { 1.0 } else { 0.0 })?;
             glide(&slider, Vector3 { X: r.x * k, Y: r.y * k, Z: 0.0 }, Some(Vector2 { X: r.w * k, Y: h }), animate && !new)?;
         }
@@ -706,43 +808,12 @@ impl SettingsPage {
             let (track, knob) = match self.knobs.get(sw.id) {
                 Some(p) => p.clone(),
                 None => {
-                    let track = c.CreateSpriteVisual()?;
-                    let knob = c.CreateSpriteVisual()?;
-                    children.InsertAtTop(&track)?;
-                    children.InsertAtTop(&knob)?;
-                    let shadow = c.CreateDropShadow()?;
-                    shadow.SetBlurRadius(4.0 * k)?;
-                    shadow.SetOffset(Vector3 { X: 0.0, Y: 1.0 * k, Z: 0.0 })?;
-                    shadow.SetOpacity(0.35)?;
-                    shadow.SetSourcePolicy(windows::UI::Composition::CompositionDropShadowSourcePolicy::InheritFromVisualContent)?;
-                    knob.SetShadow(&shadow)?;
-                    self.knobs.insert(sw.id, (track.clone(), knob.clone()));
-                    (track, knob)
+                    let pair = new_switch(&self.gfx, &children, k)?;
+                    self.knobs.insert(sw.id, pair.clone());
+                    pair
                 }
             };
-            let r = sw.rect;
-            // switches are true capsules (circular ends): track radius 11, knob 11 - 2 = 9
-            track.SetBrush(&self.gfx.pill_brush(paint::accent(), r.h * k)?)?;
-            track.SetSize(Vector2 { X: r.w * k, Y: r.h * k })?;
-            track.SetOffset(Vector3 { X: r.x * k, Y: r.y * k, Z: 0.0 })?;
-            let to = if sw.on { 1.0 } else { 0.0 };
-            if animate && !new {
-                let a = c.CreateScalarKeyFrameAnimation()?;
-                a.InsertExpressionKeyFrame(0.0, &HSTRING::from("this.StartingValue"))?;
-                a.InsertKeyFrame(1.0, to)?;
-                a.SetDuration(ms(200))?;
-                track.StartAnimation(&HSTRING::from("Opacity"), &a)?;
-            } else {
-                track.StopAnimation(&HSTRING::from("Opacity"))?;
-                track.SetOpacity(to)?;
-            }
-            // the knob: a white capsule, wider than tall, as on current iOS
-            let (kw, kh) = (24.0, SW_H - SW_PAD * 2.0);
-            knob.SetBrush(&self.gfx.pill_brush(paint::color(255, 255, 255, if sw.enabled { 1.0 } else { 0.5 }), KNOB_R * 2.0 * k)?)?;
-            knob.SetSize(Vector2 { X: kw * k, Y: kh * k })?;
-            knob.SetCenterPoint(Vector3 { X: kw * k / 2.0, Y: kh * k / 2.0, Z: 0.0 })?;
-            let x = if sw.on { r.x + r.w - kw - SW_PAD } else { r.x + SW_PAD };
-            glide(&knob, Vector3 { X: x * k, Y: (r.y + SW_PAD) * k, Z: 0.0 }, None, animate && !new)?;
+            place_switch(&self.gfx, &track, &knob, sw.rect, sw.on, sw.enabled, k, animate && !new)?;
         }
         Ok(())
     }
@@ -839,6 +910,7 @@ impl SettingsPage {
                     "binary" => cmd(format!("dls:binary:{i}")),
                     "corner" => cmd(if *i == 0 { "corner:bottom-left".into() } else { "corner:bottom-right".into() }),
                     "display" => cmd(if *i == 0 { "display:stack".into() } else { "display:folder".into() }),
+                    "theme" => cmd(["theme:system", "theme:light", "theme:dark"][(*i).min(2)].into()),
                     "sort" => cmd(format!("sort:{}", ["added", "modified", "name", "kind"][*i])),
                     "count" => cmd(format!("limit:{}", val?)),
                     "size" => cmd(format!("size:{}", ["small", "medium", "large", "extra-large"][*i])),
@@ -877,9 +949,10 @@ impl SettingsPage {
     }
 
     fn clamp_scroll(&mut self, animate: bool) {
-        let max = (self.height - self.view_h).max(0.0);
+        // (a little past the end, so the last card clears the fade at the window's foot)
+        let max = (self.height + 24.0 - self.view_h).max(0.0);
         self.scroll = self.scroll.clamp(0.0, max);
-        let to = Vector3 { X: 0.0, Y: -self.scroll * self.k, Z: 0.0 };
+        let to = Vector3 { X: 0.0, Y: (self.top - self.scroll) * self.k, Z: 0.0 };
         let c = &self.gfx.compositor;
         let _ = (|| -> Result<()> {
             if animate {

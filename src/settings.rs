@@ -1,6 +1,29 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Theme {
+    /// Follow Windows (Settings > Personalization > Colors > Choose your mode).
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Theme {
+    pub fn is_light(self) -> bool {
+        match self {
+            Theme::Light => true,
+            Theme::Dark => false,
+            Theme::System => windows_registry::CURRENT_USER
+                .open(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+                .and_then(|k| k.get_u32("AppsUseLightTheme"))
+                .is_ok_and(|v| v != 0),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Corner {
@@ -48,6 +71,7 @@ impl IconSize {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub theme: Theme,
     pub corner: Corner,
     pub sort: Sort,
     pub display: Display,
@@ -96,6 +120,7 @@ impl DlSettings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            theme: Theme::System,
             corner: Corner::BottomRight,
             sort: Sort::Added,
             display: Display::Stack,
@@ -110,6 +135,10 @@ impl Default for Settings {
 }
 
 fn file() -> Option<PathBuf> {
+    // STASH_DATA (a test copy) keeps its settings there too
+    if let Some(d) = std::env::var_os("STASH_DATA") {
+        return Some(PathBuf::from(d).join("settings.json"));
+    }
     Some(PathBuf::from(std::env::var_os("APPDATA")?).join("Stash").join("settings.json"))
 }
 

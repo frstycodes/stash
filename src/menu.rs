@@ -2,7 +2,7 @@
 
 use tray_icon::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 
-use crate::settings::{Corner, Display, IconSize, Settings, Sort};
+use crate::settings::{Corner, Display, IconSize, Settings, Sort, Theme};
 
 pub mod ids {
     pub const DOWNLOADS: &str = "downloads";
@@ -153,6 +153,9 @@ pub fn item_menu() -> Menu {
 pub fn apply_setting(id: &str, s: &mut Settings) -> bool {
     let Some((key, value)) = id.split_once(':') else { return false };
     match (key, value) {
+        ("theme", "system") => s.theme = Theme::System,
+        ("theme", "light") => s.theme = Theme::Light,
+        ("theme", "dark") => s.theme = Theme::Dark,
         ("sort", "added") => s.sort = Sort::Added,
         ("sort", "modified") => s.sort = Sort::Modified,
         ("sort", "name") => s.sort = Sort::Name,

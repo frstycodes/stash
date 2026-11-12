@@ -201,6 +201,27 @@ impl Task {
             file: Arc::new(file),
             split: resumable && total.is_some(),
         });
+        // an app shows its own icon long before it's done: fetch just that, on the side
+        let shown_name = temp.file_name().unwrap_or_default().to_string_lossy().trim_end_matches(".stashpart").to_lowercase();
+        if resumable && total.is_some() && [".exe", ".dll", ".scr"].iter().any(|e| shown_name.ends_with(e)) {
+            let icon = super::app_icon(self.id);
+            if !icon.exists() {
+                let (client, url, headers) = (self.client.clone(), ctx.url.clone(), self.headers.clone());
+                tokio::spawn(async move {
+                    let _ = early_icon(&client, &url, &headers, &icon).await;
+                });
+            }
+        }
+        // a photo's own little preview, from the start of the file
+        if resumable && total.is_some() && [".jpg", ".jpeg", ".jfif"].iter().any(|e| shown_name.ends_with(e)) {
+            let preview = super::photo_preview(self.id);
+            if !preview.exists() {
+                let (client, url, headers) = (self.client.clone(), ctx.url.clone(), self.headers.clone());
+                tokio::spawn(async move {
+                    let _ = early_photo(&client, &url, &headers, &preview).await;
+                });
+            }
+        }
         let n = if ctx.split { self.connections.max(1) } else { 1 };
         let mut set = JoinSet::new();
         set.spawn(worker(ctx.clone(), Some(first)));
@@ -229,8 +250,127 @@ impl Task {
         let final_name = temp.file_name().unwrap().to_string_lossy().trim_end_matches(".stashpart").to_string();
         let dest = crate::files::unique_dest(&self.dir, &final_name);
         std::fs::rename(&temp, &dest).map_err(|e| format!("Can't finish the file: {e}"))?;
+        // the real file has its own icon or thumbnail now
+        let _ = std::fs::remove_file(super::app_icon(self.id));
+        let _ = std::fs::remove_file(super::photo_preview(self.id));
         Ok((dest, total.unwrap_or(done)))
     }
+}
+
+/// The icon of an app (a Windows PE file) that's still downloading. Its header, at the
+/// start, says where the resources (the icons) are; those are usually small, and often
+/// near the start too. Fetch the header and the resources with two range requests and
+/// write them at their offsets into an otherwise empty file: the shell reads the icon
+/// from that like from the real app.
+async fn early_icon(client: &reqwest::Client, url: &str, headers: &[(String, String)], dest: &Path) -> Option<()> {
+    const MAX_RESOURCES: u64 = 24 * 1024 * 1024;
+    let get = |pos: u64, end: u64| async move {
+        let r = request(client, url, headers, pos, end).await.ok()?;
+        if r.status().as_u16() != 206 {
+            return None;
+        }
+        r.bytes().await.ok()
+    };
+    let head = get(0, 64 * 1024).await?;
+    let u16_at = |o: usize| Some(u16::from_le_bytes(head.get(o..o + 2)?.try_into().ok()?));
+    let u32_at = |o: usize| Some(u32::from_le_bytes(head.get(o..o + 4)?.try_into().ok()?));
+    if head.get(0..2)? != b"MZ" {
+        return None;
+    }
+    let pe = u32_at(0x3C)? as usize;
+    if head.get(pe..pe + 4)? != b"PE\0\0" {
+        return None;
+    }
+    let sections = u16_at(pe + 6)? as usize;
+    let table = pe + 24 + u16_at(pe + 20)? as usize;
+    let (ptr, size) = (0..sections).find_map(|i| {
+        let s = table + i * 40;
+        (head.get(s..s + 5)? == b".rsrc").then(|| Some((u32_at(s + 20)? as u64, u32_at(s + 16)? as u64))).flatten()
+    })?;
+    if size == 0 || size > MAX_RESOURCES {
+        return None;
+    }
+    let res = get(ptr, ptr + size).await?;
+    let dir = dest.parent()?;
+    std::fs::create_dir_all(dir).ok()?;
+    let part = dest.with_extension("part");
+    {
+        use std::os::windows::fs::FileExt;
+        let f = std::fs::File::create(&part).ok()?;
+        f.set_len(ptr + res.len() as u64).ok()?;
+        let head_len = (table + sections * 40).max(4096).min(head.len());
+        f.seek_write(&head[..head_len], 0).ok()?;
+        f.seek_write(&res, ptr).ok()?;
+    }
+    std::fs::rename(&part, dest).ok()
+}
+
+/// The preview a camera or phone stores near the start of a JPEG: in the EXIF block
+/// (an APP1 segment), the second image directory points at a small JPEG of its own.
+/// Fetch the start of the file, find that, and save it as a picture.
+async fn early_photo(client: &reqwest::Client, url: &str, headers: &[(String, String)], dest: &Path) -> Option<()> {
+    let r = request(client, url, headers, 0, 128 * 1024).await.ok()?;
+    if r.status().as_u16() != 206 {
+        return None;
+    }
+    let head = r.bytes().await.ok()?;
+    let thumb = exif_thumbnail(&head)?;
+    std::fs::create_dir_all(dest.parent()?).ok()?;
+    let part = dest.with_extension("part");
+    std::fs::write(&part, thumb).ok()?;
+    std::fs::rename(&part, dest).ok()
+}
+
+/// The EXIF thumbnail inside the start of a JPEG, if it has one.
+pub(crate) fn exif_thumbnail(b: &[u8]) -> Option<&[u8]> {
+    if b.get(0..2)? != [0xFF, 0xD8] {
+        return None;
+    }
+    let mut i = 2;
+    // walk the segments up to the image data, looking for APP1 "Exif"
+    while i + 4 <= b.len() && b[i] == 0xFF {
+        let marker = b[i + 1];
+        let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
+        if marker == 0xDA {
+            break; // the picture itself begins
+        }
+        if marker == 0xE1 && b.get(i + 4..i + 10)? == b"Exif\0\0" {
+            let tiff = b.get(i + 10..(i + 2 + len).min(b.len()))?;
+            let be = match tiff.get(0..2)? {
+                b"MM" => true,
+                b"II" => false,
+                _ => return None,
+            };
+            let u16_at = |o: usize| -> Option<usize> {
+                let x = tiff.get(o..o + 2)?;
+                Some(if be { u16::from_be_bytes([x[0], x[1]]) } else { u16::from_le_bytes([x[0], x[1]]) } as usize)
+            };
+            let u32_at = |o: usize| -> Option<usize> {
+                let x = tiff.get(o..o + 4)?;
+                Some(if be { u32::from_be_bytes([x[0], x[1], x[2], x[3]]) } else { u32::from_le_bytes([x[0], x[1], x[2], x[3]]) } as usize)
+            };
+            // IFD0, then the one after it (IFD1) describes the thumbnail
+            let ifd0 = u32_at(4)?;
+            let ifd1 = u32_at(ifd0 + 2 + u16_at(ifd0)? * 12)?;
+            if ifd1 == 0 {
+                return None;
+            }
+            let (mut off, mut size) = (None, None);
+            for e in 0..u16_at(ifd1)? {
+                let entry = ifd1 + 2 + e * 12;
+                match u16_at(entry)? {
+                    0x0201 => off = u32_at(entry + 8),
+                    0x0202 => size = u32_at(entry + 8),
+                    _ => {}
+                }
+            }
+            let (off, size) = (off?, size?);
+            let thumb = tiff.get(off..off + size)?;
+            return (thumb.len() > 100 && thumb[0..2] == [0xFF, 0xD8]).then_some(thumb);
+        }
+        i += 2 + len;
+    }
+    None
 }
 
 fn resp_url(r: &reqwest::Response) -> Option<String> {

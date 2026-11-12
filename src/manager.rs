@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use windows::Foundation::TimeSpan;
 use windows::UI::Color;
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
-use windows::UI::Composition::{AnimationIterationBehavior, CompositionStretch, ContainerVisual, CubicBezierEasingFunction, SpriteVisual, Visual};
+use windows::UI::Composition::{AnimationIterationBehavior, CompositionBrush, CompositionLinearGradientBrush, CompositionStretch, CompositionSurfaceBrush, ContainerVisual, CubicBezierEasingFunction, SpriteVisual, Visual};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D1_COLOR_F};
 use windows::Win32::Graphics::Direct2D::{D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC};
@@ -28,10 +28,12 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, Interface, PCWSTR, Result, w};
 use windows_numerics::{Vector2, Vector3};
 
+use crate::blur;
 use crate::dl::{self, AddRequest, JobView, Kind, Priority, State};
 use crate::gfx::{Gfx, Pixels};
 use crate::icons;
 use crate::paint::{self, MEDIUM, P, REGULAR, SEMIBOLD};
+use crate::popup;
 use crate::search::{self, Completion, When};
 use crate::settings::Settings;
 use crate::settings_page::{self, SettingsPage, Values};
@@ -63,6 +65,8 @@ const OPT_H: f32 = 50.0;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const T_TOAST: usize = 2;
 const T_DOCK: usize = 3;
+const T_TIP: usize = 4;
+const T_VIEW: usize = 5; // STASH_VIEW's menu or tooltip, once the window is up
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Filter {
@@ -119,6 +123,9 @@ enum Hit {
     DockAdd,
     EmptyCta,
     Page(settings_page::Hit),
+    // the right-click menu, and anywhere outside it while it's open
+    Menu(popup::MHit),
+    MenuOff,
     // sheets
     Sheet,
     Backdrop,
@@ -252,7 +259,11 @@ struct RowVis {
     rest: SpriteVisual,
     key: String,
     frac: f32,
+    bar_w: f32, // the bar's width when it was laid out; a resize lays it out again
     y: f32,
+    icon_v: SpriteVisual, // the file's icon, on its own so a new one can ease in
+    icon_id: String,      // which icon it shows (the file's own, or its type's)
+    icon_alpha: f32,
 }
 
 /// What sits in the list: group labels and downloads, in order.
@@ -264,7 +275,17 @@ enum Line {
 
 enum SheetKind {
     Add { field: Field, dir: PathBuf, priority: Priority, error: Option<String> },
-    Remove { id: u64, name: String, path: String, delete: bool },
+    /// `name` and `path` describe the first; `ids.len() > 1` asks about all of them.
+    Remove { ids: Vec<u64>, name: String, path: String, delete: bool },
+}
+
+/// The right-click menu while it's open: for `ids` (the selection), at (x, y) in DIPs.
+struct MenuState {
+    model: popup::Menu,
+    x: f32,
+    y: f32,
+    hover: Option<popup::MHit>,
+    ids: Vec<u64>,
 }
 
 struct Sheet {
@@ -272,11 +293,11 @@ struct Sheet {
     root: ContainerVisual,
     card: SpriteVisual,
     caret: SpriteVisual,
+    switch: Option<(SpriteVisual, SpriteVisual)>, // the Remove sheet's switch (live, like Settings')
 }
 
 /// Work that runs a nested message loop, done with the state borrow released.
 enum Blocking {
-    Menu(tray_icon::menu::Menu),
     PickFolder,
     PickTorrent,
 }
@@ -293,8 +314,11 @@ pub struct Manager {
     header: SpriteVisual,
     search_caret: SpriteVisual,
     chips: SpriteVisual,
-    list: SpriteVisual,      // shows `list_src` through a fade at the bottom
+    list: SpriteVisual,      // shows `list_src`, fading out under the header and the dock
     list_src: ContainerVisual,
+    blurs: Vec<SpriteVisual>, // blurred copies of the list under the header and the dock
+    page_view: SpriteVisual,      // the settings page, through the same mask
+    page_blurs: Vec<SpriteVisual>,
     inner: ContainerVisual,  // scrolls
     empty: SpriteVisual,
     dock: ContainerVisual,
@@ -317,12 +341,25 @@ pub struct Manager {
     lines: Vec<Line>,
     marks: HashMap<u64, Vec<usize>>,
     missing: HashMap<u64, bool>,
-    selected: Option<u64>,
+    selected: Option<u64>, // the focused row (arrow keys move it)
+    picked: Vec<u64>,      // every selected row: Ctrl+click toggles, Shift+click extends
+    anchor: Option<u64>,   // where Shift+click ranges from
+    menu: Option<MenuState>,
+    menu_v: SpriteVisual,
+    tip: SpriteVisual,
+    tip_on: bool,
+    view_later: Option<String>,
+    tip_off_at: std::time::Instant, // when a tooltip last went away: the next one shows at once
     hover: Hit,
     scroll: f32,
     rows: Vec<RowVis>,
+    dying: Vec<(ContainerVisual, std::time::Instant)>, // rows fading out after leaving the list
+    entering: bool, // new rows rise in (off while scrolling brings rows into view)
     groups: Vec<SpriteVisual>,
     icons: HashMap<String, Option<Pixels>>,
+    file_icons: HashMap<PathBuf, Option<Pixels>>, // finished files' own icons and thumbnails
+    icon_pending: std::collections::HashSet<PathBuf>,
+    thumbs: std::sync::mpsc::Sender<crate::thumbs::Job>,
     search: Field,
     other_search: Field,
     search_focus: bool,
@@ -339,6 +376,10 @@ pub struct Manager {
 thread_local! {
     static MGR: RefCell<Option<Manager>> = const { RefCell::new(None) };
 }
+/// The window, for the icon thread to wake, and what it has delivered.
+static MGR_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static THUMBS_DONE: std::sync::Mutex<Vec<crate::thumbs::Done>> = std::sync::Mutex::new(Vec::new());
+const WM_APP_THUMBS: u32 = WM_APP + 40;
 
 fn with<R>(f: impl FnOnce(&mut Manager) -> R) -> Option<R> {
     MGR.with(|m| m.try_borrow_mut().ok()?.as_mut().map(f))
@@ -421,6 +462,24 @@ pub fn show(gfx: &Gfx, settings: &Settings, links: Option<Vec<String>>) {
                 if let Some(px) = rest.strip_prefix(':').and_then(|v| v.parse::<f32>().ok()) {
                     m.page.scroll_by(px);
                 }
+            } else if let Some(rest) = view.strip_prefix("list:") {
+                // "list:<scroll>:<rows selected>:<menu|tip|>" for checking the list's states
+                let parts: Vec<&str> = rest.split(':').collect();
+                m.scroll = parts.first().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                m.clamp_scroll(false);
+                let n: usize = parts.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                let ids = m.list_ids();
+                m.picked = ids.iter().take(n).copied().collect();
+                m.selected = m.picked.first().copied();
+                m.anchor = m.selected;
+                m.on_selection();
+                // the menu and tooltip wait until the window has settled in front
+                if let Some(later) = parts.get(2).filter(|v| !v.is_empty()) {
+                    m.view_later = Some(later.to_string());
+                    unsafe {
+                        let _ = SetTimer(Some(m.hwnd), T_VIEW, 3000, None);
+                    }
+                }
             } else if let Some(q) = view.strip_prefix("search:") {
                 m.focus_search(true);
                 m.search.set(q);
@@ -428,6 +487,33 @@ pub fn show(gfx: &Gfx, settings: &Settings, links: Option<Vec<String>>) {
             }
         }
     });
+}
+
+impl Manager {
+    /// STASH_VIEW's menu or tooltip (see `show`).
+    fn view_later(&mut self) {
+        let Some(later) = self.view_later.take() else { return };
+        match later.as_str() {
+            "menu" => {
+                let i = self.lines.iter().position(|l| matches!(l, Line::Job(_))).unwrap_or(0);
+                let y = self.list_top() + self.line_y(i) - self.scroll + 30.0;
+                self.open_menu(SIDEBAR + 260.0, y);
+            }
+            "remove" => {
+                // the Remove sheet for the first finished download whose file is there
+                let id = self.jobs.iter().find(|j| j.state.finished() && j.path.as_ref().is_some_and(|p| p.exists())).map(|j| j.id);
+                if let Some(id) = id {
+                    self.ask_remove(vec![id]);
+                }
+            }
+            "tip" => {
+                self.hover = Hit::DockTool(1);
+                self.set_dock_open(true);
+                self.show_tip();
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The update status changed: the sidebar card and the About section follow.
@@ -464,6 +550,7 @@ pub fn refresh() {
 pub fn set_settings(s: &Settings) {
     with(|m| {
         m.settings = s.clone();
+        m.apply_theme();
         paint::set_units(s.downloads.bits, s.downloads.binary);
         if m.view == Page::Settings {
             m.build_page(true);
@@ -574,9 +661,10 @@ impl Manager {
                 None,
             )?
         };
+        MGR_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
         // Dark frame, Mica over the whole window (Windows 11), the caption folded into it.
         let mica = unsafe {
-            let dark: u32 = 1;
+            let dark: u32 = (!settings.theme.is_light()) as u32;
             let _ = DwmSetWindowAttribute(hwnd, DWMWINDOWATTRIBUTE(20), &dark as *const _ as _, 4);
             let backdrop: u32 = 2; // DWMSBT_MAINWINDOW
             let ok = DwmSetWindowAttribute(hwnd, DWMWINDOWATTRIBUTE(38), &backdrop as *const _ as _, 4).is_ok();
@@ -605,15 +693,25 @@ impl Manager {
             dock.Children()?.InsertAtTop(t)?;
             t.SetOpacity(0.0)?;
         }
+        let blurs = vec![sprite()?, sprite()?, sprite()?];
+        let (page_view, page_blurs) = (sprite()?, vec![sprite()?, sprite()?, sprite()?]);
+        let (menu_v, tip) = (sprite()?, sprite()?);
         let page = SettingsPage::new(&gfx)?;
         // one material: Mica edge to edge (Windows 10 gets one solid color)
-        backdrop.SetBrush(&c.CreateColorBrushWithColor(if mica { Color { A: 0, R: 0, G: 0, B: 0 } } else { Color { A: 255, R: 30, G: 28, B: 33 } })?)?;
+        paint::set_light(settings.theme.is_light());
+        backdrop.SetBrush(&c.CreateColorBrushWithColor(backdrop_color(mica))?)?;
         for v in [
             backdrop.cast::<Visual>()?,
             sel.cast()?,
             sidebar.cast()?,
             list.cast()?,
-            page.root.cast()?,
+            blurs[0].cast()?,
+            blurs[1].cast()?,
+            blurs[2].cast()?,
+            page_view.cast()?,
+            page_blurs[0].cast()?,
+            page_blurs[1].cast()?,
+            page_blurs[2].cast()?,
             header.cast()?,
             search_caret.cast()?,
             chips.cast()?,
@@ -621,10 +719,21 @@ impl Manager {
             dropdown.cast()?,
             toast.cast()?,
             caption.cast()?,
+            menu_v.cast()?,
+            tip.cast()?,
         ] {
             root.Children()?.InsertAtTop(&v)?;
         }
-        page.root.SetIsVisible(false)?;
+        menu_v.SetOpacity(0.0)?;
+        tip.SetOpacity(0.0)?;
+        let k0 = unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() } as f32 / 96.0;
+        for (v, small) in [(&menu_v, false), (&dropdown, false), (&toast, false), (&tip, true)] {
+            v.SetShadow(&popover_shadow(&gfx, k0, small)?)?;
+        }
+        page_view.SetIsVisible(false)?;
+        for v in &page_blurs {
+            v.SetIsVisible(false)?;
+        }
         dropdown.SetOpacity(0.0)?;
         toast.SetOpacity(0.0)?;
         // the caret blinks on the compositor
@@ -655,6 +764,9 @@ impl Manager {
             chips,
             list,
             list_src,
+            blurs,
+            page_view,
+            page_blurs,
             inner,
             empty,
             dock,
@@ -677,11 +789,29 @@ impl Manager {
             marks: HashMap::new(),
             missing: HashMap::new(),
             selected: None,
+            picked: Vec::new(),
+            anchor: None,
+            menu: None,
+            menu_v,
+            tip,
+            tip_on: false,
+            view_later: None,
+            tip_off_at: std::time::Instant::now() - std::time::Duration::from_secs(10),
             hover: Hit::None,
             scroll: 0.0,
             rows: Vec::new(),
+            dying: Vec::new(),
+            entering: true,
             groups: Vec::new(),
             icons: HashMap::new(),
+            file_icons: HashMap::new(),
+            icon_pending: Default::default(),
+            thumbs: crate::thumbs::spawn_worker(move |d| {
+                THUMBS_DONE.lock().unwrap().push(d);
+                unsafe {
+                    let _ = PostMessageW(Some(HWND(MGR_HWND.load(std::sync::atomic::Ordering::Relaxed) as *mut _)), WM_APP_THUMBS, WPARAM(0), LPARAM(0));
+                }
+            }),
             search: Field::default(),
             other_search: Field::default(),
             search_focus: false,
@@ -694,6 +824,27 @@ impl Manager {
             settings,
             toast_text: String::new(),
         })
+    }
+
+    /// Light or dark, from the setting (or Windows'): Mica and the frame switch with it,
+    /// and everything repaints.
+    fn apply_theme(&mut self) {
+        let light = self.settings.theme.is_light();
+        if light == paint::light() {
+            return;
+        }
+        paint::set_light(light);
+        unsafe {
+            let dark: u32 = (!light) as u32;
+            let _ = DwmSetWindowAttribute(self.hwnd, DWMWINDOWATTRIBUTE(20), &dark as *const _ as _, 4);
+        }
+        let _ = self.gfx.compositor.CreateColorBrushWithColor(backdrop_color(self.mica)).and_then(|b| self.backdrop.SetBrush(&b));
+        self.layout();
+        self.force_repaint();
+        if self.sheet.is_some() {
+            let _ = self.paint_sheet();
+        }
+        let _ = self.paint_menu();
     }
 
     fn back(&self) -> Result<CubicBezierEasingFunction> {
@@ -750,8 +901,7 @@ impl Manager {
         let k = self.k;
         let _ = self.backdrop.SetSize(Vector2 { X: self.w * k, Y: self.h * k });
         let _ = self.header.SetOffset(Vector3 { X: SIDEBAR * k, Y: 0.0, Z: 0.0 });
-        let _ = self.page.root.SetOffset(Vector3 { X: SIDEBAR * k, Y: HEAD * k, Z: 0.0 });
-        let _ = self.page.root.SetSize(Vector2 { X: self.cw() * k, Y: (self.h - HEAD) * k });
+        let _ = self.place_page();
         let _ = self.dock.SetOffset(Vector3 { X: SIDEBAR * k, Y: self.dock_y() * k, Z: 0.0 });
         let _ = self.place_list();
         for r in &mut self.rows {
@@ -773,49 +923,54 @@ impl Manager {
         }
     }
 
-    /// The list shows through a mask that fades it out under the dock. (Windows 10's
-    /// compositor without visual surfaces gets a plain clip instead.)
+    /// The list fills the whole column, so rows scroll on under the header and the dock.
+    /// There the list fades out while blurred copies of it fade in, blurring more toward
+    /// the edge, so what's underneath stays faintly visible behind the title, the search
+    /// and the dock. (Windows 10's compositor without visual surfaces gets a plain clip.)
     fn place_list(&self) -> Result<()> {
         let k = self.k;
         let c = &self.gfx.compositor;
         let top = self.list_top();
-        let (w, h) = (self.cw() * k, (self.h - top) * k);
-        self.list.SetOffset(Vector3 { X: SIDEBAR * k, Y: top * k, Z: 0.0 })?;
+        let (w, h) = (self.cw() * k, self.h * k);
+        self.list.SetOffset(Vector3 { X: SIDEBAR * k, Y: 0.0, Z: 0.0 })?;
         self.list.SetSize(Vector2 { X: w, Y: h })?;
-        // fully faded by the top of the dock, and clear below it
-        let gone = ((self.dock_y() - 4.0 - top) * k / h.max(1.0)).clamp(0.2, 1.0);
-        let fade = (gone - 110.0 * k / h.max(1.0)).max(0.05);
-        let made = (|| -> Result<()> {
-            let vs = c.CreateVisualSurface()?;
-            vs.SetSourceVisual(&self.list_src)?;
-            vs.SetSourceSize(Vector2 { X: w, Y: h })?;
-            let src = c.CreateSurfaceBrushWithSurface(&vs)?;
-            src.SetStretch(CompositionStretch::None)?;
-            src.SetHorizontalAlignmentRatio(0.0)?;
-            src.SetVerticalAlignmentRatio(0.0)?;
-            let mask = c.CreateLinearGradientBrush()?;
-            mask.SetStartPoint(Vector2 { X: 0.0, Y: 0.0 })?;
-            mask.SetEndPoint(Vector2 { X: 0.0, Y: 1.0 })?;
-            let stops = mask.ColorStops()?;
-            stops.Append(&c.CreateColorGradientStopWithOffsetAndColor(0.0, Color { A: 255, R: 255, G: 255, B: 255 })?)?;
-            stops.Append(&c.CreateColorGradientStopWithOffsetAndColor(fade, Color { A: 255, R: 255, G: 255, B: 255 })?)?;
-            stops.Append(&c.CreateColorGradientStopWithOffsetAndColor(gone, Color { A: 0, R: 255, G: 255, B: 255 })?)?;
-            stops.Append(&c.CreateColorGradientStopWithOffsetAndColor(1.0, Color { A: 0, R: 255, G: 255, B: 255 })?)?;
-            let brush = c.CreateMaskBrush()?;
-            brush.SetSource(&src)?;
-            brush.SetMask(&mask)?;
-            self.list.SetBrush(&brush)?;
-            Ok(())
-        })();
+        self.empty.SetOffset(Vector3 { X: 0.0, Y: top * k, Z: 0.0 })?;
+        let made = scroll_mask(&self.gfx, &self.list_src, &self.list, &self.blurs, k, self.cw(), self.h, top, self.dock_y());
         if made.is_err() {
-            // fall back: show the list directly, clipped
+            // fall back: show the list directly, clipped below the header
+            for v in &self.blurs {
+                v.SetBrush(None)?;
+            }
             self.list.SetBrush(None)?;
             if let Ok(ch) = self.root.Children() {
                 let _ = ch.InsertAbove(&self.list_src, &self.list);
             }
-            self.list_src.SetOffset(Vector3 { X: SIDEBAR * k, Y: top * k, Z: 0.0 })?;
+            self.list_src.SetOffset(Vector3 { X: SIDEBAR * k, Y: 0.0, Z: 0.0 })?;
             self.list_src.SetSize(Vector2 { X: w, Y: h })?;
-            self.list_src.SetClip(&c.CreateInsetClip()?)?;
+            let clip = c.CreateInsetClip()?;
+            clip.SetTopInset(top * k)?;
+            self.list_src.SetClip(&clip)?;
+        }
+        Ok(())
+    }
+
+    /// The settings page scrolls the same way, under the header and off the window's foot.
+    fn place_page(&self) -> Result<()> {
+        let k = self.k;
+        let c = &self.gfx.compositor;
+        self.page.root.SetSize(Vector2 { X: self.cw() * k, Y: self.h * k })?;
+        if scroll_mask(&self.gfx, &self.page.root, &self.page_view, &self.page_blurs, k, self.cw(), self.h, HEAD, self.h).is_err() {
+            for v in &self.page_blurs {
+                v.SetBrush(None)?;
+            }
+            self.page_view.SetBrush(None)?;
+            if let Ok(ch) = self.root.Children() {
+                let _ = ch.InsertAbove(&self.page.root, &self.page_view);
+            }
+            self.page.root.SetOffset(Vector3 { X: SIDEBAR * k, Y: 0.0, Z: 0.0 })?;
+            let clip = c.CreateInsetClip()?;
+            clip.SetTopInset(HEAD * k)?;
+            self.page.root.SetClip(&clip)?;
         }
         Ok(())
     }
@@ -861,6 +1016,8 @@ impl Manager {
         if self.selected.is_some_and(|id| !self.jobs.iter().any(|j| j.id == id)) {
             self.selected = None;
         }
+        let jobs = &self.jobs;
+        self.picked.retain(|id| jobs.iter().any(|j| j.id == *id));
         let _ = self.paint_dock();
         if structural {
             let _ = self.paint_sidebar();
@@ -958,7 +1115,7 @@ impl Manager {
         let active = unsafe { GetForegroundWindow() == self.hwnd };
         let (hover, press) = (self.hover.clone(), self.cap_press);
         self.sprite_from(&self.caption, CAP_W * 3.0, CAP_H, |p| {
-            let ink = if active { paint::color(255, 255, 255, 0.9) } else { paint::color(255, 255, 255, 0.45) };
+            let ink = if active { paint::ink(0.9) } else { paint::ink(0.45) };
             for (i, (hit, code, glyph)) in [
                 (Hit::CapMin, HTMINBUTTON, '\u{E921}'),
                 (Hit::CapMax, HTMAXBUTTON, if zoomed { '\u{E923}' } else { '\u{E922}' }),
@@ -973,7 +1130,7 @@ impl Manager {
                 if hit == Hit::CapClose && on {
                     p.fill(x, 0.0, CAP_W, CAP_H, if down { paint::color(148, 18, 14, 1.0) } else { paint::color(196, 43, 28, 1.0) });
                 } else if on {
-                    p.fill(x, 0.0, CAP_W, CAP_H, paint::color(255, 255, 255, if down { 0.06 } else { 0.09 }));
+                    p.fill(x, 0.0, CAP_W, CAP_H, paint::ink(if down { 0.06 } else { 0.09 }));
                 }
                 let c = if hit == Hit::CapClose && on { paint::color(255, 255, 255, 1.0) } else { ink };
                 p.caption_glyph(glyph, x + CAP_W / 2.0, CAP_H / 2.0, 10.0, c);
@@ -1007,10 +1164,10 @@ impl Manager {
                 let y = 64.0 + i as f32 * 38.0;
                 let on = view == Page::List(*f);
                 if !on && hover == Hit::Filter(i) {
-                    p.round(10.0, y, SIDEBAR - 20.0, 34.0, 13.0, paint::color(255, 255, 255, 0.04));
+                    p.round(10.0, y, SIDEBAR - 20.0, 34.0, 13.0, paint::ink(0.04));
                 }
                 p.glyph(g, 30.0, y + 17.0, 13.0, if on { paint::text() } else { paint::dim() });
-                let (weight, ink) = if on { (MEDIUM, paint::text()) } else { (REGULAR, paint::color(255, 255, 255, 0.78)) };
+                let (weight, ink) = if on { (MEDIUM, paint::text()) } else { (REGULAR, paint::ink(0.78)) };
                 p.text_mid(label, 48.0, y + 17.0, 13.5, weight, ink, 110.0);
                 if counts[i] > 0 {
                     p.text_right(&counts[i].to_string(), SIDEBAR - 22.0, y + 17.0, 12.0, REGULAR, paint::faint());
@@ -1019,7 +1176,7 @@ impl Manager {
             // an update on its way or ready: a card above Settings
             if let Some((title, sub, ready)) = &card {
                 let cy = h - 52.0 - 8.0 - UPDATE_CARD;
-                p.round(10.0, cy, SIDEBAR - 20.0, UPDATE_CARD, 16.0, paint::color(255, 255, 255, 0.06));
+                p.round(10.0, cy, SIDEBAR - 20.0, UPDATE_CARD, 16.0, paint::ink(0.06));
                 p.glyph(icons::DOWNLOAD, 30.0, cy + 22.0, 12.0, paint::accent());
                 p.text_mid(title, 46.0, cy + 22.0, 13.0, SEMIBOLD, paint::text(), SIDEBAR - 66.0);
                 p.text_mid(sub, 22.0, cy + 44.0, 12.0, REGULAR, paint::dim(), SIDEBAR - 44.0);
@@ -1034,7 +1191,7 @@ impl Manager {
             let y = h - 52.0;
             let on = view == Page::Settings;
             if !on && hover == Hit::Settings {
-                p.round(10.0, y, SIDEBAR - 20.0, 34.0, 13.0, paint::color(255, 255, 255, 0.04));
+                p.round(10.0, y, SIDEBAR - 20.0, 34.0, 13.0, paint::ink(0.04));
             }
             p.glyph(icons::SETTINGS, 30.0, y + 17.0, 13.0, if on { paint::text() } else { paint::dim() });
             p.text_mid("Settings", 48.0, y + 17.0, 13.5, if on { MEDIUM } else { REGULAR }, paint::text(), 100.0);
@@ -1048,7 +1205,7 @@ impl Manager {
             Page::List(f) => 64.0 + FILTERS.iter().position(|x| x.0 == f).unwrap_or(0) as f32 * 38.0,
             Page::Settings => self.h - 52.0,
         };
-        self.sel.SetBrush(&self.gfx.shape_brush(paint::color(255, 255, 255, 0.075), 34.0, 13.0, k)?)?;
+        self.sel.SetBrush(&self.gfx.shape_brush(paint::ink(0.075), 34.0, 13.0, k)?)?;
         self.sel.SetSize(Vector2 { X: (SIDEBAR - 20.0) * k, Y: 34.0 * k })?;
         let to = Vector3 { X: 10.0 * k, Y: y * k, Z: 0.0 };
         if !animate {
@@ -1095,7 +1252,7 @@ impl Manager {
                 return;
             }
             let bg = if focus { 0.09 } else if hover == Hit::Search { 0.075 } else { 0.06 };
-            p.round(sx, sy, sw, sh, 14.0, paint::color(255, 255, 255, bg));
+            p.round(sx, sy, sw, sh, 14.0, paint::ink(bg));
             if focus {
                 p.round_stroke(sx, sy, sw, sh, 14.0, paint::rgb(paint::ORANGE, 0.55), 1.0);
             }
@@ -1117,12 +1274,12 @@ impl Manager {
             if text.is_empty() {
                 // the shortcut, as a keycap
                 let kw = p.measure("Ctrl F", 11.0, SEMIBOLD) + 12.0;
-                p.round(sx + sw - kw - 8.0, sy + 9.0, kw, 18.0, 6.0, paint::color(255, 255, 255, 0.08));
+                p.round(sx + sw - kw - 8.0, sy + 9.0, kw, 18.0, 6.0, paint::ink(0.08));
                 p.text_mid("Ctrl F", sx + sw - kw - 2.0, sy + 18.0, 11.0, SEMIBOLD, paint::dim(), kw);
             } else {
                 let hot = hover == Hit::SearchClear;
                 if hot {
-                    p.round(sx + sw - 30.0, sy + 6.0, 24.0, 24.0, 8.0, paint::color(255, 255, 255, 0.1));
+                    p.round(sx + sw - 30.0, sy + 6.0, 24.0, 24.0, 8.0, paint::ink(0.1));
                 }
                 p.glyph(icons::CANCEL, sx + sw - 18.0, sy + sh / 2.0, 9.5, if hot { paint::text() } else { paint::faint() });
             }
@@ -1152,12 +1309,12 @@ impl Manager {
                 let w = 10.0 + kw + 5.0 + lw + 26.0;
                 p.round(x, 4.0, w, 26.0, 10.0, paint::rgb(paint::ORANGE, 0.14));
                 p.text_mid(c.key, x + 10.0, 17.0, 12.5, MEDIUM, paint::dim(), kw + 2.0);
-                p.text_mid(&c.label, x + 15.0 + kw, 17.0, 12.5, MEDIUM, paint::color(255, 196, 155, 1.0), lw + 2.0);
+                p.text_mid(&c.label, x + 15.0 + kw, 17.0, 12.5, MEDIUM, paint::accent_text(), lw + 2.0);
                 let hot = hover == Hit::Chip(i);
                 if hot {
-                    p.round(x + w - 23.0, 7.0, 20.0, 20.0, 7.0, paint::color(255, 255, 255, 0.12));
+                    p.round(x + w - 23.0, 7.0, 20.0, 20.0, 7.0, paint::ink(0.12));
                 }
-                p.glyph(icons::CANCEL, x + w - 13.0, 17.0, 8.0, paint::color(255, 196, 155, 1.0));
+                p.glyph(icons::CANCEL, x + w - 13.0, 17.0, 8.0, paint::accent_text());
                 x += w + 6.0;
             }
         })
@@ -1268,7 +1425,7 @@ impl Manager {
         let shown = self.options.len().min(6);
         let first = self.pick.saturating_sub(shown - 1);
         let hint = if token.is_empty() {
-            "Names, sites and links match even with typos. Narrow it down with:".to_string()
+            "Typos are fine. Narrow it down with:".to_string()
         } else if token.contains(':') || token.starts_with(['<', '>']) {
             "Pick one".to_string()
         } else {
@@ -1277,26 +1434,25 @@ impl Manager {
         let h = 36.0 + shown as f32 * OPT_H + 34.0;
         let (opts, pick, hover) = (self.options.clone(), self.pick, self.hover.clone());
         self.sprite_from(&self.dropdown, sw, h, |p| {
-            p.round(0.0, 0.0, sw, h, 18.0, paint::color(42, 40, 46, 1.0));
-            p.round_stroke(0.0, 0.0, sw, h, 18.0, paint::color(255, 255, 255, 0.08), 1.0);
+            p.popover(0.0, 0.0, sw, h, popup::RADIUS);
             p.text(&hint, 14.0, 12.0, 11.5, MEDIUM, paint::faint(), sw - 28.0);
             for (n, o) in opts.iter().enumerate().skip(first).take(shown) {
                 let y = 34.0 + (n - first) as f32 * OPT_H;
                 if n == pick || hover == Hit::Option(n) {
-                    p.round(6.0, y, sw - 12.0, OPT_H - 2.0, 13.0, paint::color(255, 255, 255, if n == pick { 0.08 } else { 0.05 }));
+                    p.round(popup::PAD, y, sw - 2.0 * popup::PAD, OPT_H - 2.0, popup::RADIUS - popup::PAD, paint::ink(if n == pick { 0.09 } else { 0.05 }));
                 }
                 // the tag (typed part plain, the completion brighter), its description under it
                 let tw = p.measure(&o.text, 12.5, SEMIBOLD) + 16.0;
                 p.round(16.0, y + 7.0, tw, 20.0, 7.0, paint::rgb(paint::ORANGE, 0.14));
                 let typed: String = o.text.chars().take(token.chars().count()).collect();
                 let rest: String = o.text.chars().skip(token.chars().count()).collect();
-                let w1 = p.text_mid(&typed, 24.0, y + 17.0, 12.5, SEMIBOLD, paint::color(255, 182, 133, 1.0), tw);
-                p.text_mid(&rest, 24.0 + w1, y + 17.0, 12.5, SEMIBOLD, paint::color(255, 220, 196, 1.0), tw);
+                let w1 = p.text_mid(&typed, 24.0, y + 17.0, 12.5, SEMIBOLD, paint::accent_text(), tw);
+                p.text_mid(&rest, 24.0 + w1, y + 17.0, 12.5, SEMIBOLD, paint::accent_strong(), tw);
                 p.text(&o.desc, 16.0, y + 29.0, 12.0, REGULAR, paint::dim(), sw - 32.0);
             }
             let fy = h - 26.0;
-            p.fill(12.0, fy - 8.0, sw - 24.0, 1.0, paint::color(255, 255, 255, 0.06));
-            p.text("↑ ↓ or Ctrl N / P  choose      Tab  complete      Esc  close", 16.0, fy, 11.0, REGULAR, paint::faint(), sw - 32.0);
+            p.fill(12.0, fy - 8.0, sw - 24.0, 1.0, paint::ink(0.06));
+            p.text("↑ ↓  choose     Tab  complete     Esc  close", 16.0, fy, 11.0, REGULAR, paint::faint(), sw - 32.0);
         })?;
         self.dropdown.SetOffset(Vector3 { X: sx * k, Y: (sy + sh + 6.0) * k, Z: 0.0 })
     }
@@ -1359,8 +1515,8 @@ impl Manager {
             let lw = paint::advance(&dw, label, 12.5 * k) / k + 24.0;
             let label = label.clone();
             self.sprite_from(&v, lw + 8.0, GROUP, |p| {
-                p.round(4.0, 6.0, lw, 26.0, 10.0, paint::color(40, 38, 44, 0.94));
-                p.text_mid(&label, 16.0, 19.0, 12.5, SEMIBOLD, paint::color(255, 255, 255, 0.78), lw);
+                p.round(4.0, 6.0, lw, 26.0, 10.0, paint::raised(0.94));
+                p.text_mid(&label, 16.0, 19.0, 12.5, SEMIBOLD, paint::ink(0.78), lw);
             })?;
             children.InsertAtTop(&v)?;
             // sticky: max(own position, scroll), pushed up by the next group's label
@@ -1369,7 +1525,7 @@ impl Manager {
                 "Vector3({x}, Min(Max({y}, -inner.Offset.Y + {pad}), {next} - {gh}), 0)",
                 x = 10.0 * k,
                 y = y * k,
-                pad = 2.0 * k,
+                pad = (self.list_top() + 2.0) * k,
                 next = next * k,
                 gh = GROUP * k
             )))?;
@@ -1391,50 +1547,111 @@ impl Manager {
         self.icons.entry(ext.clone()).or_insert_with(|| shell::type_icon(&format!("file.{ext}"), folder, size.max(48))).clone()
     }
 
+    /// The rows on screen (and a screen's worth either side): the list is virtual, so a
+    /// long history costs only the rows you can see. Rows that stay glide to their new
+    /// places; new downloads (and rows a list switch brings in) rise in; rows that come
+    /// into view by scrolling are simply there; rows that leave the list fade out.
     fn sync_rows(&mut self) -> Result<()> {
-        let jobs: Vec<(usize, JobView)> = self.lines.iter().enumerate().filter_map(|(i, l)| if let Line::Job(j) = l { Some((i, j.clone())) } else { None }).collect();
+        let view = self.h - self.list_top();
+        let (lo, hi) = (self.scroll - view, self.scroll + 2.0 * view);
+        let mut all = std::collections::HashSet::new();
+        let mut jobs: Vec<(f32, JobView)> = Vec::new();
+        let mut y = 4.0;
+        for l in &self.lines {
+            match l {
+                Line::Group(_) => y += GROUP,
+                Line::Job(j) => {
+                    all.insert(j.id);
+                    if y + ROW >= lo && y <= hi {
+                        jobs.push((y, j.clone()));
+                    }
+                    y += ROW;
+                }
+            }
+        }
         let k = self.k;
         let c = self.gfx.compositor.clone();
         let children = self.inner.Children()?;
-        let keep: Vec<u64> = jobs.iter().map(|(_, j)| j.id).collect();
+        let keep: std::collections::HashSet<u64> = jobs.iter().map(|(_, j)| j.id).collect();
+        let fade = self.ease_out()?;
+        let mut gone = Vec::new();
         self.rows.retain(|r| {
-            let stay = keep.contains(&r.id);
-            if !stay {
-                let _ = children.Remove(&r.v);
+            if keep.contains(&r.id) {
+                return true;
             }
-            stay
+            if all.contains(&r.id) {
+                let _ = children.Remove(&r.v); // scrolled out of reach
+            } else {
+                // left the list: fade out, then go
+                let _ = (|| -> Result<()> {
+                    let o = c.CreateScalarKeyFrameAnimation()?;
+                    o.InsertExpressionKeyFrame(0.0, &HSTRING::from("this.StartingValue"))?;
+                    o.InsertKeyFrameWithEasingFunction(1.0, 0.0, &fade)?;
+                    o.SetDuration(ms(160))?;
+                    r.v.StartAnimation(&HSTRING::from("Opacity"), &o)?;
+                    let sc = c.CreateVector3KeyFrameAnimation()?;
+                    sc.InsertKeyFrameWithEasingFunction(1.0, Vector3 { X: 0.97, Y: 0.97, Z: 1.0 }, &fade)?;
+                    sc.SetDuration(ms(160))?;
+                    r.v.StartAnimation(&HSTRING::from("Scale"), &sc)
+                })();
+                gone.push((r.v.clone(), std::time::Instant::now()));
+            }
+            false
         });
+        // what faded out a moment ago can go now
+        self.dying.retain(|(v, t)| {
+            let done = t.elapsed().as_millis() > 400;
+            if done {
+                let _ = children.Remove(v);
+            }
+            !done
+        });
+        self.dying.extend(gone);
         let rw = self.row_w();
         let back = self.back()?;
-        for (n, (i, j)) in jobs.iter().enumerate() {
-            let y = self.line_y(*i);
+        let mut n = 0;
+        for (y, j) in jobs.iter() {
+            let y = *y;
+            let mut entered = false;
             let idx = match self.rows.iter().position(|r| r.id == j.id) {
                 Some(idx) => idx,
                 None => {
+                    entered = self.entering;
                     let v = c.CreateContainerVisual()?;
                     let (sprite, fill, rest) = (c.CreateSpriteVisual()?, c.CreateSpriteVisual()?, c.CreateSpriteVisual()?);
+                    let icon_v = c.CreateSpriteVisual()?;
+                    // a soft shadow under the icon's own shape, so pale icons don't melt into the surface
+                    let shadow = c.CreateDropShadow()?;
+                    shadow.SetBlurRadius(8.0 * k)?;
+                    shadow.SetOffset(Vector3 { X: 0.0, Y: 1.5 * k, Z: 0.0 })?;
+                    shadow.SetOpacity(if paint::light() { 0.14 } else { 0.22 })?;
+                    shadow.SetSourcePolicy(windows::UI::Composition::CompositionDropShadowSourcePolicy::InheritFromVisualContent)?;
+                    icon_v.SetShadow(&shadow)?;
                     v.Children()?.InsertAtTop(&sprite)?;
+                    v.Children()?.InsertAtTop(&icon_v)?;
                     v.Children()?.InsertAtTop(&rest)?;
                     v.Children()?.InsertAtTop(&fill)?;
                     children.InsertAtBottom(&v)?;
                     v.SetOffset(Vector3 { X: 12.0 * k, Y: y * k, Z: 0.0 })?;
                     v.SetCenterPoint(Vector3 { X: rw * k / 2.0, Y: ROW * k / 2.0, Z: 0.0 })?;
-                    // in with a small rise; later moves glide
-                    let delay = ms((n.min(10) as i64) * 24);
-                    let o = c.CreateScalarKeyFrameAnimation()?;
-                    o.InsertKeyFrame(0.0, 0.0)?;
-                    o.InsertKeyFrame(1.0, 1.0)?;
-                    o.SetDuration(ms(200))?;
-                    o.SetDelayTime(delay)?;
-                    o.SetDelayBehavior(windows::UI::Composition::AnimationDelayBehavior::SetInitialValueBeforeDelay)?;
-                    v.StartAnimation(&HSTRING::from("Opacity"), &o)?;
-                    let sc = c.CreateVector3KeyFrameAnimation()?;
-                    sc.InsertKeyFrame(0.0, Vector3 { X: 0.97, Y: 0.97, Z: 1.0 })?;
-                    sc.InsertKeyFrameWithEasingFunction(1.0, Vector3 { X: 1.0, Y: 1.0, Z: 1.0 }, &back)?;
-                    sc.SetDuration(ms(320))?;
-                    sc.SetDelayTime(delay)?;
-                    sc.SetDelayBehavior(windows::UI::Composition::AnimationDelayBehavior::SetInitialValueBeforeDelay)?;
-                    v.StartAnimation(&HSTRING::from("Scale"), &sc)?;
+                    // in with a small rise (not when it's just scrolled into view); later moves glide
+                    if entered {
+                        let delay = ms((n.min(10) as i64) * 24);
+                        let o = c.CreateScalarKeyFrameAnimation()?;
+                        o.InsertKeyFrame(0.0, 0.0)?;
+                        o.InsertKeyFrame(1.0, 1.0)?;
+                        o.SetDuration(ms(200))?;
+                        o.SetDelayTime(delay)?;
+                        o.SetDelayBehavior(windows::UI::Composition::AnimationDelayBehavior::SetInitialValueBeforeDelay)?;
+                        v.StartAnimation(&HSTRING::from("Opacity"), &o)?;
+                        let sc = c.CreateVector3KeyFrameAnimation()?;
+                        sc.InsertKeyFrame(0.0, Vector3 { X: 0.97, Y: 0.97, Z: 1.0 })?;
+                        sc.InsertKeyFrameWithEasingFunction(1.0, Vector3 { X: 1.0, Y: 1.0, Z: 1.0 }, &back)?;
+                        sc.SetDuration(ms(320))?;
+                        sc.SetDelayTime(delay)?;
+                        sc.SetDelayBehavior(windows::UI::Composition::AnimationDelayBehavior::SetInitialValueBeforeDelay)?;
+                        v.StartAnimation(&HSTRING::from("Scale"), &sc)?;
+                    }
                     let glide = c.CreateVector3KeyFrameAnimation()?;
                     glide.SetTarget(&HSTRING::from("Offset"))?;
                     glide.InsertExpressionKeyFrameWithEasingFunction(1.0, &HSTRING::from("this.FinalValue"), &back)?;
@@ -1442,7 +1659,7 @@ impl Manager {
                     let implicit = c.CreateImplicitAnimationCollection()?;
                     implicit.Insert(&HSTRING::from("Offset"), &glide)?;
                     v.SetImplicitAnimations(&implicit)?;
-                    self.rows.push(RowVis { id: j.id, v, sprite, fill, rest, key: String::new(), frac: -1.0, y });
+                    self.rows.push(RowVis { id: j.id, v, sprite, fill, rest, key: String::new(), frac: -1.0, bar_w: 0.0, y, icon_v, icon_id: String::new(), icon_alpha: -1.0 });
                     self.rows.len() - 1
                 }
             };
@@ -1450,7 +1667,7 @@ impl Manager {
                 self.rows[idx].v.SetOffset(Vector3 { X: 12.0 * k, Y: y * k, Z: 0.0 })?;
                 self.rows[idx].y = y;
             }
-            let selected = self.selected == Some(j.id);
+            let selected = self.picked.contains(&j.id);
             let hover_btn = match &self.hover {
                 Hit::RowBtn(id, b) if *id == j.id => Some(*b),
                 _ => None,
@@ -1471,15 +1688,107 @@ impl Manager {
                 paint::speed(1_000_000)
             );
             if self.rows[idx].key != key {
-                let icon = self.icon(j);
                 let sprite = self.rows[idx].sprite.clone();
                 let j2 = j.clone();
-                self.sprite_from(&sprite, rw, ROW, |p| paint_row(p, &j2, rw, selected, hovered, hover_btn, missing, icon.as_ref(), &marks, &site))?;
+                self.sprite_from(&sprite, rw, ROW, |p| paint_row(p, &j2, rw, selected, hovered, hover_btn, missing, None, &marks, &site))?;
                 self.rows[idx].key = key;
+            }
+            self.update_row_icon(idx, j, missing, n, entered)?;
+            if entered {
+                n += 1;
             }
             self.update_bar(idx, j)?;
         }
         Ok(())
+    }
+
+    /// The row's icon: the file's own (its thumbnail, or an app's icon) once it's on
+    /// disk, else its type's. A new or changed icon eases in instead of popping.
+    fn update_row_icon(&mut self, idx: usize, j: &JobView, missing: bool, n: usize, entered: bool) -> Result<()> {
+        let k = self.k;
+        // finished: the file itself; an app still downloading: its icon, read early
+        let source = if j.state.finished() {
+            j.path.clone().filter(|_| !missing)
+        } else {
+            dl::early_picture(j.id).filter(|_| j.kind == Kind::Http)
+        };
+        if let Some(p) = &source {
+            if !self.file_icons.contains_key(p) && self.icon_pending.insert(p.clone()) {
+                let size = (32.0 * k * 1.5).round() as i32;
+                let _ = self.thumbs.send(crate::thumbs::Job { path: p.clone(), modified: SystemTime::UNIX_EPOCH, size: size.max(48) });
+            }
+        }
+        let own = source.as_ref().is_some_and(|p| matches!(self.file_icons.get(p), Some(Some(_))));
+        let ext = std::path::Path::new(&j.name).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let id = if own { format!("file:{}", source.as_ref().map(|p| p.display().to_string()).unwrap_or_default()) } else { format!("type:{ext}:{}", j.kind == Kind::Torrent) };
+        let alpha = if missing { 0.45 } else if j.state.finished() || j.state == State::Active { 1.0 } else { 0.6 };
+        let row = &self.rows[idx];
+        let changed = row.icon_id != id;
+        let first = row.icon_id.is_empty();
+        let v = row.icon_v.clone();
+        if changed {
+            let px = if own { source.as_ref().and_then(|p| self.file_icons.get(p).cloned().flatten()) } else { self.icon(j) };
+            let size = 32.0;
+            if let Some(px) = px {
+                let surface = self.gfx.image_surface(&px, (size * k).round(), 0.0, 1.0, 1.0)?;
+                let brush = self.gfx.compositor.CreateSurfaceBrushWithSurface(&surface)?;
+                brush.SetStretch(CompositionStretch::Uniform)?;
+                v.SetBrush(&brush)?;
+            }
+            v.SetSize(Vector2 { X: (size * k).round(), Y: (size * k).round() })?;
+            v.SetOffset(Vector3 { X: ((34.0 - size / 2.0) * k).round(), Y: (((ROW - size) / 2.0) * k).round(), Z: 0.0 })?;
+            v.SetCenterPoint(Vector3 { X: size * k / 2.0, Y: size * k / 2.0, Z: 0.0 })?;
+            // ease in: a brand-new row's icon after the row itself, a swapped one at once;
+            // a row that only scrolled into view shows its icon as it is
+            let c = &self.gfx.compositor;
+            if first && !entered {
+                v.StopAnimation(&HSTRING::from("Opacity"))?;
+                v.StopAnimation(&HSTRING::from("Scale"))?;
+                v.SetOpacity(alpha)?;
+                v.SetScale(Vector3 { X: 1.0, Y: 1.0, Z: 1.0 })?;
+                let row = &mut self.rows[idx];
+                row.icon_id = id;
+                row.icon_alpha = alpha;
+                return Ok(());
+            }
+            let delay = if first { ms((n.min(10) as i64) * 24 + 60) } else { ms(0) };
+            let o = c.CreateScalarKeyFrameAnimation()?;
+            o.InsertKeyFrame(0.0, 0.0)?;
+            o.InsertKeyFrameWithEasingFunction(1.0, alpha, &self.ease_out()?)?;
+            o.SetDuration(ms(260))?;
+            o.SetDelayTime(delay)?;
+            o.SetDelayBehavior(windows::UI::Composition::AnimationDelayBehavior::SetInitialValueBeforeDelay)?;
+            v.StartAnimation(&HSTRING::from("Opacity"), &o)?;
+            let sc = c.CreateVector3KeyFrameAnimation()?;
+            sc.InsertKeyFrame(0.0, Vector3 { X: 0.7, Y: 0.7, Z: 1.0 })?;
+            sc.InsertKeyFrameWithEasingFunction(1.0, Vector3 { X: 1.0, Y: 1.0, Z: 1.0 }, &self.back()?)?;
+            sc.SetDuration(ms(380))?;
+            sc.SetDelayTime(delay)?;
+            sc.SetDelayBehavior(windows::UI::Composition::AnimationDelayBehavior::SetInitialValueBeforeDelay)?;
+            v.StartAnimation(&HSTRING::from("Scale"), &sc)?;
+        } else if (self.rows[idx].icon_alpha - alpha).abs() > 0.01 {
+            let o = self.gfx.compositor.CreateScalarKeyFrameAnimation()?;
+            o.InsertExpressionKeyFrame(0.0, &HSTRING::from("this.StartingValue"))?;
+            o.InsertKeyFrameWithEasingFunction(1.0, alpha, &self.ease_out()?)?;
+            o.SetDuration(ms(200))?;
+            v.StartAnimation(&HSTRING::from("Opacity"), &o)?;
+        }
+        let row = &mut self.rows[idx];
+        row.icon_id = id;
+        row.icon_alpha = alpha;
+        Ok(())
+    }
+
+    /// Icons fetched in the background have arrived: rows that show them ease them in.
+    fn on_thumbs(&mut self) {
+        let done: Vec<crate::thumbs::Done> = std::mem::take(&mut *THUMBS_DONE.lock().unwrap());
+        for d in done {
+            self.icon_pending.remove(&d.path);
+            self.file_icons.insert(d.path, d.pixels);
+        }
+        if self.view != Page::Settings {
+            let _ = self.sync_rows();
+        }
     }
 
     fn bar_geom(&self) -> (f32, f32, f32) {
@@ -1506,12 +1815,12 @@ impl Manager {
         let color = match j.state {
             State::Active => paint::accent(),
             State::Failed => paint::red(),
-            _ => paint::color(142, 138, 150, 1.0),
+            _ => paint::ink(0.42), // paused or waiting: a quiet grey in either theme
         };
         let frac = j.fraction().unwrap_or(0.0);
-        if row.frac < 0.0 || row.key.is_empty() {
+        if row.frac < 0.0 || (row.bar_w - bw).abs() > 0.5 {
             row.fill.SetBrush(&self.gfx.pill_brush(color, h)?)?;
-            row.rest.SetBrush(&self.gfx.pill_brush(paint::color(255, 255, 255, 0.10), h)?)?;
+            row.rest.SetBrush(&self.gfx.pill_brush(paint::ink(0.10), h)?)?;
             row.fill.SetOffset(Vector3 { X: bx * k, Y: by * k, Z: 0.0 })?;
             row.fill.SetSize(Vector2 { X: ((bw - GAP) * frac * k).max(h), Y: h })?;
             let e = c.CreateExpressionAnimationWithExpression(&HSTRING::from(format!(
@@ -1533,6 +1842,7 @@ impl Manager {
             row.fill.SetBrush(&self.gfx.pill_brush(color, h)?)?;
         }
         self.rows[idx].frac = frac;
+        self.rows[idx].bar_w = bw;
         Ok(())
     }
 
@@ -1586,7 +1896,7 @@ impl Manager {
             p.text(&sub, (w - sw) / 2.0, cy + 80.0, 13.0, REGULAR, paint::dim(), w - 48.0);
             let Some(cta) = cta else { return };
             if searching {
-                p.round(bx, by, bw, bh, 15.0, paint::color(255, 255, 255, if hot { 0.14 } else { 0.08 }));
+                p.round(bx, by, bw, bh, 15.0, paint::ink(if hot { 0.14 } else { 0.08 }));
                 let lw = p.measure(cta, 13.5, SEMIBOLD);
                 p.text_mid(cta, bx + (bw - lw) / 2.0, by + bh / 2.0, 13.5, SEMIBOLD, paint::text(), bw);
                 return;
@@ -1602,8 +1912,8 @@ impl Manager {
             let mut x = w / 2.0 - total / 2.0;
             for ((t, cap), tw) in parts.iter().zip(widths) {
                 if *cap {
-                    p.round(x, y - 10.0, tw, 21.0, 6.0, paint::color(255, 255, 255, 0.07));
-                    p.round(x, y - 10.0, tw, 19.0, 6.0, paint::color(255, 255, 255, 0.10));
+                    p.round(x, y - 10.0, tw, 21.0, 6.0, paint::ink(0.07));
+                    p.round(x, y - 10.0, tw, 19.0, 6.0, paint::ink(0.10));
                     p.text_mid(t, x + 7.0, y - 0.5, 11.5, MEDIUM, paint::text(), tw);
                 } else {
                     p.text_mid(t, x, y, 11.5, REGULAR, paint::faint(), tw + 2.0);
@@ -1638,6 +1948,7 @@ impl Manager {
             (a, q) => format!("{a} downloading, {q} queued"),
         };
         let speed = if active > 0 { Some(paint::speed(down)) } else { None };
+        let status = if self.picked.len() > 1 { format!("{} selected  \u{b7}  Esc to clear", self.picked.len()) } else { status };
         let values = self.speeds.clone();
         let status_w = cw - 24.0 - 22.0 - 4.0 * 48.0;
         self.sprite_from(&self.dock_status, status_w, DOCK_H, |p| {
@@ -1663,11 +1974,13 @@ impl Manager {
         })?;
         self.dock_add.SetOffset(Vector3 { X: (cw - 22.0 - 44.0) * k, Y: 0.0, Z: 0.0 })?;
         // the ghost actions
+        let multi = self.picked.len() > 1;
         for (i, (icon, _)) in DOCK_TOOLS.iter().enumerate() {
+            let icon = if multi && i == 2 { &icons::CANCEL } else { icon };
             let hot = self.hover == Hit::DockTool(i);
             self.sprite_from(&self.dock_tools[i], 40.0, 40.0, |p| {
                 if hot {
-                    p.round(0.0, 0.0, 40.0, 40.0, 14.0, paint::color(255, 255, 255, 0.10));
+                    p.round(0.0, 0.0, 40.0, 40.0, 14.0, paint::ink(0.10));
                 }
                 p.glyph(icon, 20.0, 20.0, 13.0, if hot { paint::text() } else { paint::dim() });
             })?;
@@ -1719,8 +2032,15 @@ impl Manager {
     fn clamp_scroll(&mut self, animate: bool) {
         let view_h = self.h - self.list_top();
         let max = (self.content_h() - view_h).max(0.0);
+        let before = self.scroll;
         self.scroll = self.scroll.clamp(0.0, max);
-        let to = Vector3 { X: 0.0, Y: -self.scroll * self.k, Z: 0.0 };
+        if (self.scroll - before).abs() > 0.5 || animate {
+            // rows coming into reach are just there
+            self.entering = false;
+            let _ = self.sync_rows();
+            self.entering = true;
+        }
+        let to = Vector3 { X: 0.0, Y: (self.list_top() - self.scroll) * self.k, Z: 0.0 };
         let _ = (|| -> Result<()> {
             if animate {
                 let a = self.gfx.compositor.CreateVector3KeyFrameAnimation()?;
@@ -1751,6 +2071,7 @@ impl Manager {
 
     fn build_page(&mut self, animate: bool) {
         let v = self.values();
+        self.page.top = HEAD;
         let _ = self.page.build(&v, self.k, self.cw(), self.h - HEAD, animate);
     }
 
@@ -1762,14 +2083,23 @@ impl Manager {
         self.view = view;
         self.scroll = 0.0;
         self.selected = None;
+        self.picked.clear();
+        self.close_menu();
+        self.hide_tip();
         self.focus_search(false);
         let settings = view == Page::Settings;
         if was_settings != settings {
             std::mem::swap(&mut self.search, &mut self.other_search);
             self.page.query = if settings { self.search.string() } else { self.other_search.string() };
         }
-        let _ = self.page.root.SetIsVisible(settings);
+        let _ = self.page_view.SetIsVisible(settings);
+        for v in &self.page_blurs {
+            let _ = v.SetIsVisible(settings);
+        }
         let _ = self.list.SetIsVisible(!settings);
+        for v in &self.blurs {
+            let _ = v.SetIsVisible(!settings);
+        }
         let _ = self.move_sel(true);
         let _ = self.paint_sidebar();
         let _ = self.paint_header();
@@ -1778,12 +2108,7 @@ impl Manager {
             self.build_page(false);
         } else {
             let _ = self.place_list();
-            // the list's rows come in again
-            if let Ok(ch) = self.inner.Children() {
-                for r in self.rows.drain(..) {
-                    let _ = ch.Remove(&r.v);
-                }
-            }
+            // rows in both lists glide to their new places; only new ones come in
             self.rebuild_list();
         }
     }
@@ -1796,6 +2121,9 @@ impl Manager {
         }
         if let Some(s) = &self.sheet {
             return self.sheet_hit(s, x, y);
+        }
+        if let Some(m) = &self.menu {
+            return m.model.hit(x - m.x, y - m.y).map_or(Hit::MenuOff, Hit::Menu);
         }
         if let Some(i) = self.option_at(x, y) {
             return Hit::Option(i);
@@ -1930,8 +2258,18 @@ impl Manager {
         if any(|x| matches!(x, Hit::Option(_))) {
             let _ = self.paint_dropdown();
         }
+        if self.menu.is_some() {
+            let mh = if let Hit::Menu(m) = &h { Some(*m) } else { None };
+            if let Some(m) = &mut self.menu {
+                if m.hover != mh {
+                    m.hover = mh;
+                    let _ = self.paint_menu();
+                }
+            }
+        }
+        self.update_tip();
         let in_dock = matches!(h, Hit::Dock | Hit::DockAdd | Hit::DockTool(_));
-        self.set_dock_open(in_dock);
+        self.set_dock_open(in_dock || self.picked.len() > 1);
         if any(|x| matches!(x, Hit::DockAdd | Hit::DockTool(_))) {
             let _ = self.paint_dock();
         }
@@ -1964,10 +2302,29 @@ impl Manager {
     }
 
     fn click(&mut self, hit: Hit, double: bool) -> Option<Blocking> {
+        self.hide_tip();
         if !matches!(hit, Hit::Search | Hit::SearchClear | Hit::Option(_) | Hit::Chip(_)) && self.search_focus {
             self.focus_search(false);
         }
         match hit {
+            Hit::Menu(popup::MHit::Item(i)) => {
+                let Some(m) = self.menu.take() else { return None };
+                self.close_menu();
+                if let Some(popup::Item::Action { id, .. }) = m.model.items.get(i) {
+                    self.act(id, &m.ids);
+                }
+            }
+            Hit::Menu(popup::MHit::Prio(pr)) => {
+                let Some(m) = self.menu.take() else { return None };
+                self.close_menu();
+                for id in &m.ids {
+                    if self.job(*id).is_some_and(|j| !j.state.finished()) {
+                        dl::engine().set_priority(*id, pr);
+                    }
+                }
+            }
+            Hit::Menu(popup::MHit::Card) => {}
+            Hit::MenuOff => self.close_menu(),
             Hit::Filter(i) => self.set_view(Page::List(FILTERS[i].0)),
             Hit::Settings => self.set_view(Page::Settings),
             Hit::Search => {
@@ -1990,6 +2347,11 @@ impl Manager {
                 }
             }
             Hit::DockAdd => self.open_add(None),
+            // with several rows selected, the dock's actions are for them
+            Hit::DockTool(i) if self.picked.len() > 1 => {
+                let ids = self.sel_in_order();
+                self.act(["pause", "resume", "remove"][i.min(2)], &ids);
+            }
             Hit::DockTool(0) => dl::engine().pause_all(),
             Hit::DockTool(1) => dl::engine().resume_all(),
             Hit::DockTool(_) => dl::engine().clear_finished(),
@@ -2002,11 +2364,24 @@ impl Manager {
                 }
             }
             Hit::Row(id) => {
-                self.selected = Some(id);
-                let _ = self.sync_rows();
-                if double {
-                    self.open(id);
+                let (ctrl, shift) = unsafe { (GetKeyState(VK_CONTROL.0 as i32) < 0, GetKeyState(VK_SHIFT.0 as i32) < 0) };
+                if ctrl {
+                    if let Some(i) = self.picked.iter().position(|s| *s == id) {
+                        self.picked.remove(i);
+                    } else {
+                        self.picked.push(id);
+                    }
+                    self.selected = Some(id);
+                    self.anchor = Some(id);
+                } else if shift && self.anchor.is_some() {
+                    self.select_range(id);
+                } else {
+                    self.select_only(id);
+                    if double {
+                        self.open(id);
+                    }
                 }
+                self.on_selection();
             }
             Hit::RowBtn(id, RowBtn::Toggle) => self.toggle(id),
             Hit::RowBtn(id, RowBtn::Cancel) => dl::engine().remove(id, true),
@@ -2049,8 +2424,9 @@ impl Manager {
                 let _ = self.paint_sheet();
             }
             Hit::None => {
-                if self.selected.take().is_some() {
-                    let _ = self.sync_rows();
+                if self.selected.take().is_some() || !self.picked.is_empty() {
+                    self.picked.clear();
+                    self.on_selection();
                 }
             }
             Hit::UpdateCard => crate::stash::queue("update:apply".into()),
@@ -2059,39 +2435,397 @@ impl Manager {
         None
     }
 
-    fn row_menu(&self, id: u64) -> Option<tray_icon::menu::Menu> {
-        use tray_icon::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
-        let j = self.job(id)?;
-        let item = |action: &str, label: &str, enabled: bool| MenuItem::with_id(format!("dl:{action}:{id}"), label, enabled, None);
-        let done = j.state.finished();
-        let missing = self.is_missing(j);
-        let open = item("open", "Open", done && !missing);
-        let reveal = item("reveal", "Show in Folder", !missing);
-        let copy = item("copy", if j.source.starts_with("magnet:") { "Copy Magnet Link" } else { "Copy Download Link" }, true);
-        let source = item("source", "Open Source Page", j.referrer.is_some() || j.source.starts_with("http"));
-        let again = item("again", if j.expired { "Download Again (link expired)" } else { "Download Again" }, !j.expired && (done || j.state == State::Failed));
-        let remove = item("remove", if done { "Remove from List…" } else { "Cancel and Remove" }, true);
-        let mut items: Vec<Box<dyn IsMenuItem>> = vec![Box::new(open), Box::new(reveal), Box::new(PredefinedMenuItem::separator())];
-        if !done {
-            let toggle = match j.state {
-                State::Active | State::Queued => item("pause", "Pause", true),
-                State::Failed => item("resume", "Try Again", true),
-                _ => item("resume", "Resume", true),
-            };
-            let prio = |p: Priority, label: &str| CheckMenuItem::with_id(format!("dl:prio-{}:{id}", p as u8), label, true, j.priority == p, None);
-            let priority = Submenu::with_items("Priority", true, &[&prio(Priority::High, "High") as &dyn IsMenuItem, &prio(Priority::Normal, "Normal"), &prio(Priority::Low, "Low")]).ok()?;
-            items.push(Box::new(toggle));
-            items.push(Box::new(item("now", "Start Now", j.state == State::Queued)));
-            items.push(Box::new(priority));
-            items.push(Box::new(PredefinedMenuItem::separator()));
+    // ---------- selection ----------
+
+    fn select_only(&mut self, id: u64) {
+        self.picked = vec![id];
+        self.selected = Some(id);
+        self.anchor = Some(id);
+    }
+
+    /// The downloads on the list, top to bottom.
+    fn list_ids(&self) -> Vec<u64> {
+        self.lines.iter().filter_map(|l| if let Line::Job(j) = l { Some(j.id) } else { None }).collect()
+    }
+
+    /// Shift+click: everything from the anchor to `id`.
+    fn select_range(&mut self, id: u64) {
+        let ids = self.list_ids();
+        let a = self.anchor.and_then(|a| ids.iter().position(|x| *x == a));
+        let b = ids.iter().position(|x| *x == id);
+        if let (Some(a), Some(b)) = (a, b) {
+            self.picked = ids[a.min(b)..=a.max(b)].to_vec();
+        } else {
+            self.picked = vec![id];
         }
-        items.push(Box::new(copy));
-        items.push(Box::new(source));
-        items.push(Box::new(again));
-        items.push(Box::new(PredefinedMenuItem::separator()));
-        items.push(Box::new(remove));
-        let refs: Vec<&dyn IsMenuItem> = items.iter().map(|b| b.as_ref()).collect();
-        Menu::with_items(&refs).ok()
+        self.selected = Some(id);
+    }
+
+    fn sel_in_order(&self) -> Vec<u64> {
+        self.list_ids().into_iter().filter(|id| self.picked.contains(id)).collect()
+    }
+
+    /// The rows, and the dock (its actions follow a multiple selection), catch up.
+    fn on_selection(&mut self) {
+        let _ = self.sync_rows();
+        let in_dock = matches!(self.hover, Hit::Dock | Hit::DockAdd | Hit::DockTool(_));
+        self.set_dock_open(in_dock || self.picked.len() > 1);
+        let _ = self.paint_dock();
+    }
+
+    /// Run a menu or keyboard action on these downloads.
+    fn act(&mut self, action: &str, ids: &[u64]) {
+        let e = dl::engine();
+        match action {
+            "copy" => {
+                let links: Vec<String> = ids.iter().filter_map(|id| self.job(*id).map(|j| j.source.clone())).collect();
+                if links.is_empty() {
+                    return;
+                }
+                shell::set_clipboard_text(&links.join("\r\n"));
+                let note = if links.len() == 1 { "Download link copied".to_string() } else { format!("{} download links copied", links.len()) };
+                self.show_toast(&note);
+            }
+            "remove" => self.ask_remove(ids.to_vec()),
+            "pause" => {
+                for id in ids {
+                    if self.job(*id).is_some_and(|j| matches!(j.state, State::Active | State::Queued | State::Seeding)) {
+                        e.pause(*id);
+                    }
+                }
+            }
+            "resume" => {
+                for id in ids {
+                    if self.job(*id).is_some_and(|j| matches!(j.state, State::Paused | State::Failed)) {
+                        e.resume(*id);
+                    }
+                }
+            }
+            "again" => {
+                for id in ids {
+                    if self.job(*id).is_some_and(|j| !j.expired && (j.state.finished() || j.state == State::Failed)) {
+                        e.again(*id);
+                        self.missing.remove(id);
+                    }
+                }
+            }
+            _ => {
+                for id in ids {
+                    command(&format!("dl:{action}:{id}"));
+                }
+            }
+        }
+    }
+
+    /// Remove downloads from the list. Unfinished ones are cancelled (their partial
+    /// file goes); when finished files are still on the PC, ask whether they go too.
+    fn ask_remove(&mut self, ids: Vec<u64>) {
+        let has_file = |j: &JobView| j.state.finished() && j.path.as_ref().is_some_and(|p| p.exists());
+        let jobs: Vec<JobView> = ids.iter().filter_map(|id| self.job(*id).cloned()).collect();
+        let Some(first) = jobs.iter().find(|j| has_file(j)).cloned() else {
+            for j in &jobs {
+                dl::engine().remove(j.id, !j.state.finished());
+            }
+            if jobs.len() > 1 {
+                self.show_toast(&format!("Removed {} downloads", jobs.len()));
+            }
+            self.picked.clear();
+            return;
+        };
+        let files = jobs.iter().filter(|j| has_file(j)).count();
+        let (name, path) = if jobs.len() == 1 {
+            let path = first.path.as_ref().map(|p| p.parent().unwrap_or(p).display().to_string()).unwrap_or_default();
+            (first.name.clone(), format!("{path}  \u{b7}  {}", first.total.map(paint::bytes).unwrap_or_default()))
+        } else {
+            let more = jobs.len() - 1;
+            let total: u64 = jobs.iter().filter(|j| has_file(j)).filter_map(|j| j.total).sum();
+            (format!("{}  and {more} more", first.name), format!("{files} of {} files still on your PC  \u{b7}  {}", jobs.len(), paint::bytes(total)))
+        };
+        self.open_sheet(SheetKind::Remove { ids: jobs.iter().map(|j| j.id).collect(), name, path, delete: false });
+    }
+
+    // ---------- the right-click menu ----------
+
+    fn menu_items(&self, ids: &[u64]) -> Vec<popup::Item> {
+        use popup::Item;
+        // each action's icon, by its command
+        let icon = |id: &str| -> Option<&'static str> {
+            Some(match id {
+                "open" => icons::OPEN,
+                "reveal" => icons::FOLDER,
+                "pause" => icons::PAUSE,
+                "resume" => icons::PLAY,
+                "retry" => icons::RETRY,
+                "now" => icons::BOLT,
+                "copy" => icons::LINK,
+                "source" => icons::GLOBE,
+                "again" => icons::DOWNLOAD,
+                "remove" => icons::TRASH,
+                "cancel" => icons::CANCEL,
+                _ => return None,
+            })
+        };
+        // removing is the one destructive action: always in the danger colour
+        let action = |id: &str, label: String, keys: Option<&'static str>, enabled: bool| Item::Action { id: id.into(), label, icon: icon(id), keys, enabled, danger: id == "remove" };
+        let jobs: Vec<&JobView> = ids.iter().filter_map(|id| self.job(*id)).collect();
+        if let [j] = jobs[..] {
+            let done = j.state.finished();
+            let missing = self.is_missing(j);
+            let mut items = vec![
+                action("open", "Open".into(), Some("Enter"), done && !missing),
+                action("reveal", "Show in Folder".into(), None, !missing),
+                Item::Sep,
+            ];
+            if !done {
+                let (id, label, glyph) = match j.state {
+                    State::Active | State::Queued | State::Seeding => ("pause", "Pause", "pause"),
+                    State::Failed => ("resume", "Try Again", "retry"),
+                    _ => ("resume", "Resume", "resume"),
+                };
+                items.push(Item::Action { id: id.into(), label: label.into(), icon: icon(glyph), keys: Some("Space"), enabled: true, danger: false });
+                items.push(action("now", "Start Now".into(), None, j.state == State::Queued));
+                items.push(Item::Priority(Some(j.priority)));
+                items.push(Item::Sep);
+            }
+            let copy = if j.source.starts_with("magnet:") { "Copy Magnet Link" } else { "Copy Download Link" };
+            items.push(action("copy", copy.into(), Some("Ctrl+C"), true));
+            items.push(action("source", "Open Source Page".into(), None, j.referrer.is_some() || j.source.starts_with("http")));
+            let again = if j.expired { "Download Again (link expired)" } else { "Download Again" };
+            items.push(action("again", again.into(), None, !j.expired && (done || j.state == State::Failed)));
+            items.push(Item::Sep);
+            items.push(if done {
+                action("remove", "Remove from List\u{2026}".into(), Some("Del"), true)
+            } else {
+                Item::Action { id: "remove".into(), label: "Cancel Download".into(), icon: icon("cancel"), keys: Some("Del"), enabled: true, danger: true }
+            });
+            return items;
+        }
+        let n = jobs.len();
+        let count = |f: &dyn Fn(&JobView) -> bool| jobs.iter().filter(|j| f(j)).count();
+        let pausable = count(&|j| matches!(j.state, State::Active | State::Queued | State::Seeding));
+        let resumable = count(&|j| matches!(j.state, State::Paused | State::Failed));
+        let again = count(&|j| !j.expired && (j.state.finished() || j.state == State::Failed));
+        let unfinished: Vec<&&JobView> = jobs.iter().filter(|j| !j.state.finished()).collect();
+        // the count each action applies to (none: the plain, disabled verb)
+        let label = |n: usize, verb: &str, one: &str, many: &str| match n {
+            0 => verb.to_string(),
+            1 => format!("{verb} {one}"),
+            n => format!("{verb} {n} {many}"),
+        };
+        let mut items = vec![
+            action("pause", label(pausable, "Pause", "Download", "Downloads"), Some("Space"), pausable > 0),
+            action("resume", label(resumable, "Resume", "Download", "Downloads"), None, resumable > 0),
+            action(
+                "again",
+                match again {
+                    0 => "Download Again".to_string(),
+                    1 => "Download 1 File Again".to_string(),
+                    n => format!("Download {n} Files Again"),
+                },
+                None,
+                again > 0,
+            ),
+        ];
+        if !unfinished.is_empty() {
+            let first = unfinished[0].priority;
+            items.push(Item::Priority(unfinished.iter().all(|j| j.priority == first).then_some(first)));
+        }
+        items.push(Item::Sep);
+        items.push(action("copy", format!("Copy {n} Links"), Some("Ctrl+C"), true));
+        items.push(Item::Sep);
+        items.push(action("remove", format!("Remove {n} from List\u{2026}"), Some("Del"), true));
+        items
+    }
+
+    /// Open the menu for the selection at (x, y): it grows from the pointer, flipping
+    /// to stay inside the window.
+    fn open_menu(&mut self, x: f32, y: f32) {
+        self.hide_tip();
+        let ids = self.sel_in_order();
+        if ids.is_empty() {
+            return;
+        }
+        let k = self.k;
+        let dw = self.gfx.dwrite.clone();
+        let model = popup::Menu::new(self.menu_items(&ids), |t, size, _| paint::advance(&dw, t, size * k) / k);
+        let (w, h) = (model.w, model.h);
+        let right = x + w > self.w - 8.0;
+        let up = y + h > self.h - 8.0;
+        let mx = (if right { x - w } else { x }).clamp(8.0, (self.w - w - 8.0).max(8.0));
+        let my = (if up { y - h } else { y }).clamp(8.0, (self.h - h - 8.0).max(8.0));
+        self.menu = Some(MenuState { model, x: mx, y: my, hover: None, ids });
+        let _ = (|| -> Result<()> {
+            self.paint_menu()?;
+            let v = &self.menu_v;
+            v.SetOffset(Vector3 { X: mx * k, Y: my * k, Z: 0.0 })?;
+            v.SetCenterPoint(Vector3 { X: if right { w * k } else { 0.0 }, Y: if up { h * k } else { 0.0 }, Z: 0.0 })?;
+            let c = &self.gfx.compositor;
+            let o = c.CreateScalarKeyFrameAnimation()?;
+            o.InsertKeyFrame(0.0, 0.0)?;
+            o.InsertKeyFrameWithEasingFunction(1.0, 1.0, &self.ease_out()?)?;
+            o.SetDuration(ms(110))?;
+            v.StartAnimation(&HSTRING::from("Opacity"), &o)?;
+            let sc = c.CreateVector3KeyFrameAnimation()?;
+            sc.InsertKeyFrame(0.0, Vector3 { X: 0.95, Y: 0.95, Z: 1.0 })?;
+            sc.InsertKeyFrameWithEasingFunction(1.0, Vector3 { X: 1.0, Y: 1.0, Z: 1.0 }, &self.ease_out()?)?;
+            sc.SetDuration(ms(170))?;
+            v.StartAnimation(&HSTRING::from("Scale"), &sc)
+        })();
+    }
+
+    fn paint_menu(&self) -> Result<()> {
+        let Some(m) = &self.menu else { return Ok(()) };
+        self.sprite_from(&self.menu_v, m.model.w, m.model.h, |p| m.model.paint(p, m.hover))
+    }
+
+    fn close_menu(&mut self) {
+        if self.menu.take().is_none() && !self.menu_v.Opacity().is_ok_and(|o| o > 0.0) {
+            return;
+        }
+        let _ = (|| -> Result<()> {
+            let o = self.gfx.compositor.CreateScalarKeyFrameAnimation()?;
+            o.InsertExpressionKeyFrame(0.0, &HSTRING::from("this.StartingValue"))?;
+            o.InsertKeyFrame(1.0, 0.0)?;
+            o.SetDuration(ms(90))?;
+            self.menu_v.StartAnimation(&HSTRING::from("Opacity"), &o)
+        })();
+    }
+
+    /// Arrow keys move through the menu, Enter runs the item, Esc closes it.
+    fn menu_key(&mut self, vk: u16) -> bool {
+        let Some(m) = &mut self.menu else { return false };
+        let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+        let items = m.model.actionable();
+        let at = match m.hover {
+            Some(popup::MHit::Item(i)) => items.iter().position(|x| *x == i),
+            _ => None,
+        };
+        let next = vk == VK_DOWN.0 || (ctrl && vk == b'N' as u16);
+        let prev = vk == VK_UP.0 || (ctrl && vk == b'P' as u16);
+        if (next || prev) && !items.is_empty() {
+            let n = items.len();
+            let i = match (at, next) {
+                (None, true) => 0,
+                (None, false) => n - 1,
+                (Some(i), true) => (i + 1) % n,
+                (Some(i), false) => (i + n - 1) % n,
+            };
+            m.hover = Some(popup::MHit::Item(items[i]));
+            let _ = self.paint_menu();
+        } else if vk == VK_RETURN.0 || vk == VK_SPACE.0 {
+            if let Some(h) = m.hover {
+                self.click(Hit::Menu(h), false);
+            }
+        } else {
+            self.close_menu();
+        }
+        true
+    }
+
+    // ---------- tooltips ----------
+
+    fn tip_text(&self, h: &Hit) -> Option<String> {
+        let multi = self.picked.len() > 1;
+        Some(match h {
+            Hit::DockAdd => "New download  (Ctrl+N)".into(),
+            Hit::DockTool(i) if multi => ["Pause selected", "Resume selected", "Remove selected"][(*i).min(2)].into(),
+            Hit::DockTool(i) => DOCK_TOOLS.get(*i)?.1.into(),
+            Hit::RowBtn(id, b) => {
+                let j = self.job(*id)?;
+                match b {
+                    RowBtn::Toggle => match j.state {
+                        State::Active | State::Queued | State::Seeding => "Pause",
+                        State::Failed => "Try again",
+                        _ => "Resume",
+                    },
+                    RowBtn::Cancel => "Cancel download",
+                    RowBtn::Reveal => "Show in folder",
+                    RowBtn::Again if self.is_missing(j) => return None, // the button says it
+                    RowBtn::Again => "Download again",
+                }
+                .into()
+            }
+            _ => return None,
+        })
+    }
+
+    /// Where a tooltip points: the button's center x and its top and bottom (DIPs).
+    fn tip_anchor(&self, h: &Hit) -> Option<(f32, f32, f32)> {
+        match h {
+            Hit::DockAdd => Some((self.w - 22.0 - 22.0, self.dock_y(), self.dock_y() + 44.0)),
+            Hit::DockTool(i) => Some((SIDEBAR + self.tool_x(*i) + 20.0, self.dock_y() + 2.0, self.dock_y() + 42.0)),
+            Hit::RowBtn(id, b) => {
+                let i = self.lines.iter().position(|l| matches!(l, Line::Job(j) if j.id == *id))?;
+                let top = self.list_top() + self.line_y(i) - self.scroll + ROW / 2.0 - 15.0;
+                let bx = match b {
+                    RowBtn::Cancel | RowBtn::Reveal => self.row_w() - 26.0,
+                    _ => self.row_w() - 62.0,
+                };
+                Some((SIDEBAR + 12.0 + bx, top, top + 30.0))
+            }
+            _ => None,
+        }
+    }
+
+    /// After a hover change: the hovered button's tooltip shows after a short rest
+    /// (at once if another one was just up), and goes when the pointer leaves.
+    fn update_tip(&mut self) {
+        if self.tip_text(&self.hover).is_none() || self.menu.is_some() {
+            self.hide_tip();
+            return;
+        }
+        if self.tip_on || self.tip_off_at.elapsed().as_millis() < 400 {
+            self.show_tip();
+        } else {
+            unsafe {
+                let _ = SetTimer(Some(self.hwnd), T_TIP, 550, None);
+            }
+        }
+    }
+
+    fn show_tip(&mut self) {
+        let hover = self.hover.clone();
+        let (Some(text), Some((cx, top, bottom))) = (self.tip_text(&hover), self.tip_anchor(&hover)) else { return };
+        let k = self.k;
+        let dw = self.gfx.dwrite.clone();
+        let w = popup::tip_w(&text, |t, size, _| paint::advance(&dw, t, size * k) / k);
+        let mut y = top - 6.0 - popup::TIP_H;
+        if matches!(hover, Hit::RowBtn(..)) && y < self.list_top() {
+            y = bottom + 6.0;
+        }
+        let x = (cx - w / 2.0).clamp(SIDEBAR + 4.0, self.w - w - 4.0);
+        let was_on = self.tip_on;
+        self.tip_on = true;
+        let _ = (|| -> Result<()> {
+            self.sprite_from(&self.tip, w, popup::TIP_H, |p| popup::paint_tip(p, &text, w))?;
+            self.tip.SetOffset(Vector3 { X: (x * k).round(), Y: (y * k).round(), Z: 0.0 })?;
+            if !was_on {
+                let o = self.gfx.compositor.CreateScalarKeyFrameAnimation()?;
+                o.InsertExpressionKeyFrame(0.0, &HSTRING::from("this.StartingValue"))?;
+                o.InsertKeyFrameWithEasingFunction(1.0, 1.0, &self.ease_out()?)?;
+                o.SetDuration(ms(140))?;
+                self.tip.StartAnimation(&HSTRING::from("Opacity"), &o)?;
+            }
+            Ok(())
+        })();
+    }
+
+    fn hide_tip(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), T_TIP);
+        }
+        if !self.tip_on {
+            return;
+        }
+        self.tip_on = false;
+        self.tip_off_at = std::time::Instant::now();
+        let _ = (|| -> Result<()> {
+            let o = self.gfx.compositor.CreateScalarKeyFrameAnimation()?;
+            o.InsertExpressionKeyFrame(0.0, &HSTRING::from("this.StartingValue"))?;
+            o.InsertKeyFrame(1.0, 0.0)?;
+            o.SetDuration(ms(90))?;
+            self.tip.StartAnimation(&HSTRING::from("Opacity"), &o)
+        })();
     }
 
     fn on_drop(&mut self, paths: Vec<PathBuf>) {
@@ -2108,6 +2842,10 @@ impl Manager {
         if self.sheet.is_some() {
             return self.sheet_key(vk, ctrl);
         }
+        if self.menu.is_some() {
+            return self.menu_key(vk);
+        }
+        self.hide_tip();
         if ctrl && vk == b'F' as u16 {
             self.focus_search(true);
             self.search.all = !self.search.text.is_empty();
@@ -2143,9 +2881,9 @@ impl Manager {
             if vk == VK_RETURN.0 || vk == VK_DOWN.0 {
                 // into the results
                 self.focus_search(false);
-                if let Some(Line::Job(j)) = self.lines.iter().find(|l| matches!(l, Line::Job(_))) {
-                    self.selected = Some(j.id);
-                    let _ = self.sync_rows();
+                if let Some(id) = self.list_ids().first().copied() {
+                    self.select_only(id);
+                    self.on_selection();
                 }
                 return true;
             }
@@ -2171,7 +2909,12 @@ impl Manager {
                     (Some(p), false) => p.saturating_sub(1),
                 };
                 if let Some(&id) = ids.get(next) {
-                    self.selected = Some(id);
+                    // Shift extends the selection from the anchor; plain arrows move it
+                    if unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0 && self.anchor.is_some() {
+                        self.select_range(id);
+                    } else {
+                        self.select_only(id);
+                    }
                     if let Some(i) = self.lines.iter().position(|l| matches!(l, Line::Job(j) if j.id == id)) {
                         let top = self.line_y(i);
                         let view = self.h - self.list_top() - 80.0;
@@ -2182,12 +2925,27 @@ impl Manager {
                         }
                         self.clamp_scroll(true);
                     }
-                    let _ = self.sync_rows();
+                    self.on_selection();
                 }
             }
+            v if ctrl && v == b'A' as u16 => {
+                self.picked = ids.clone();
+                self.anchor = ids.first().copied();
+                self.on_selection();
+            }
+            v if v == VK_ESCAPE.0 && !self.picked.is_empty() => {
+                self.picked.clear();
+                self.selected = None;
+                self.on_selection();
+            }
             v if v == VK_SPACE.0 => {
-                if let Some(id) = self.selected {
+                // one row pauses or resumes; several all pause, unless all are paused
+                let ids = self.sel_in_order();
+                if let [id] = ids[..] {
                     self.toggle(id);
+                } else if !ids.is_empty() {
+                    let running = ids.iter().any(|id| self.job(*id).is_some_and(|j| matches!(j.state, State::Active | State::Queued | State::Seeding)));
+                    self.act(if running { "pause" } else { "resume" }, &ids);
                 }
             }
             v if v == VK_RETURN.0 => {
@@ -2196,13 +2954,21 @@ impl Manager {
                 }
             }
             v if v == VK_DELETE.0 => {
-                if let Some(id) = self.selected {
-                    command(&format!("dl:remove:{id}"));
+                let ids = self.sel_in_order();
+                if !ids.is_empty() {
+                    self.act("remove", &ids);
                 }
             }
             v if ctrl && v == b'C' as u16 => {
-                if let Some(id) = self.selected {
-                    command(&format!("dl:copy:{id}"));
+                let ids = self.sel_in_order();
+                self.act("copy", &ids);
+            }
+            // Shift+F10 or the menu key: the menu for the selection, under the focused row
+            v if v == VK_APPS.0 || (v == VK_F10.0 && unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0) => {
+                let at = self.selected.and_then(|id| self.lines.iter().position(|l| matches!(l, Line::Job(j) if j.id == id)));
+                if let Some(i) = at {
+                    let y = self.list_top() + self.line_y(i) - self.scroll + ROW - 8.0;
+                    self.open_menu(SIDEBAR + 80.0, y);
                 }
             }
             _ => return false,
@@ -2239,8 +3005,7 @@ impl Manager {
             let tw = paint::advance(&dw, text, 13.0 * k) / k + 46.0;
             let t = text.to_string();
             self.sprite_from(&self.toast, tw, 38.0, |p| {
-                p.round(0.0, 0.0, tw, 38.0, 14.0, paint::color(44, 42, 47, 0.98));
-                p.round_stroke(0.0, 0.0, tw, 38.0, 14.0, paint::color(255, 255, 255, 0.08), 1.0);
+                p.popover(0.0, 0.0, tw, 38.0, popup::RADIUS);
                 p.glyph(icons::CHECK, 18.0, 19.0, 11.0, paint::green());
                 p.text_mid(&t, 32.0, 19.0, 13.0, MEDIUM, paint::text(), tw);
             })?;
@@ -2271,12 +3036,14 @@ impl Manager {
 
     fn open_sheet(&mut self, kind: SheetKind) {
         self.close_sheet();
+        self.close_menu();
+        self.hide_tip();
         self.focus_search(false);
         let _ = (|| -> Result<()> {
             let c = self.gfx.compositor.clone();
             let root = c.CreateContainerVisual()?;
             let dim = c.CreateSpriteVisual()?;
-            dim.SetBrush(&c.CreateColorBrushWithColor(Color { A: 120, R: 0, G: 0, B: 0 })?)?;
+            dim.SetBrush(&c.CreateColorBrushWithColor(Color { A: if paint::light() { 56 } else { 120 }, R: 0, G: 0, B: 0 })?)?;
             dim.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 })?;
             let card = c.CreateSpriteVisual()?;
             let caret = c.CreateSpriteVisual()?;
@@ -2287,13 +3054,9 @@ impl Manager {
             root.Children()?.InsertAtTop(&card)?;
             root.SetSize(Vector2 { X: self.w * self.k, Y: self.h * self.k })?;
             self.root.Children()?.InsertAtTop(&root)?;
-            let shadow = c.CreateDropShadow()?;
-            shadow.SetBlurRadius(40.0 * self.k)?;
-            shadow.SetOffset(Vector3 { X: 0.0, Y: 12.0 * self.k, Z: 0.0 })?;
-            shadow.SetOpacity(0.5)?;
-            shadow.SetSourcePolicy(windows::UI::Composition::CompositionDropShadowSourcePolicy::InheritFromVisualContent)?;
-            card.SetShadow(&shadow)?;
-            self.sheet = Some(Sheet { kind, root: root.clone(), card: card.clone(), caret });
+            card.SetShadow(&popover_shadow(&self.gfx, self.k, false)?)?;
+            let switch = if matches!(kind, SheetKind::Remove { .. }) { Some(settings_page::new_switch(&self.gfx, &card.Children()?, self.k)?) } else { None };
+            self.sheet = Some(Sheet { kind, root: root.clone(), card: card.clone(), caret, switch });
             self.place_sheet()?;
             self.paint_sheet()?;
             let fade = c.CreateScalarKeyFrameAnimation()?;
@@ -2331,10 +3094,7 @@ impl Manager {
     }
 
     fn open_remove(&mut self, id: u64) {
-        let Some(j) = self.job(id).cloned() else { return };
-        let path = j.path.as_ref().map(|p| p.parent().unwrap_or(p).display().to_string()).unwrap_or_default();
-        let size = j.total.map(paint::bytes).unwrap_or_default();
-        self.open_sheet(SheetKind::Remove { id, name: j.name.clone(), path: format!("{path}  ·  {size}"), delete: false });
+        self.ask_remove(vec![id]);
     }
 
     fn place_sheet(&self) -> Result<()> {
@@ -2406,7 +3166,7 @@ impl Manager {
         let hover = self.hover.clone();
         let dw = self.gfx.dwrite.clone();
         let Some(s) = &mut self.sheet else { return Ok(()) };
-        let (card, caret_v) = (s.card.clone(), s.caret.clone());
+        let (card, caret_v, live_switch) = (s.card.clone(), s.caret.clone(), s.switch.clone());
         match &mut s.kind {
             SheetKind::Add { field, dir, priority, error } => {
                 let w = SHEET_W;
@@ -2426,11 +3186,10 @@ impl Manager {
                 let ok_label = if count > 1 { format!("Download {count}") } else { "Download".to_string() };
                 let full_w = paint::advance(&dw, &text, FIELD_TEXT * k) / k;
                 let draw = |p: &P| {
-                    p.round(0.0, 0.0, w, ADD_H, 26.0, paint::color(40, 38, 44, 0.985));
-                    p.round_stroke(0.0, 0.0, w, ADD_H, 26.0, paint::color(255, 255, 255, 0.09), 1.0);
+                    p.popover(0.0, 0.0, w, ADD_H, 26.0);
                     p.text("New Download", 24.0, 19.0, 17.0, SEMIBOLD, paint::text(), 300.0);
                     p.text("Paste one or more links: web addresses or magnet links.", 24.0, 46.0, 12.5, REGULAR, paint::dim(), w - 48.0);
-                    p.round(24.0, 76.0, w - 48.0, 36.0, 13.0, paint::color(0, 0, 0, 0.25));
+                    p.round(24.0, 76.0, w - 48.0, 36.0, 13.0, paint::well(0.25));
                     p.round_stroke(24.0, 76.0, w - 48.0, 36.0, 13.0, paint::rgb(paint::ORANGE, 0.75), 1.5);
                     unsafe {
                         p.dc.PushAxisAlignedClip(&D2D_RECT_F { left: 34.0 * k, top: 78.0 * k, right: (w - 34.0) * k, bottom: 110.0 * k }, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
@@ -2455,13 +3214,13 @@ impl Manager {
                     let on = hover == Hit::Folder;
                     p.text_right("Change…", w - 26.0, 149.0, 13.0, MEDIUM, if on { paint::accent_hot() } else { paint::accent() });
                     p.text_mid("Priority", 24.0, 187.0, 13.0, REGULAR, paint::dim(), 80.0);
-                    p.round(104.0, 172.0, 228.0, 30.0, 12.0, paint::color(0, 0, 0, 0.25));
+                    p.round(104.0, 172.0, 228.0, 30.0, 12.0, paint::well(0.25));
                     for (i, (pr, label)) in [(Priority::Low, "Low"), (Priority::Normal, "Normal"), (Priority::High, "High")].iter().enumerate() {
                         let x = 104.0 + i as f32 * 76.0;
                         if *pr == priority {
-                            p.round(x + 3.0, 175.0, 70.0, 24.0, 9.0, paint::color(255, 255, 255, 0.14));
+                            p.round(x + 3.0, 175.0, 70.0, 24.0, 9.0, paint::ink(0.14));
                         } else if hover == Hit::Prio(*pr) {
-                            p.round(x + 3.0, 175.0, 70.0, 24.0, 9.0, paint::color(255, 255, 255, 0.05));
+                            p.round(x + 3.0, 175.0, 70.0, 24.0, 9.0, paint::ink(0.05));
                         }
                         let lw = p.measure(label, 13.0, MEDIUM);
                         p.text_mid(label, x + (76.0 - lw) / 2.0, 187.0, 13.0, MEDIUM, if *pr == priority { paint::text() } else { paint::dim() }, 76.0);
@@ -2472,7 +3231,7 @@ impl Manager {
                     p.text_mid("Open Torrent File…", 46.0, 232.0, 13.0, MEDIUM, link, 140.0);
                     let ok_x = w - 24.0 - 120.0;
                     let cancel_x = ok_x - 10.0 - 92.0;
-                    p.round(cancel_x, 214.0, 92.0, 36.0, 18.0, paint::color(255, 255, 255, if hover == Hit::Cancel { 0.14 } else { 0.08 }));
+                    p.round(cancel_x, 214.0, 92.0, 36.0, 18.0, paint::ink(if hover == Hit::Cancel { 0.14 } else { 0.08 }));
                     let lw = p.measure("Cancel", 13.5, MEDIUM);
                     p.text_mid("Cancel", cancel_x + (92.0 - lw) / 2.0, 232.0, 13.5, MEDIUM, paint::text(), 92.0);
                     let enabled = count > 0;
@@ -2496,16 +3255,34 @@ impl Manager {
                 caret_v.SetOffset(Vector3 { X: cx * k, Y: 85.0 * k, Z: 0.0 })?;
                 caret_v.SetIsVisible(!all)?;
             }
-            SheetKind::Remove { name, path, delete, .. } => {
+            SheetKind::Remove { ids, name, path, delete } => {
                 let (w, h) = (420.0, REMOVE_H);
                 let (name, path, delete) = (name.clone(), path.clone(), *delete);
+                let many = ids.len() > 1;
+                let n = ids.len();
+                let (title, desc, switch, keep, gone) = if many {
+                    (
+                        format!("Remove {n} downloads from the list?"),
+                        "Some files are still on your PC. Keep them, or move them to the Recycle Bin.",
+                        "Also move their files to the Recycle Bin",
+                        format!("Remove {n} from List"),
+                        "Remove and Delete Files".to_string(),
+                    )
+                } else {
+                    (
+                        "Remove from your downloads?".to_string(),
+                        "The file is still on your PC. Keep it, or move it to the Recycle Bin too.",
+                        "Also move the file to the Recycle Bin",
+                        "Remove from List".to_string(),
+                        "Remove and Delete File".to_string(),
+                    )
+                };
                 let icon = shell::type_icon(&name, false, (32.0 * k) as i32);
                 let draw = |p: &P| {
-                    p.round(0.0, 0.0, w, h, 26.0, paint::color(40, 38, 44, 0.985));
-                    p.round_stroke(0.0, 0.0, w, h, 26.0, paint::color(255, 255, 255, 0.09), 1.0);
-                    p.text("Remove from your downloads?", 22.0, 20.0, 16.5, SEMIBOLD, paint::text(), w - 44.0);
-                    p.text("The file is still on your PC. Keep it, or move it to the Recycle Bin too.", 22.0, 46.0, 12.5, REGULAR, paint::dim(), w - 44.0);
-                    p.round(22.0, 78.0, w - 44.0, 56.0, 18.0, paint::color(255, 255, 255, 0.05));
+                    p.popover(0.0, 0.0, w, h, 26.0);
+                    p.text(&title, 22.0, 20.0, 16.5, SEMIBOLD, paint::text(), w - 44.0);
+                    p.text(desc, 22.0, 46.0, 12.5, REGULAR, paint::dim(), w - 44.0);
+                    p.round(22.0, 78.0, w - 44.0, 56.0, 18.0, paint::ink(0.05));
                     if let Some(px) = &icon {
                         if let Ok(b) = Gfx::bitmap(p.dc, px) {
                             let dest = D2D_RECT_F { left: 34.0 * k, top: 90.0 * k, right: 66.0 * k, bottom: 122.0 * k };
@@ -2514,32 +3291,32 @@ impl Manager {
                     }
                     p.text(&name, 76.0, 87.0, 13.5, MEDIUM, paint::text(), w - 44.0 - 70.0);
                     p.text(&path, 76.0, 107.0, 12.0, REGULAR, paint::dim(), w - 44.0 - 70.0);
-                    // the switch, then its label
+                    // the switch (its live parts sit on this track), then its label
                     let sx = 24.0;
-                    p.capsule(sx, 158.0, 40.0, 22.0, if delete { paint::accent() } else { paint::color(255, 255, 255, 0.16) });
-                    let kx = if delete { sx + 14.0 } else { sx + 2.0 };
-                    p.capsule(kx, 160.0, 24.0, 18.0, paint::color(255, 255, 255, 1.0));
-                    p.text_mid("Also move the file to the Recycle Bin", sx + 52.0, 169.0, 13.0, REGULAR, paint::text(), w - 100.0);
+                    settings_page::paint_switch_track(p, settings_page::Rect::new(sx, 158.0, settings_page::SWITCH.0, settings_page::SWITCH.1), true);
+                    p.text_mid(switch, sx + 52.0, 169.0, 13.0, REGULAR, paint::text(), w - 100.0);
                     let ok_w = 178.0;
                     let (ok_x, by) = (w - 22.0 - ok_w, h - 22.0 - 38.0);
                     let cancel_x = ok_x - 10.0 - 92.0;
                     // cancel is an outline, the action solid (danger red when it deletes)
                     let hot = hover == Hit::Cancel;
                     if hot {
-                        p.round(cancel_x, by, 92.0, 38.0, 19.0, paint::color(255, 255, 255, 0.06));
+                        p.round(cancel_x, by, 92.0, 38.0, 19.0, paint::ink(0.06));
                     }
-                    p.round_stroke(cancel_x, by, 92.0, 38.0, 19.0, paint::color(255, 255, 255, 0.22), 1.0);
+                    p.round_stroke(cancel_x, by, 92.0, 38.0, 19.0, paint::ink(0.22), 1.0);
                     let lw = p.measure("Cancel", 13.5, MEDIUM);
                     p.text_mid("Cancel", cancel_x + (92.0 - lw) / 2.0, by + 19.0, 13.5, MEDIUM, paint::text(), 92.0);
                     let hot = hover == Hit::Ok;
                     let (label, fill) = if delete {
-                        ("Remove and Delete File", if hot { paint::color(236, 93, 97, 1.0) } else { paint::color(229, 72, 77, 1.0) })
+                        (gone.as_str(), if hot { paint::color(236, 93, 97, 1.0) } else { paint::color(229, 72, 77, 1.0) })
                     } else {
-                        ("Remove from List", paint::color(255, 255, 255, if hot { 0.2 } else { 0.13 }))
+                        (keep.as_str(), paint::ink(if hot { 0.2 } else { 0.13 }))
                     };
                     p.round(ok_x, by, ok_w, 38.0, 19.0, fill);
                     let lw = p.measure(label, 13.5, SEMIBOLD);
-                    p.text_mid(label, ok_x + (ok_w - lw) / 2.0, by + 19.0, 13.5, SEMIBOLD, paint::color(255, 255, 255, 1.0), ok_w);
+                    // white on the red; the plain one is a neutral button
+                    let ink = if delete { paint::color(255, 255, 255, 1.0) } else { paint::text() };
+                    p.text_mid(label, ok_x + (ok_w - lw) / 2.0, by + 19.0, 13.5, SEMIBOLD, ink, ok_w);
                 };
                 let surface = self.gfx.surface(w * k, h * k, |dc| unsafe {
                     dc.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
@@ -2547,6 +3324,12 @@ impl Manager {
                 })?;
                 set_surface(&self.gfx, &card, &surface, w * k, h * k)?;
                 caret_v.SetIsVisible(false)?;
+                if let Some((track, knob)) = &live_switch {
+                    let r = settings_page::Rect::new(24.0, 158.0, settings_page::SWITCH.0, settings_page::SWITCH.1);
+                    // slides when flipped; set in place when the sheet first opens
+                    let flip = track.Opacity().is_ok_and(|o| (o > 0.5) != delete);
+                    settings_page::place_switch(&self.gfx, track, knob, r, delete, true, k, flip)?;
+                }
             }
         }
         Ok(())
@@ -2596,11 +3379,23 @@ impl Manager {
                 self.close_sheet();
                 self.clamp_scroll(true);
             }
-            SheetKind::Remove { id, delete, .. } => {
-                let (id, delete) = (*id, *delete);
-                dl::engine().remove(id, delete);
+            SheetKind::Remove { ids, delete, .. } => {
+                let (ids, delete) = (ids.clone(), *delete);
+                for id in &ids {
+                    // an unfinished one is cancelled, its partial file with it
+                    let unfinished = self.job(*id).is_some_and(|j| !j.state.finished());
+                    dl::engine().remove(*id, delete || unfinished);
+                }
+                self.picked.clear();
                 self.close_sheet();
-                self.show_toast(if delete { "Removed, and the file moved to the Recycle Bin" } else { "Removed from your downloads" });
+                let n = ids.len();
+                let note = match (n, delete) {
+                    (1, true) => "Removed, and the file moved to the Recycle Bin".to_string(),
+                    (1, false) => "Removed from your downloads".to_string(),
+                    (_, true) => format!("Removed {n} downloads, and their files moved to the Recycle Bin"),
+                    (_, false) => format!("Removed {n} downloads from the list"),
+                };
+                self.show_toast(&note);
             }
         }
     }
@@ -2637,6 +3432,92 @@ impl Manager {
 
 const DOCK_TOOLS: [(&str, &str); 3] = [(icons::PAUSE, "Pause all"), (icons::PLAY, "Resume all"), (icons::CLEAR, "Clear finished")];
 
+/// How every scrolling area in the window meets its chrome: `src` (not in the tree)
+/// fills the column from the window's top, and `view` shows it through an alpha mask that
+/// thins it out under the header (the top `top` DIPs) and from `bottom` down (a dock's
+/// top, or the window's foot), while the `blurs` show blurred copies there, the more
+/// blurred the more transparent, so it all fades to nothing at the edges and nothing is
+/// laid over the Mica. `w` and `h` are the column's size, in DIPs.
+#[allow(clippy::too_many_arguments)]
+fn scroll_mask(gfx: &Gfx, src: &ContainerVisual, view: &SpriteVisual, blurs: &[SpriteVisual], k: f32, w: f32, h: f32, top: f32, bottom: f32) -> Result<()> {
+    let c = &gfx.compositor;
+    let wpx = w * k;
+    view.SetOffset(Vector3 { X: SIDEBAR * k, Y: 0.0, Z: 0.0 })?;
+    view.SetSize(Vector2 { X: wpx, Y: h * k })?;
+    let white = |a: f32| Color { A: (a.clamp(0.0, 1.0) * 255.0) as u8, R: 255, G: 255, B: 255 };
+    // a vertical alpha ramp: (y in DIPs from the visual's top, alpha)
+    let ramp = |stops: &[(f32, f32)], height: f32| -> Result<CompositionLinearGradientBrush> {
+        let g = c.CreateLinearGradientBrush()?;
+        g.SetStartPoint(Vector2 { X: 0.0, Y: 0.0 })?;
+        g.SetEndPoint(Vector2 { X: 0.0, Y: 1.0 })?;
+        let list = g.ColorStops()?;
+        for (y, a) in stops {
+            list.Append(&c.CreateColorGradientStopWithOffsetAndColor((y / height).clamp(0.0, 1.0), white(*a))?)?;
+        }
+        Ok(g)
+    };
+    // the content's region [from, to) (DIPs), as a brush
+    let region = |from: f32, to: f32| -> Result<CompositionSurfaceBrush> {
+        let vs = c.CreateVisualSurface()?;
+        vs.SetSourceVisual(src)?;
+        vs.SetSourceOffset(Vector2 { X: 0.0, Y: from * k })?;
+        vs.SetSourceSize(Vector2 { X: wpx, Y: (to - from) * k })?;
+        let b = c.CreateSurfaceBrushWithSurface(&vs)?;
+        b.SetStretch(CompositionStretch::None)?;
+        b.SetHorizontalAlignmentRatio(0.0)?;
+        b.SetVerticalAlignmentRatio(0.0)?;
+        Ok(b)
+    };
+    let masked = |v: &SpriteVisual, brush: &CompositionBrush, mask: &CompositionLinearGradientBrush| -> Result<()> {
+        let m = c.CreateMaskBrush()?;
+        m.SetSource(brush)?;
+        m.SetMask(mask)?;
+        v.SetBrush(&m)
+    };
+    let place = |v: &SpriteVisual, y: f32, bh: f32| -> Result<()> {
+        v.SetOffset(Vector3 { X: SIDEBAR * k, Y: y * k, Z: 0.0 })?;
+        v.SetSize(Vector2 { X: wpx, Y: bh * k })
+    };
+    // the sharp content: gone near the top, full from the header's foot to the bottom chrome
+    let sharp = ramp(&[(0.0, 0.0), (top * 0.7, 0.0), (top * 0.9, 0.55), (top, 1.0), (bottom - 40.0, 1.0), (bottom - 6.0, 0.3), (bottom + 8.0, 0.0), (h, 0.0)], h)?;
+    masked(view, &region(0.0, h)?.cast()?, &sharp)?;
+    // under the header: a light blur in the middle, a heavier one at the top
+    let hb = top + 12.0;
+    let light = blur::brush(c, &region(0.0, hb)?.cast()?, 5.0 * k)?;
+    masked(&blurs[0], &light.cast()?, &ramp(&[(0.0, 0.0), (top * 0.35, 0.1), (top * 0.7, 0.32), (top * 0.92, 0.2), (top, 0.0), (hb, 0.0)], hb)?)?;
+    place(&blurs[0], 0.0, hb)?;
+    let heavy = blur::brush(c, &region(0.0, hb)?.cast()?, 14.0 * k)?;
+    masked(&blurs[1], &heavy.cast()?, &ramp(&[(0.0, 0.0), (top * 0.4, 0.14), (top * 0.65, 0.06), (top * 0.8, 0.0), (hb, 0.0)], hb)?)?;
+    place(&blurs[1], 0.0, hb)?;
+    // at the bottom: only the strip behind the chrome, thinning out toward the edge
+    let from = (bottom - 24.0).min(h - 24.0);
+    let foot = blur::brush(c, &region(from, h)?.cast()?, 9.0 * k)?;
+    masked(&blurs[2], &foot.cast()?, &ramp(&[(0.0, 0.0), (20.0, 0.4), (38.0, 0.22), (h - from, 0.0)], h - from)?)?;
+    place(&blurs[2], from, h - from)?;
+    Ok(())
+}
+
+/// Every popover's shadow: soft, wide and faint, so it lifts the card without a dark
+/// halo (a tooltip's is smaller, as the tooltip is).
+fn popover_shadow(gfx: &Gfx, k: f32, small: bool) -> Result<windows::UI::Composition::DropShadow> {
+    let (blur, y, opacity) = if small { (14.0, 3.0, 0.16) } else { (36.0, 10.0, 0.2) };
+    let shadow = gfx.compositor.CreateDropShadow()?;
+    shadow.SetBlurRadius(blur * k)?;
+    shadow.SetOffset(Vector3 { X: 0.0, Y: y * k, Z: 0.0 })?;
+    shadow.SetOpacity(if paint::light() { opacity * 0.7 } else { opacity })?;
+    shadow.SetSourcePolicy(windows::UI::Composition::CompositionDropShadowSourcePolicy::InheritFromVisualContent)?;
+    Ok(shadow)
+}
+
+/// Under everything: clear over Mica; one solid colour where there's no Mica (Windows 10).
+fn backdrop_color(mica: bool) -> Color {
+    match (mica, paint::light()) {
+        (true, _) => Color { A: 0, R: 0, G: 0, B: 0 },
+        (false, true) => Color { A: 255, R: 243, G: 242, B: 245 },
+        (false, false) => Color { A: 255, R: 30, G: 28, B: 33 },
+    }
+}
+
 fn set_surface(gfx: &Gfx, v: &SpriteVisual, surface: &windows::UI::Composition::CompositionDrawingSurface, w: f32, h: f32) -> Result<()> {
     let brush = gfx.compositor.CreateSurfaceBrushWithSurface(surface)?;
     brush.SetStretch(CompositionStretch::Fill)?;
@@ -2665,14 +3546,13 @@ fn has_toggle(j: &JobView) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn paint_row(p: &P, j: &JobView, rw: f32, selected: bool, hovered: bool, hover_btn: Option<RowBtn>, missing: bool, icon: Option<&Pixels>, marks: &[usize], site: &str) {
     if selected {
-        p.round(0.0, 2.0, rw, ROW - 4.0, 16.0, paint::color(255, 255, 255, 0.075));
+        p.round(0.0, 2.0, rw, ROW - 4.0, 16.0, paint::ink(0.075));
     } else if hovered {
-        p.round(0.0, 2.0, rw, ROW - 4.0, 16.0, paint::color(255, 255, 255, 0.04));
+        p.round(0.0, 2.0, rw, ROW - 4.0, 16.0, paint::ink(0.04));
     }
     let k = p.k;
     let finished = j.state.finished();
-    // the icon on a soft squircle tile
-    p.round(12.0, (ROW - 44.0) / 2.0, 44.0, 44.0, 14.0, paint::color(255, 255, 255, 0.06));
+    // (the icon is its own visual, with a soft shadow: see update_row_icon)
     if let Some(px) = icon {
         if let Ok(b) = Gfx::bitmap(p.dc, px) {
             let s = 28.0;
@@ -2691,7 +3571,7 @@ fn paint_row(p: &P, j: &JobView, rw: f32, selected: bool, hovered: bool, hover_b
             head_w += p.text_right(pct, right, name_y + 9.0, 12.5, SEMIBOLD, if j.state == State::Active { paint::text() } else { paint::dim() });
         }
         if j.state == State::Active && j.phase.is_none() {
-            head_w += 10.0 + p.text_right(&paint::speed(j.speed), right - head_w - 10.0, name_y + 9.0, 12.5, MEDIUM, paint::color(255, 182, 133, 1.0));
+            head_w += 10.0 + p.text_right(&paint::speed(j.speed), right - head_w - 10.0, name_y + 9.0, 12.5, MEDIUM, paint::accent_text());
         }
     }
     let name_ink = if missing { paint::dim() } else { paint::text() };
@@ -2700,7 +3580,7 @@ fn paint_row(p: &P, j: &JobView, rw: f32, selected: bool, hovered: bool, hover_b
         let (label, c, bg) = if j.priority == Priority::High {
             ("HIGH", paint::rgb(paint::GOLD, 1.0), paint::rgb(paint::GOLD, 0.14))
         } else {
-            ("LOW", paint::faint(), paint::color(255, 255, 255, 0.07))
+            ("LOW", paint::faint(), paint::ink(0.07))
         };
         let lw = p.measure(label, 9.0, SEMIBOLD) + 10.0;
         p.round(68.0 + nw + 8.0, name_y + 2.0, lw, 15.0, 5.0, bg);
@@ -2711,8 +3591,8 @@ fn paint_row(p: &P, j: &JobView, rw: f32, selected: bool, hovered: bool, hover_b
         let size = j.total.map(paint::bytes).unwrap_or_default();
         let from = if site.is_empty() { shell::folder_name(&j.dir) } else { site.to_string() };
         if missing {
-            p.glyph(icons::WARNING, 75.0, meta_y + 8.0, 9.5, paint::color(245, 169, 122, 1.0));
-            let w1 = p.text("Moved or deleted", 86.0, meta_y, 12.5, MEDIUM, paint::color(245, 169, 122, 1.0), 160.0);
+            p.glyph(icons::WARNING, 75.0, meta_y + 8.0, 9.5, paint::warn_text());
+            let w1 = p.text("Moved or deleted", 86.0, meta_y, 12.5, MEDIUM, paint::warn_text(), 160.0);
             p.text(&format!("  ·  {size}  ·  {from}"), 86.0 + w1, meta_y, 12.5, REGULAR, paint::dim(), right - 86.0 - w1);
         } else {
             p.text(&format!("{size}  ·  {from}"), 68.0, meta_y, 12.5, REGULAR, paint::dim(), right - 68.0);
@@ -2757,7 +3637,7 @@ fn paint_row(p: &P, j: &JobView, rw: f32, selected: bool, hovered: bool, hover_b
         if !show {
             return;
         }
-        p.round(cx - 15.0, cy - 15.0, 30.0, 30.0, 11.0, paint::color(255, 255, 255, if on { 0.14 } else { 0.05 }));
+        p.round(cx - 15.0, cy - 15.0, 30.0, 30.0, 11.0, paint::ink(if on { 0.14 } else { 0.05 }));
         p.glyph(g, cx, cy, 10.5, if on { paint::text() } else { paint::dim() });
     };
     if finished && missing {
@@ -2771,8 +3651,8 @@ fn paint_row(p: &P, j: &JobView, rw: f32, selected: bool, hovered: bool, hover_b
             if hot {
                 p.round(rw - 10.0 - bw, cy - 16.0, bw, 32.0, 12.0, paint::rgb(paint::ORANGE, 0.14));
             }
-            p.glyph(icons::RETRY, rw - 10.0 - bw + 18.0, cy, 10.5, paint::color(255, 182, 133, 1.0));
-            p.text_mid(label, rw - 10.0 - bw + 30.0, cy, 12.5, SEMIBOLD, paint::color(255, 182, 133, 1.0), lw + 2.0);
+            p.glyph(icons::RETRY, rw - 10.0 - bw + 18.0, cy, 10.5, paint::accent_text());
+            p.text_mid(label, rw - 10.0 - bw + 30.0, cy, 12.5, SEMIBOLD, paint::accent_text(), lw + 2.0);
         }
         return;
     }
@@ -2803,14 +3683,8 @@ fn track_leave(hwnd: HWND) {
     }
 }
 
-fn run_blocking(hwnd: HWND, b: Blocking) {
+fn run_blocking(_hwnd: HWND, b: Blocking) {
     match b {
-        Blocking::Menu(menu) => {
-            use tray_icon::menu::ContextMenu;
-            unsafe {
-                menu.show_context_menu_for_hwnd(hwnd.0 as isize, None);
-            }
-        }
         Blocking::PickFolder => {
             if let Some(dir) = shell::pick_folder() {
                 with(|m| {
@@ -2860,10 +3734,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         WM_ACTIVATE => unsafe {
             let _ = DwmExtendFrameIntoClientArea(hwnd, &MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 });
+            if (wparam.0 & 0xffff) == 0 {
+                with(|m| {
+                    m.close_menu();
+                    m.hide_tip();
+                });
+            }
             if (wparam.0 & 0xffff) != 0 {
                 // files may have been moved or deleted while we were away
                 with(|m| {
                     m.missing.clear();
+                    m.file_icons.retain(|p, _| p.exists());
                     m.on_snapshot(true);
                 });
             }
@@ -2895,7 +3776,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let h = m.hit(x as f32 / m.k, y as f32 / m.k);
                 let cursor = match &h {
                     Hit::Search | Hit::Field => IDC_IBEAM,
-                    Hit::None | Hit::Caption | Hit::Row(_) | Hit::Sheet | Hit::Backdrop | Hit::Dock => IDC_ARROW,
+                    Hit::None | Hit::Caption | Hit::Row(_) | Hit::Sheet | Hit::Backdrop | Hit::Dock | Hit::Menu(_) | Hit::MenuOff => IDC_ARROW,
                     Hit::Page(settings_page::Hit::None) => IDC_ARROW,
                     _ => IDC_HAND,
                 };
@@ -2984,6 +3865,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             with(|m| {
                 m.tracking = false;
                 m.set_hover(Hit::None);
+                m.hide_tip();
             });
             return LRESULT(0);
         }
@@ -2998,18 +3880,20 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             with(|m| m.page.press(None));
         }
         WM_RBUTTONUP => {
-            blocking = with(|m| {
-                let h = m.hit(x as f32 / m.k, y as f32 / m.k);
-                match h {
-                    Hit::Row(id) | Hit::RowBtn(id, _) => {
-                        m.selected = Some(id);
-                        let _ = m.sync_rows();
-                        m.row_menu(id).map(Blocking::Menu)
+            with(|m| {
+                m.close_menu();
+                let (fx, fy) = (x as f32 / m.k, y as f32 / m.k);
+                if let Hit::Row(id) | Hit::RowBtn(id, _) = m.hit(fx, fy) {
+                    // a row outside the selection becomes the selection
+                    if !m.picked.contains(&id) {
+                        m.select_only(id);
+                        m.on_selection();
                     }
-                    _ => None,
+                    m.selected = Some(id);
+                    m.open_menu(fx, fy);
                 }
-            })
-            .flatten();
+            });
+            return LRESULT(0);
         }
         WM_MOUSEWHEEL => {
             let delta = (wparam.0 >> 16) as u16 as i16 as f32;
@@ -3017,6 +3901,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if m.sheet.is_some() {
                     return;
                 }
+                m.close_menu();
+                m.hide_tip();
                 if m.view == Page::Settings {
                     m.page.scroll_by(-delta / 120.0 * 90.0);
                 } else {
@@ -3038,6 +3924,30 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     with(|m| m.on_char(c));
                 }
             }
+            return LRESULT(0);
+        }
+        WM_SETTINGCHANGE => {
+            let what = if lparam.0 != 0 { unsafe { PCWSTR(lparam.0 as *const u16).to_string().unwrap_or_default() } } else { String::new() };
+            if what == "ImmersiveColorSet" {
+                with(|m| m.apply_theme());
+            }
+        }
+        WM_APP_THUMBS => {
+            with(|m| m.on_thumbs());
+            return LRESULT(0);
+        }
+        WM_TIMER if wparam.0 == T_VIEW => {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), T_VIEW);
+            }
+            with(|m| m.view_later());
+            return LRESULT(0);
+        }
+        WM_TIMER if wparam.0 == T_TIP => {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), T_TIP);
+            }
+            with(|m| m.show_tip());
             return LRESULT(0);
         }
         WM_TIMER if wparam.0 == T_TOAST || wparam.0 == T_DOCK => unsafe {
