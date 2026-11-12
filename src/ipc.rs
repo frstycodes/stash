@@ -73,6 +73,10 @@ pub fn decode(s: &str) -> Request {
 
 /// What a launch with these arguments asks for.
 pub fn from_args(args: &[String]) -> Request {
+    // the jump list's New Download
+    if args.iter().any(|a| a == "--new-download") {
+        return Request::Open(Vec::new());
+    }
     let links: Vec<String> = args.iter().filter(|a| !a.starts_with("--")).cloned().collect();
     if links.is_empty() { Request::Show } else { Request::Open(links) }
 }

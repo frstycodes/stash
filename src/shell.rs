@@ -421,7 +421,10 @@ pub fn already_running() -> bool {
     unsafe {
         // a test copy (STASH_DATA) runs beside the real one
         let name = if std::env::var_os("STASH_DATA").is_some() { w!("Local\\StashDownloadsStackTest") } else { w!("Local\\StashDownloadsStack") };
-        let handle = CreateMutexW(None, true, name);
+        // STASH_INSTANCE=<tag> (with STASH_DATA) runs one more test copy beside the others
+        let tagged = std::env::var("STASH_INSTANCE").ok().filter(|_| std::env::var_os("STASH_DATA").is_some());
+        let tagged = tagged.map(|t| windows::core::HSTRING::from(format!("Local\\StashDownloadsStackTest-{t}")));
+        let handle = CreateMutexW(None, true, tagged.as_ref().map_or(name, |t| PCWSTR(t.as_ptr())));
         let exists = GetLastError() == ERROR_ALREADY_EXISTS;
         match handle {
             // not ours: let it go, so asking again (after the other copy exits) can succeed
@@ -510,6 +513,7 @@ pub fn clipboard_text() -> Option<String> {
 }
 
 pub fn set_clipboard_text(text: &str) {
+    crate::clipwatch::note_own(text);
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
     use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};

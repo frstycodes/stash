@@ -483,6 +483,35 @@ impl SettingsPage {
             foot: None,
         });
 
+        // notifications and shortcuts (feat-system)
+        let hk = crate::hotkey::CHOICES.iter().position(|c| c.eq_ignore_ascii_case(s.hotkey.trim()));
+        let hk = if s.hotkey.trim().is_empty() { Some(0) } else { hk.map(|i| i + 1) };
+        sections.push(Section {
+            title: "Notifications & shortcuts",
+            keys: "notifications shortcuts system",
+            rows: vec![
+                Row::new(
+                    "Notify when downloads finish",
+                    Some("A Windows notification with Open and Show in Folder. Quiet while you game or present."),
+                    "notification toast alert finished done failed focus assist",
+                    Ctl::Switch { id: "notify", on: s.notify, enabled: true },
+                ),
+                Row::new("Open the stack from anywhere", Some("Arrows move, Enter opens, Esc closes."), "hotkey shortcut keyboard global key", Ctl::Seg {
+                    id: "hotkey",
+                    opts: std::iter::once("Off".to_string()).chain(crate::hotkey::CHOICES.iter().map(|c| c.to_string())).collect(),
+                    sel: hk,
+                    custom: None,
+                }),
+                Row::new(
+                    "Offer to download copied links",
+                    Some("When you copy a link to a file, Stash offers to download it."),
+                    "clipboard copy link watch monitor paste url",
+                    Ctl::Switch { id: "clipwatch", on: s.watch_clipboard, enabled: true },
+                ),
+            ],
+            foot: None,
+        });
+
         // stack
         let sort = [Sort::Added, Sort::Modified, Sort::Name, Sort::Kind].iter().position(|z| *z == s.sort);
         let counts = [5usize, 8, 10, 12];
@@ -495,6 +524,12 @@ impl SettingsPage {
                     id: "display",
                     opts: vec!["Stack".into(), "Folder".into()],
                     sel: Some(usize::from(s.display == Display::Folder)),
+                    custom: None,
+                }),
+                Row::new("Open as", Some("Files arc up from the stack, or open in a grid."), "view fan grid layout", Ctl::Seg {
+                    id: "view",
+                    opts: vec!["Fan".into(), "Grid".into()],
+                    sel: Some(usize::from(s.view == crate::settings::View::Grid)),
                     custom: None,
                 }),
                 Row::new("Sort by", Some("Which files are on top."), "order date name kind", Ctl::Seg {
@@ -933,6 +968,8 @@ impl SettingsPage {
                     "sort" => cmd(format!("sort:{}", ["added", "modified", "name", "kind"][*i])),
                     "count" => cmd(format!("limit:{}", val?)),
                     "size" => cmd(format!("size:{}", ["small", "medium", "large", "extra-large"][*i])),
+                    "view" => cmd(if *i == 0 { "view:fan".into() } else { "view:grid".into() }),
+                    "hotkey" => cmd(if *i == 0 { "hotkey:off".into() } else { format!("hotkey:{}", crate::hotkey::CHOICES[(*i - 1).min(2)]) }),
                     _ => None,
                 }
             }
@@ -955,6 +992,8 @@ impl SettingsPage {
                 "show-stack" => cmd("show-stack:flip".into()),
                 "arrivals" => cmd("arrivals:flip".into()),
                 "autoupdate" => cmd("update:auto".into()),
+                "notify" => cmd("notify:flip".into()),
+                "clipwatch" => cmd("clipwatch:flip".into()),
                 _ => None,
             },
             Hit::Button(id) => cmd(id.clone()),

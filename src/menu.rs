@@ -174,6 +174,11 @@ pub fn apply_setting(id: &str, s: &mut Settings) -> bool {
         ("size", "large") => s.icon_size = IconSize::Large,
         ("size", "extra-large") => s.icon_size = IconSize::ExtraLarge,
         ("limit", n) => s.limit = n.parse().unwrap_or(10),
+        ("view", "fan") => s.view = crate::settings::View::Fan,
+        ("view", "grid") => s.view = crate::settings::View::Grid,
+        ("notify", _) => s.notify = !s.notify,
+        ("clipwatch", _) => s.watch_clipboard = !s.watch_clipboard,
+        ("hotkey", v) => s.hotkey = if v == "off" { String::new() } else { v.to_string() },
         _ => return false,
     }
     true

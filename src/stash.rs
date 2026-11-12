@@ -40,6 +40,9 @@ use crate::settings::{self, Corner, Display, Settings};
 use crate::shell;
 use crate::thumbs::{self, Job};
 
+mod extras;
+mod grid;
+
 // ---------- geometry (logical pixels; multiplied by the DPI scale `k`) ----------
 
 const TILE: f32 = 88.0;
@@ -354,6 +357,10 @@ pub struct Stash {
     dl_fill: SpriteVisual,
     dl_text: String,
     dl_shown: bool,
+
+    // feat-system
+    kb: bool,                                  // opened by the shortcut, keys come to us
+    grid_panel: Option<(f32, f32, f32, f32)>, // the grid's panel, fan-window pixels
 }
 
 thread_local! {
@@ -571,6 +578,8 @@ impl Stash {
             dl_fill,
             dl_text: String::new(),
             dl_shown: false,
+            kb: false,
+            grid_panel: None,
         };
         APP.with(|a| *a.borrow_mut() = Some(state));
         // The download engine: its own thread; it pokes us when there's news.
@@ -587,6 +596,7 @@ impl Stash {
             s.prefetch();
             s.ready = true;
             s.on_downloads();
+            crate::system::start(s.tile, &s.settings);
             // Settings > General: open the window when Stash starts (not when a browser
             // extension or an update starts it in the background)
             let quiet = std::env::args().any(|a| a == "--background" || a == "--updated");
@@ -1029,6 +1039,7 @@ impl Stash {
             let _ = self.update_job_rows();
         }
         let _ = self.update_dl_overlay(&snap);
+        crate::system::on_snapshot(&snap, &self.settings, &self.downloads);
         if elsewhere {
             let _ = self.bounce();
         }
@@ -1040,6 +1051,10 @@ impl Stash {
     /// back under the windows, unless you've opened it meanwhile.
     fn announce(&mut self, j: &JobView) {
         if self.demo.is_some() || !self.settings.show_stack || !self.settings.show_arrivals {
+            return;
+        }
+        // never pop up over a game, a video or a presentation
+        if crate::toast::fullscreen() {
             return;
         }
         let covered = !self.topmost && !self.open && shell::covered(self.tile);
@@ -1149,6 +1164,9 @@ impl Stash {
 
     /// Refresh the fan's download rows in place: label text and progress.
     fn update_job_rows(&mut self) -> Result<()> {
+        if self.grid() {
+            return self.update_grid_jobs();
+        }
         let k = self.k;
         let right = self.right();
         let icon = ICON * self.ik;
@@ -1314,6 +1332,10 @@ impl Stash {
         self.fan_layer.Children()?.RemoveAll()?;
         self.rows.clear();
         self.hover_row = None;
+        self.grid_panel = None;
+        if self.grid() {
+            return self.build_grid();
+        }
 
         let right = self.right();
         let (ox, oy) = self.fan_origin();
@@ -1547,6 +1569,12 @@ impl Stash {
         let tile_left = if self.right() { w - t } else { 0.0 };
         unsafe {
             let region = CreateRectRgn(tile_left as i32, (h - t) as i32, (tile_left + t) as i32, h as i32);
+            if let Some((l, t, r, b)) = self.grid_panel {
+                let m = 36.0 * self.k; // room for its shadow
+                let p = CreateRectRgn((l - m) as i32, (t - m) as i32, (r + m) as i32, (b + m) as i32);
+                CombineRgn(Some(region), Some(region), Some(p), RGN_OR);
+                let _ = DeleteObject(HGDIOBJ(p.0));
+            }
             let current = self.rows.iter().map(|row| row.corners(pad));
             let leaving = self.fan_outgoing.iter().flat_map(|(_, corners, _)| corners.iter().copied());
             for corners in current.chain(leaving) {
@@ -1747,7 +1775,7 @@ impl Stash {
     /// The pile is hidden while open: its items are out in the fan. (The folder
     /// icon has no counterpart in the fan, so it stays.)
     fn show_pile(&self, visible: bool) {
-        let hide = !visible && self.settings.display == Display::Stack;
+        let hide = !visible && self.settings.display == Display::Stack && !self.grid();
         let _ = self.stack.StopAnimation(&HSTRING::from("Opacity"));
         let _ = self.stack.SetOpacity(if hide { 0.0 } else { 1.0 });
         // the progress bar stays with the download; only the speed steps aside while open
@@ -1783,6 +1811,9 @@ impl Stash {
             return true;
         }
         let f = shell::window_rect(self.fan);
+        if self.open && self.over_grid_panel((c.x - f.left) as f32, (c.y - f.top) as f32) {
+            return true;
+        }
         self.row_at((c.x - f.left) as f32, (c.y - f.top) as f32, HIT_PAD * self.k).is_some()
     }
 
@@ -1969,7 +2000,7 @@ impl Stash {
                         let _ = SetTimer(Some(self.tile), T_HOVER, HOVER_OPEN_MS, None);
                     }
                 }
-                if self.open {
+                if self.open && !self.grid() {
                     self.set_hover_row(Some(0));
                 }
             }
@@ -2177,6 +2208,7 @@ impl Stash {
                         } else if self.settings.corner != before.corner {
                             self.layout();
                         }
+                        crate::system::apply(self.tile, &before, &self.settings);
                         self.reload(true);
                         self.prefetch(); // sort, count or size changed
                         self.apply_stack_visible();
@@ -2764,6 +2796,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
             }
             return LRESULT(0);
+        }
+        WM_HOTKEY if is_tile && wparam.0 as i32 == crate::hotkey::ID => {
+            with(|s| s.on_hotkey());
+            None
+        }
+        extras::WM_APP_KEY if is_tile => {
+            with(|s| s.on_key(wparam.0 as u16));
+            None
+        }
+        WM_CLIPBOARDUPDATE if is_tile => {
+            with(|s| s.on_clipboard());
+            None
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_DPICHANGED if is_tile => {
             with(|s| s.relayout_if_needed());

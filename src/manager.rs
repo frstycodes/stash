@@ -577,6 +577,12 @@ pub fn set_settings(s: &Settings) {
     });
 }
 
+/// The downloads window, once it exists (for its taskbar button).
+pub fn hwnd() -> Option<HWND> {
+    let h = MGR_HWND.load(std::sync::atomic::Ordering::Relaxed);
+    (h != 0).then_some(HWND(h as *mut _))
+}
+
 /// Where new downloads go: the Downloads folder in the stack (which can be moved).
 pub fn default_dir(s: &Settings) -> PathBuf {
     s.downloads.folder.clone().filter(|f| f.is_dir()).unwrap_or_else(shell::downloads_dir)
@@ -3782,6 +3788,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     let x = (lparam.0 & 0xffff) as i16 as i32;
     let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
     let mut blocking = None;
+    if let Some(r) = crate::taskbar::on_message(hwnd, msg, wparam, lparam) {
+        return r;
+    }
     match msg {
         WM_NCCALCSIZE if wparam.0 != 0 => {
             unsafe {
