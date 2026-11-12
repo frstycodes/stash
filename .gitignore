@@ -1,3 +1,6 @@
 /target
 /dist
 /browser/dist
+
+# Claude Code session working copies (each is a git worktree of its own)
+/.claude/worktrees/

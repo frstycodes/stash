@@ -145,16 +145,33 @@ The script sets the version in `Cargo.toml`, commits, tags `v0.3.0` and pushes. 
 
 ### Store publishing
 
-The Store step needs four repository secrets from Partner Center. Until they exist, the workflow skips the Store step and still publishes the GitHub release.
+Each release submits the x64 + Arm64 bundle (`Stash-<version>.msixbundle`) to the Microsoft Store as a new submission, which goes live once Microsoft certifies it (usually within a few days). The step needs four repository secrets from Partner Center. Until all four exist, the workflow skips it and still publishes the GitHub release.
+
+One-time setup:
+
+1. **First submission, by hand.** The workflow can only update an app that already has a submission. In [Partner Center](https://partner.microsoft.com/dashboard/apps-and-games/overview), open the app (reserved as "Stash: Downloads stack"), select **Start your submission**, and fill it in from [packaging/store/listing.md](packaging/store/listing.md):
+   - pricing and availability
+   - properties: category, the privacy policy URL, and the runFullTrust note under Notes for certification
+   - age ratings
+   - the Store listing text and screenshots
+
+   Under **Packages**, upload `Stash-<version>.msixbundle` from the latest GitHub release, then submit.
+2. **An Entra application for the workflow.** In Partner Center, go to **Account settings > User management > Microsoft Entra applications**:
+   1. Select **Create Microsoft Entra application** (or **Add Microsoft Entra application** to use an existing one).
+   2. Give it the **Manager** role.
+   3. Open it and select **Add new key**. The key is shown once, so copy it.
+3. **Repository secrets.** Add each with `gh secret set <NAME>` (it asks for the value without echoing it):
 
 | Secret | Where to find it |
 | --- | --- |
-| `STORE_SELLER_ID` | Partner Center, Account settings, Legal info (Seller ID) |
-| `STORE_TENANT_ID` | Partner Center, Account settings, User management, Microsoft Entra applications |
-| `STORE_CLIENT_ID` | Same page, after you create an Entra application with the Manager role |
-| `STORE_CLIENT_SECRET` | Same application, under Keys (a new key) |
+| `STORE_SELLER_ID` | Partner Center, Account settings, Legal info (Seller ID). Already set. |
+| `STORE_TENANT_ID` | The application's page from step 2: Tenant ID |
+| `STORE_CLIENT_ID` | The same page: Client ID |
+| `STORE_CLIENT_SECRET` | The key from step 2 |
 
-Add each one with `gh secret set <NAME>`, which asks for the value without echoing it.
+After that, every pushed version tag also submits to the Store. A submission still in certification blocks a new one, so let it finish (or cancel it in Partner Center) before tagging the next release.
+
+The Store version updates through the Store, so its built-in updater is off. It can't register the browser extensions' connection (a packaged app's registry writes stay private to it), so the extensions only hand downloads to the GitHub version.
 
 The Store app's identity lives in [packaging/identity.json](packaging/identity.json), and `packaging/build-msix.ps1` builds the package.
 
