@@ -116,11 +116,14 @@ pub struct DlSettings {
     /// Retries, download hours, proxy, sorting, what to do when done.
     #[serde(default)]
     pub engine: crate::dl::Prefs,
+    /// Torrent settings: upload limit, seed limits, UPnP, choosing files.
+    #[serde(default)]
+    pub torrents: crate::dl::TorrentOptions,
 }
 
 impl Default for DlSettings {
     fn default() -> Self {
-        Self { max_active: 3, connections: 8, limit_kbps: 0, seed: false, folder: None, window: None, bits: false, binary: false, engine: crate::dl::Prefs::default() }
+        Self { max_active: 3, connections: 8, limit_kbps: 0, seed: false, folder: None, window: None, bits: false, binary: false, engine: crate::dl::Prefs::default(), torrents: Default::default() }
     }
 }
 
