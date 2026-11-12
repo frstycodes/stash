@@ -254,6 +254,8 @@ fn ms(v: i64) -> TimeSpan {
     TimeSpan { Duration: v * 10_000 }
 }
 
+mod engine_rows;
+
 impl SettingsPage {
     pub fn new(gfx: &Gfx) -> Result<Self> {
         let c = &gfx.compositor;
@@ -448,6 +450,8 @@ impl SettingsPage {
             ],
             foot: None,
         });
+
+        sections.push(self.engine_section(v));
 
         // units
         sections.push(Section {
@@ -933,6 +937,7 @@ impl SettingsPage {
                     "sort" => cmd(format!("sort:{}", ["added", "modified", "name", "kind"][*i])),
                     "count" => cmd(format!("limit:{}", val?)),
                     "size" => cmd(format!("size:{}", ["small", "medium", "large", "extra-large"][*i])),
+                    id if id.starts_with("dle-") => cmd(format!("dle:seg:{}:{i}", &id[4..])),
                     _ => None,
                 }
             }
@@ -955,6 +960,7 @@ impl SettingsPage {
                 "show-stack" => cmd("show-stack:flip".into()),
                 "arrivals" => cmd("arrivals:flip".into()),
                 "autoupdate" => cmd("update:auto".into()),
+                id if id.starts_with("dle-") => cmd(format!("dle:flip:{}", &id[4..])),
                 _ => None,
             },
             Hit::Button(id) => cmd(id.clone()),
