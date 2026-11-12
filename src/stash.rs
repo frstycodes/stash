@@ -587,6 +587,12 @@ impl Stash {
             s.prefetch();
             s.ready = true;
             s.on_downloads();
+            // Settings > General: open the window when Stash starts (not when a browser
+            // extension or an update starts it in the background)
+            let quiet = std::env::args().any(|a| a == "--background" || a == "--updated");
+            if s.settings.start_window && !quiet && std::env::var_os("STASH_VIEW").is_none() {
+                s.show_downloads(None);
+            }
             // STASH_ANNOUNCE (with STASH_DATA): play a new download's arrival after 2.5 s
             if std::env::var_os("STASH_ANNOUNCE").is_some() && std::env::var_os("STASH_DATA").is_some() {
                 unsafe {
@@ -657,6 +663,7 @@ impl Stash {
         shell::place(self.tile, None, tx, wa.bottom - m - t, t, t, true);
         // the fan sits directly beneath the tile, so items emerge from behind it
         shell::place(self.fan, Some(self.tile), fx, wa.bottom - m - fh, fw, fh, false);
+        self.apply_stack_visible();
         // the falling icon's window: centered over the tile, reaching up above it
         let (dw, dh) = ((t as f32 * 2.2).round() as i32, t + (DROP_HEIGHT * k).round() as i32);
         self.drop_size = (dw as f32, dh as f32);
@@ -1032,7 +1039,7 @@ impl Stash {
     /// the stack takes it with a squash and a flash of its glow. After a moment it goes
     /// back under the windows, unless you've opened it meanwhile.
     fn announce(&mut self, j: &JobView) {
-        if self.demo.is_some() {
+        if self.demo.is_some() || !self.settings.show_stack || !self.settings.show_arrivals {
             return;
         }
         let covered = !self.topmost && !self.open && shell::covered(self.tile);
@@ -2098,6 +2105,7 @@ impl Stash {
                 ids::NEW_DOWNLOAD => self.show_downloads(Some(Vec::new())),
                 ids::ADD_FOLDER => blocking = Some(Blocking::PickFolder),
                 ids::REMOVE_FOLDER => self.remove_folder(),
+                TRAY_CLICK if self.settings.tray_opens_window || !self.settings.show_stack => self.show_downloads(None),
                 TRAY_CLICK => self.toggle_from_tray(),
                 ids::OPEN_FOLDER => self.activate(None),
                 "update:apply" => {
@@ -2171,6 +2179,7 @@ impl Stash {
                         }
                         self.reload(true);
                         self.prefetch(); // sort, count or size changed
+                        self.apply_stack_visible();
                         manager::set_settings(&self.settings);
                     }
                 }
@@ -2182,6 +2191,25 @@ impl Stash {
     /// Leave at once, once everything is saved: the tray icon goes, and the process ends
     /// without tearing down the engine's threads, the compositor and the windows one by
     /// one (that teardown could hang, and crash, which kept the exe locked for an update).
+    /// The stack is there, or not (Settings > General).
+    fn apply_stack_visible(&mut self) {
+        if self.settings.show_stack {
+            if unsafe { !IsWindowVisible(self.tile).as_bool() } {
+                unsafe {
+                    let _ = ShowWindow(self.tile, SW_SHOWNOACTIVATE);
+                }
+                self.restack();
+            }
+        } else {
+            self.close();
+            unsafe {
+                let _ = ShowWindow(self.tile, SW_HIDE);
+                let _ = ShowWindow(self.fan, SW_HIDE);
+                let _ = ShowWindow(self.drop, SW_HIDE);
+            }
+        }
+    }
+
     fn exit_now(&mut self) {
         self.tray = None; // removes the icon from the tray
         log("exit");

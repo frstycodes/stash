@@ -13,10 +13,7 @@ const SEP_H: f32 = 9.0;
 const PRIO_H: f32 = 38.0;
 pub const RADIUS: f32 = 14.0;
 const ITEM_R: f32 = RADIUS - PAD; // concentric with the card
-const SEG_W: f32 = 58.0;
-const SEG_H: f32 = 26.0;
-const SEG_PAD: f32 = 2.0;
-const SEG_R: f32 = ITEM_R + 1.0;
+const SEG_W: f32 = 58.0; // each priority option
 const ICON_W: f32 = 26.0; // the icon column before each label
 const TEXT_X: f32 = PAD + 12.0 + ICON_W;
 
@@ -46,7 +43,7 @@ const PRIOS: [(Priority, &str); 3] = [(Priority::Low, "Low"), (Priority::Normal,
 impl Menu {
     /// `measure(text, size, weight)` gives a text's width, to size the card.
     pub fn new(items: Vec<Item>, measure: impl Fn(&str, f32, DWRITE_FONT_WEIGHT) -> f32) -> Self {
-        let mut w: f32 = 3.0 * SEG_W + 2.0 * SEG_PAD + 70.0 + 2.0 * PAD + ICON_W;
+        let mut w: f32 = 3.0 * SEG_W + 2.0 * crate::ui::SEG_PAD + 70.0 + 2.0 * PAD + ICON_W;
         let mut h = 2.0 * PAD;
         for it in &items {
             h += match it {
@@ -76,10 +73,13 @@ impl Menu {
         })
     }
 
-    fn seg_x(&self, n: usize) -> f32 {
-        // the control's right edge lines up with the shortcuts' column
-        self.w - PAD - 12.0 + 2.0 - SEG_PAD - (3 - n) as f32 * SEG_W
+    /// The priority control (the app's segmented control), its right edge on the shortcuts' column.
+    fn prio_seg(&self, cy: f32) -> (crate::settings_page::Rect, Vec<crate::settings_page::Rect>) {
+        let widths = [SEG_W; 3];
+        let total = 3.0 * SEG_W + 2.0 * crate::ui::SEG_PAD + 4.0;
+        crate::ui::seg_layout(self.w - PAD - 10.0 - total, cy, &widths)
     }
+
 
     pub fn hit(&self, x: f32, y: f32) -> Option<MHit> {
         if !(0.0..self.w).contains(&x) || !(0.0..self.h).contains(&y) {
@@ -93,11 +93,8 @@ impl Menu {
                 Item::Action { enabled: true, .. } => MHit::Item(i),
                 Item::Priority(_) => {
                     let cy = top + h / 2.0;
-                    PRIOS
-                        .iter()
-                        .enumerate()
-                        .find(|(n, _)| (self.seg_x(*n)..self.seg_x(*n) + SEG_W).contains(&x) && (y - cy).abs() <= SEG_H / 2.0)
-                        .map_or(MHit::Card, |(_, (p, _))| MHit::Prio(*p))
+                    let (_, parts) = self.prio_seg(cy);
+                    parts.iter().zip(PRIOS).find(|(r, _)| r.contains(x, y)).map_or(MHit::Card, |(_, (p, _))| MHit::Prio(p))
                 }
                 _ => MHit::Card,
             });
@@ -148,19 +145,11 @@ impl Menu {
                 Item::Priority(current) => {
                     let cy = top + rh / 2.0;
                     p.text_mid("Priority", TEXT_X, cy, 13.0, REGULAR, paint::text(), 80.0);
-                    let x0 = self.seg_x(0) - SEG_PAD;
-                    p.round(x0, cy - SEG_H / 2.0, 3.0 * SEG_W + 2.0 * SEG_PAD, SEG_H, SEG_R, paint::well(0.22));
-                    for (n, (pr, name)) in PRIOS.iter().enumerate() {
-                        let x = self.seg_x(n);
-                        let on = *current == Some(*pr);
-                        if on {
-                            p.round(x, cy - SEG_H / 2.0 + SEG_PAD, SEG_W, SEG_H - 2.0 * SEG_PAD, SEG_R - SEG_PAD, paint::ink(0.14));
-                        } else if hover == Some(MHit::Prio(*pr)) {
-                            p.round(x, cy - SEG_H / 2.0 + SEG_PAD, SEG_W, SEG_H - 2.0 * SEG_PAD, SEG_R - SEG_PAD, paint::ink(0.05));
-                        }
-                        let lw = p.measure(name, 12.0, MEDIUM);
-                        p.text_mid(name, x + (SEG_W - lw) / 2.0, cy, 12.0, MEDIUM, if on { paint::text() } else { paint::dim() }, SEG_W);
-                    }
+                    let (rect, parts) = self.prio_seg(cy);
+                    let sel = PRIOS.iter().position(|(pr, _)| *current == Some(*pr));
+                    let hot = PRIOS.iter().position(|(pr, _)| hover == Some(MHit::Prio(*pr)));
+                    let names: Vec<&str> = PRIOS.iter().map(|(_, n)| *n).collect();
+                    crate::ui::paint_seg(p, rect, &parts, &names, sel, hot, true);
                 }
             }
         }

@@ -72,6 +72,16 @@ impl IconSize {
 #[serde(default)]
 pub struct Settings {
     pub theme: Theme,
+    /// Clicking the tray icon opens the downloads window (instead of fanning the stack).
+    pub tray_opens_window: bool,
+    /// Starting Stash (at sign-in, or from the Start menu) opens the window.
+    pub start_window: bool,
+    /// Closing the window quits Stash (instead of leaving it in the tray).
+    pub close_quits: bool,
+    /// The stack in the corner of the desktop.
+    pub show_stack: bool,
+    /// A new download comes up over the windows and drops into the stack.
+    pub show_arrivals: bool,
     pub corner: Corner,
     pub sort: Sort,
     pub display: Display,
@@ -121,6 +131,11 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: Theme::System,
+            tray_opens_window: false,
+            start_window: false,
+            close_quits: false,
+            show_stack: true,
+            show_arrivals: true,
             corner: Corner::BottomRight,
             sort: Sort::Added,
             display: Display::Stack,

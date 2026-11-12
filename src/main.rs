@@ -17,6 +17,7 @@ mod settings_page;
 mod shell;
 mod stash;
 mod thumbs;
+mod ui;
 mod update;
 
 use windows::Win32::System::Ole::OleInitialize;

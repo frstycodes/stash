@@ -153,6 +153,11 @@ pub fn item_menu() -> Menu {
 pub fn apply_setting(id: &str, s: &mut Settings) -> bool {
     let Some((key, value)) = id.split_once(':') else { return false };
     match (key, value) {
+        ("tray", v) => s.tray_opens_window = v == "window",
+        ("start", v) => s.start_window = v == "window",
+        ("close", v) => s.close_quits = v == "quit",
+        ("show-stack", _) => s.show_stack = !s.show_stack,
+        ("arrivals", _) => s.show_arrivals = !s.show_arrivals,
         ("theme", "system") => s.theme = Theme::System,
         ("theme", "light") => s.theme = Theme::Light,
         ("theme", "dark") => s.theme = Theme::Dark,

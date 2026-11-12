@@ -356,6 +356,10 @@ pub fn start_at_login() -> bool {
 }
 
 pub fn set_start_at_login(enabled: bool) {
+    // a test copy (STASH_DATA) never points your sign-in at itself
+    if std::env::var_os("STASH_DATA").is_some() {
+        return;
+    }
     if is_packaged() {
         // If the user turned it off in Task Manager, only they can turn it back on there.
         if let Some(task) = startup_task() {

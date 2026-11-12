@@ -20,11 +20,12 @@ use crate::shell;
 const PAD: f32 = 24.0;
 const ROW_H: f32 = 64.0;
 const CARD_R: f32 = 30.0;
-const SEG_H: f32 = 34.0;
+const SEG_H: f32 = crate::ui::SEG_H;
 // Concentric radii: a nested shape's radius is its container's minus the padding between.
-const SEG_PAD: f32 = 3.0;
-const SEG_R: f32 = 13.0;
-const SEG_IN_R: f32 = SEG_R - SEG_PAD;
+const SEG_PAD: f32 = crate::ui::SEG_PAD;
+const SEG_R: f32 = crate::ui::SEG_R;
+#[allow(dead_code)]
+const SEG_IN_R: f32 = crate::ui::SEG_IN_R;
 const SW_W: f32 = 40.0;
 const SW_H: f32 = 22.0;
 const SW_PAD: f32 = 2.0;
@@ -344,6 +345,36 @@ impl SettingsPage {
         };
         let mut sections = Vec::new();
 
+        // general: how Stash starts, opens and closes
+        sections.push(Section {
+            title: "General",
+            keys: "general app behaviour behavior",
+            rows: vec![
+                Row::new("Clicking the tray icon", Some("Fans out the stack, or opens this window."), "tray icon click open notification area taskbar", Ctl::Seg {
+                    id: "tray",
+                    opts: vec!["Shows the stack".into(), "Opens Stash".into()],
+                    sel: Some(usize::from(s.tray_opens_window)),
+                    custom: None,
+                }),
+                Row::new("When Stash starts", Some("Waits quietly in the tray, or opens this window."), "start startup launch open minimized tray background window", Ctl::Seg {
+                    id: "start",
+                    opts: vec!["Stay in the tray".into(), "Open the window".into()],
+                    sel: Some(usize::from(s.start_window)),
+                    custom: None,
+                }),
+                Row::new("Closing the window", Some("Stash keeps downloading from the tray, or quits."), "close exit quit tray minimize background x", Ctl::Seg {
+                    id: "close",
+                    opts: vec!["Keep running".into(), "Quit Stash".into()],
+                    sel: Some(usize::from(s.close_quits)),
+                    custom: None,
+                }),
+                Row::new("Show the stack on the desktop", Some("The pile of recent files in the corner of your screen."), "stack desktop corner pile hide show tile", Ctl::Switch { id: "show-stack", on: s.show_stack, enabled: true }),
+                Row::new("Show new downloads arriving", Some("The stack comes up over your windows and catches the file."), "animation arrive drop new download stack popup raise", Ctl::Switch { id: "arrivals", on: s.show_arrivals, enabled: s.show_stack }),
+                Row::new("Start when you sign in", None, "startup login boot launch autostart windows", Ctl::Switch { id: "login", on: v.login, enabled: true }),
+            ],
+            foot: None,
+        });
+
         // appearance
         let theme = [Theme::System, Theme::Light, Theme::Dark].iter().position(|t| *t == s.theme);
         sections.push(Section {
@@ -485,7 +516,6 @@ impl SettingsPage {
                     custom: None,
                 }),
                 Row::new("Icon size", None, "big small large scale", Ctl::Seg { id: "size", opts: vec!["S".into(), "M".into(), "L".into(), "XL".into()], sel: size, custom: None }),
-                Row::new("Start when you sign in", None, "startup login boot launch autostart windows", Ctl::Switch { id: "login", on: v.login, enabled: true }),
             ],
             foot: None,
         });
@@ -592,7 +622,7 @@ impl SettingsPage {
                         self.ops.push(Op::Folder { name: name.clone(), path: path.clone(), downloads: *downloads, y: ry });
                     }
                     Kind::AddFolder => {
-                        self.buttons.push(Button { id: "add-folder".into(), label: "Add Folder…".into(), icon: Some(icons::ADD), primary: false, rect: Rect::new(PAD + 16.0, ry + 12.0, 128.0, 32.0) });
+                        self.buttons.push(Button { id: "add-folder".into(), label: "Add Folder…".into(), icon: Some(icons::ADD), primary: false, rect: Rect::new(PAD + 16.0, ry + 12.0, 128.0, crate::ui::BUTTON_H_SMALL) });
                         self.ops.push(Op::Text { title: String::new(), desc: Some("Scroll over the stack to switch between folders.".into()), y: ry + 16.0 });
                     }
                     Kind::About { status } => self.ops.push(Op::About { y: ry, status: status.clone() }),
@@ -605,9 +635,14 @@ impl SettingsPage {
                     }
                     Ctl::Buttons(list) => {
                         let mut x = right;
-                        for (id, label, icon, w, primary) in list {
+                        let dw = self.gfx.dwrite.clone();
+                        let k = self.k;
+                        for (id, label, icon, _, primary) in list {
+                            // the app's small button: as wide as its label, a circle if it's only an icon
+                            let bh = crate::ui::BUTTON_H_SMALL;
+                            let w = if label.is_empty() { bh } else { crate::ui::button_w(|t| paint::advance(&dw, t, 13.5 * k) / k, label, icon.is_some()) };
                             x -= w;
-                            self.buttons.push(Button { id: id.clone(), label: label.clone(), icon: *icon, primary: *primary, rect: Rect::new(x, cy - 16.0, *w, 32.0) });
+                            self.buttons.push(Button { id: id.clone(), label: label.clone(), icon: *icon, primary: *primary, rect: Rect::new(x, cy - bh / 2.0, w, bh) });
                             x -= 8.0;
                         }
                     }
@@ -723,30 +758,11 @@ impl SettingsPage {
             for sw in &self.switches {
                 paint_switch_track(&p, sw.rect, sw.enabled);
             }
-            // buttons: ghost squircles, a fill on hover
+            // buttons: the app's buttons (Primary or Secondary)
             for b in &self.buttons {
                 let hot = hover == Hit::Button(b.id.clone());
-                let r = b.rect;
-                if b.primary {
-                    p.round(r.x, r.y, r.w, r.h, r.h / 2.0, if hot { paint::accent_hot() } else { paint::accent() });
-                    let lw = p.measure(&b.label, 13.0, SEMIBOLD);
-                    p.text_mid(&b.label, r.x + (r.w - lw) / 2.0, r.y + r.h / 2.0, 13.0, SEMIBOLD, paint::color(255, 255, 255, 1.0), r.w);
-                    continue;
-                }
-                p.round(r.x, r.y, r.w, r.h, 12.0, paint::ink(if hot { 0.14 } else { 0.07 }));
-                match (b.icon, b.label.is_empty()) {
-                    (Some(icon), true) => p.glyph(icon, r.x + r.w / 2.0, r.y + r.h / 2.0, 11.0, if hot { paint::text() } else { paint::dim() }),
-                    (icon, false) => {
-                        let iw = if icon.is_some() { 20.0 } else { 0.0 };
-                        let lw = p.measure(&b.label, 13.0, MEDIUM);
-                        let x = r.x + (r.w - lw - iw) / 2.0;
-                        if let Some(icon) = icon {
-                            p.glyph(icon, x + 7.0, r.y + r.h / 2.0, 11.0, paint::text());
-                        }
-                        p.text_mid(&b.label, x + iw, r.y + r.h / 2.0, 13.0, MEDIUM, paint::text(), lw + 2.0);
-                    }
-                    _ => {}
-                }
+                let kind = if b.primary { crate::ui::Kind::Primary } else { crate::ui::Kind::Secondary };
+                crate::ui::button(&p, b.rect, &b.label, b.icon, kind, hot, true);
             }
         })?;
         let brush = self.gfx.compositor.CreateSurfaceBrushWithSurface(&surface)?;
@@ -799,7 +815,7 @@ impl SettingsPage {
             // the squircle's look: a soft white fill, redrawn at this scale
             let r = s.parts[s.sel.unwrap_or(0)];
             let h = r.h * k;
-            slider.SetBrush(&self.gfx.shape_brush(paint::ink(0.13), r.h, SEG_IN_R, k)?)?;
+            slider.SetBrush(&crate::ui::seg_slider_brush(&self.gfx, r.h, k)?)?;
             slider.SetOpacity(if s.sel.is_some() { 1.0 } else { 0.0 })?;
             glide(&slider, Vector3 { X: r.x * k, Y: r.y * k, Z: 0.0 }, Some(Vector2 { X: r.w * k, Y: h }), animate && !new)?;
         }
@@ -911,6 +927,9 @@ impl SettingsPage {
                     "corner" => cmd(if *i == 0 { "corner:bottom-left".into() } else { "corner:bottom-right".into() }),
                     "display" => cmd(if *i == 0 { "display:stack".into() } else { "display:folder".into() }),
                     "theme" => cmd(["theme:system", "theme:light", "theme:dark"][(*i).min(2)].into()),
+                    "tray" => cmd(if *i == 0 { "tray:stack".into() } else { "tray:window".into() }),
+                    "start" => cmd(if *i == 0 { "start:tray".into() } else { "start:window".into() }),
+                    "close" => cmd(if *i == 0 { "close:keep".into() } else { "close:quit".into() }),
                     "sort" => cmd(format!("sort:{}", ["added", "modified", "name", "kind"][*i])),
                     "count" => cmd(format!("limit:{}", val?)),
                     "size" => cmd(format!("size:{}", ["small", "medium", "large", "extra-large"][*i])),
@@ -933,6 +952,8 @@ impl SettingsPage {
                 "seed" => cmd("dls:seed".into()),
                 "magnets" => cmd("dls:magnets".into()),
                 "login" => cmd("login".into()),
+                "show-stack" => cmd("show-stack:flip".into()),
+                "arrivals" => cmd("arrivals:flip".into()),
                 "autoupdate" => cmd("update:auto".into()),
                 _ => None,
             },

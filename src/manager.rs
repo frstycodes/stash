@@ -294,6 +294,7 @@ struct Sheet {
     card: SpriteVisual,
     caret: SpriteVisual,
     switch: Option<(SpriteVisual, SpriteVisual)>, // the Remove sheet's switch (live, like Settings')
+    slider: Option<(SpriteVisual, Priority)>,      // the New Download sheet's priority selection
 }
 
 /// Work that runs a nested message loop, done with the state borrow released.
@@ -499,6 +500,7 @@ impl Manager {
                 let y = self.list_top() + self.line_y(i) - self.scroll + 30.0;
                 self.open_menu(SIDEBAR + 260.0, y);
             }
+            "add" => self.open_add(Some("https://example.com/files/big-archive.zip".into())),
             "remove" => {
                 // the Remove sheet for the first finished download whose file is there
                 let id = self.jobs.iter().find(|j| j.state.finished() && j.path.as_ref().is_some_and(|p| p.exists())).map(|j| j.id);
@@ -1875,7 +1877,7 @@ impl Manager {
     fn empty_button(&self) -> (f32, f32, f32, f32) {
         let (w, h) = (self.cw(), self.h - self.list_top());
         let cy = (h / 2.0 - 80.0).max(60.0);
-        (w / 2.0 - 78.0, cy + 118.0, 156.0, 42.0)
+        (w / 2.0 - 78.0, cy + 120.0, 156.0, crate::ui::BUTTON_H)
     }
 
     fn paint_empty(&self, empty: bool) -> Result<()> {
@@ -1895,16 +1897,12 @@ impl Manager {
             let sw = p.measure(&sub, 13.0, REGULAR).min(w - 48.0);
             p.text(&sub, (w - sw) / 2.0, cy + 80.0, 13.0, REGULAR, paint::dim(), w - 48.0);
             let Some(cta) = cta else { return };
+            let r = settings_page::Rect::new(bx, by, bw, bh);
             if searching {
-                p.round(bx, by, bw, bh, 15.0, paint::ink(if hot { 0.14 } else { 0.08 }));
-                let lw = p.measure(cta, 13.5, SEMIBOLD);
-                p.text_mid(cta, bx + (bw - lw) / 2.0, by + bh / 2.0, 13.5, SEMIBOLD, paint::text(), bw);
+                crate::ui::button(p, r, cta, None, crate::ui::Kind::Secondary, hot, true);
                 return;
             }
-            // flat orange capsule
-            p.round(bx, by, bw, bh, bh / 2.0, if hot { paint::accent_hot() } else { paint::accent() });
-            p.glyph(icons::ADD, bx + 28.0, by + bh / 2.0, 11.5, paint::color(255, 255, 255, 1.0));
-            p.text_mid(cta, bx + 44.0, by + bh / 2.0, 13.5, SEMIBOLD, paint::color(255, 255, 255, 1.0), 110.0);
+            crate::ui::button(p, r, cta, Some(icons::ADD), crate::ui::Kind::Primary, hot, true);
             let y = by + 66.0;
             let parts = [("or press", false), ("Ctrl", true), ("V", true)];
             let widths: Vec<f32> = parts.iter().map(|(t, cap)| p.measure(t, 11.5, if *cap { MEDIUM } else { REGULAR }) + if *cap { 14.0 } else { 0.0 }).collect();
@@ -1979,10 +1977,7 @@ impl Manager {
             let icon = if multi && i == 2 { &icons::CANCEL } else { icon };
             let hot = self.hover == Hit::DockTool(i);
             self.sprite_from(&self.dock_tools[i], 40.0, 40.0, |p| {
-                if hot {
-                    p.round(0.0, 0.0, 40.0, 40.0, 14.0, paint::ink(0.10));
-                }
-                p.glyph(icon, 20.0, 20.0, 13.0, if hot { paint::text() } else { paint::dim() });
+                crate::ui::button(p, settings_page::Rect::new(0.0, 0.0, 40.0, 40.0), "", Some(icon), crate::ui::Kind::Ghost, hot, true);
             })?;
             if !self.dock_open {
                 self.dock_tools[i].SetOffset(Vector3 { X: (self.tool_x(i) + 22.0) * k, Y: 2.0 * k, Z: 0.0 })?;
@@ -3056,7 +3051,14 @@ impl Manager {
             self.root.Children()?.InsertAtTop(&root)?;
             card.SetShadow(&popover_shadow(&self.gfx, self.k, false)?)?;
             let switch = if matches!(kind, SheetKind::Remove { .. }) { Some(settings_page::new_switch(&self.gfx, &card.Children()?, self.k)?) } else { None };
-            self.sheet = Some(Sheet { kind, root: root.clone(), card: card.clone(), caret, switch });
+            let slider = if matches!(kind, SheetKind::Add { .. }) {
+                let v = c.CreateSpriteVisual()?;
+                card.Children()?.InsertAtBottom(&v)?;
+                Some((v, Priority::Normal))
+            } else {
+                None
+            };
+            self.sheet = Some(Sheet { kind, root: root.clone(), card: card.clone(), caret, switch, slider });
             self.place_sheet()?;
             self.paint_sheet()?;
             let fade = c.CreateScalarKeyFrameAnimation()?;
@@ -3130,9 +3132,10 @@ impl Manager {
                 if inside(w - 100.0, 136.0, 80.0, 26.0) {
                     return Hit::Folder;
                 }
-                for (i, p) in [Priority::Low, Priority::Normal, Priority::High].iter().enumerate() {
-                    if inside(104.0 + i as f32 * 76.0, 172.0, 76.0, 30.0) {
-                        return Hit::Prio(*p);
+                let (_, parts) = self.prio_seg();
+                for (r, p) in parts.iter().zip([Priority::Low, Priority::Normal, Priority::High]) {
+                    if r.contains(x, y) {
+                        return Hit::Prio(p);
                     }
                 }
                 if inside(18.0, 214.0, 150.0, 34.0) {
@@ -3150,10 +3153,11 @@ impl Manager {
                     return Hit::AlsoDelete;
                 }
                 let ok_w = 178.0;
-                if inside(w - 22.0 - ok_w, h - 22.0 - 38.0, ok_w, 38.0) {
+                let bh = crate::ui::BUTTON_H;
+                if inside(w - 22.0 - ok_w, h - 22.0 - bh, ok_w, bh) {
                     return Hit::Ok;
                 }
-                if inside(w - 22.0 - ok_w - 10.0 - 92.0, h - 22.0 - 38.0, 92.0, 38.0) {
+                if inside(w - 22.0 - ok_w - 10.0 - 92.0, h - 22.0 - bh, 92.0, bh) {
                     return Hit::Cancel;
                 }
             }
@@ -3161,7 +3165,16 @@ impl Manager {
         Hit::Sheet
     }
 
+    /// The New Download sheet's priority control: the app's segmented control.
+    fn prio_seg(&self) -> (settings_page::Rect, Vec<settings_page::Rect>) {
+        let dw = self.gfx.dwrite.clone();
+        let k = self.k;
+        let widths = crate::ui::seg_widths(&["Low", "Normal", "High"], |t| paint::advance(&dw, t, 13.0 * k) / k + 14.0);
+        crate::ui::seg_layout(104.0, 187.0, &widths)
+    }
+
     fn paint_sheet(&mut self) -> Result<()> {
+        let prio = self.prio_seg();
         let k = self.k;
         let hover = self.hover.clone();
         let dw = self.gfx.dwrite.clone();
@@ -3211,38 +3224,20 @@ impl Manager {
                     p.text_mid("Save to", 24.0, 149.0, 13.0, REGULAR, paint::dim(), 80.0);
                     p.glyph(icons::FOLDER, 112.0, 149.0, 12.0, paint::dim());
                     p.text_mid(&folder, 126.0, 149.0, 13.0, REGULAR, paint::text(), w - 126.0 - 110.0);
-                    let on = hover == Hit::Folder;
-                    p.text_right("Change…", w - 26.0, 149.0, 13.0, MEDIUM, if on { paint::accent_hot() } else { paint::accent() });
+                    let change_w = p.measure("Change…", 13.0, MEDIUM);
+                    crate::ui::link(p, w - 26.0 - change_w, 149.0, "Change…", None, hover == Hit::Folder);
                     p.text_mid("Priority", 24.0, 187.0, 13.0, REGULAR, paint::dim(), 80.0);
-                    p.round(104.0, 172.0, 228.0, 30.0, 12.0, paint::well(0.25));
-                    for (i, (pr, label)) in [(Priority::Low, "Low"), (Priority::Normal, "Normal"), (Priority::High, "High")].iter().enumerate() {
-                        let x = 104.0 + i as f32 * 76.0;
-                        if *pr == priority {
-                            p.round(x + 3.0, 175.0, 70.0, 24.0, 9.0, paint::ink(0.14));
-                        } else if hover == Hit::Prio(*pr) {
-                            p.round(x + 3.0, 175.0, 70.0, 24.0, 9.0, paint::ink(0.05));
-                        }
-                        let lw = p.measure(label, 13.0, MEDIUM);
-                        p.text_mid(label, x + (76.0 - lw) / 2.0, 187.0, 13.0, MEDIUM, if *pr == priority { paint::text() } else { paint::dim() }, 76.0);
-                    }
-                    let on = hover == Hit::Torrent;
-                    let link = if on { paint::accent_hot() } else { paint::accent() };
-                    p.glyph(icons::TORRENT, 32.0, 232.0, 12.0, link);
-                    p.text_mid("Open Torrent File…", 46.0, 232.0, 13.0, MEDIUM, link, 140.0);
+                    // the app's segmented control; its selection is a sprite that slides
+                    let (rect, parts) = &prio;
+                    let sel = [Priority::Low, Priority::Normal, Priority::High].iter().position(|x| *x == priority);
+                    let hot = [Priority::Low, Priority::Normal, Priority::High].iter().position(|x| hover == Hit::Prio(*x));
+                    crate::ui::paint_seg(p, *rect, parts, &["Low", "Normal", "High"], sel, hot, false);
+                    crate::ui::link(p, 26.0, 232.0, "Open Torrent File…", Some(icons::TORRENT), hover == Hit::Torrent);
                     let ok_x = w - 24.0 - 120.0;
                     let cancel_x = ok_x - 10.0 - 92.0;
-                    p.round(cancel_x, 214.0, 92.0, 36.0, 18.0, paint::ink(if hover == Hit::Cancel { 0.14 } else { 0.08 }));
-                    let lw = p.measure("Cancel", 13.5, MEDIUM);
-                    p.text_mid("Cancel", cancel_x + (92.0 - lw) / 2.0, 232.0, 13.5, MEDIUM, paint::text(), 92.0);
-                    let enabled = count > 0;
-                    let fill = match (enabled, hover == Hit::Ok) {
-                        (false, _) => paint::rgb(paint::ORANGE, 0.35),
-                        (true, true) => paint::accent_hot(),
-                        (true, false) => paint::accent(),
-                    };
-                    p.round(ok_x, 214.0, 120.0, 36.0, 18.0, fill);
-                    let lw = p.measure(&ok_label, 13.5, SEMIBOLD);
-                    p.text_mid(&ok_label, ok_x + (120.0 - lw) / 2.0, 232.0, 13.5, SEMIBOLD, paint::color(255, 255, 255, if enabled { 1.0 } else { 0.6 }), 120.0);
+                    let bh = crate::ui::BUTTON_H;
+                    crate::ui::button(p, settings_page::Rect::new(cancel_x, 214.0, 92.0, bh), "Cancel", None, crate::ui::Kind::Secondary, hover == Hit::Cancel, true);
+                    crate::ui::button(p, settings_page::Rect::new(ok_x, 214.0, 120.0, bh), &ok_label, None, crate::ui::Kind::Primary, hover == Hit::Ok, count > 0);
                 };
                 let k2 = self.k;
                 let surface = self.gfx.surface(w * k2, ADD_H * k2, |dc| unsafe {
@@ -3250,6 +3245,13 @@ impl Manager {
                     draw(&P { dc, dw: &dw, k: k2 });
                 })?;
                 set_surface(&self.gfx, &card, &surface, w * k2, ADD_H * k2)?;
+                // slide the selection to the priority (set in place when the sheet opens)
+                if let Some(Sheet { slider: Some((v, shown)), .. }) = &mut self.sheet {
+                    let i = [Priority::Low, Priority::Normal, Priority::High].iter().position(|x| *x == priority).unwrap_or(1);
+                    let animate = *shown != priority && v.Size().is_ok_and(|s| s.X > 0.0);
+                    crate::ui::place_seg_slider(&self.gfx, v, prio.1[i], k2, animate)?;
+                    *shown = priority;
+                }
                 let cx = (34.0 + caret_x - scroll_x).min(w - 34.0);
                 caret_v.SetSize(Vector2 { X: (1.5 * k).max(1.0), Y: 18.0 * k })?;
                 caret_v.SetOffset(Vector3 { X: cx * k, Y: 85.0 * k, Z: 0.0 })?;
@@ -3263,7 +3265,7 @@ impl Manager {
                 let (title, desc, switch, keep, gone) = if many {
                     (
                         format!("Remove {n} downloads from the list?"),
-                        "Some files are still on your PC. Keep them, or move them to the Recycle Bin.",
+                        "Some of their files are still on your PC.",
                         "Also move their files to the Recycle Bin",
                         format!("Remove {n} from List"),
                         "Remove and Delete Files".to_string(),
@@ -3271,7 +3273,7 @@ impl Manager {
                 } else {
                     (
                         "Remove from your downloads?".to_string(),
-                        "The file is still on your PC. Keep it, or move it to the Recycle Bin too.",
+                        "The file is still on your PC.",
                         "Also move the file to the Recycle Bin",
                         "Remove from List".to_string(),
                         "Remove and Delete File".to_string(),
@@ -3296,27 +3298,13 @@ impl Manager {
                     settings_page::paint_switch_track(p, settings_page::Rect::new(sx, 158.0, settings_page::SWITCH.0, settings_page::SWITCH.1), true);
                     p.text_mid(switch, sx + 52.0, 169.0, 13.0, REGULAR, paint::text(), w - 100.0);
                     let ok_w = 178.0;
-                    let (ok_x, by) = (w - 22.0 - ok_w, h - 22.0 - 38.0);
+                    let bh = crate::ui::BUTTON_H;
+                    let (ok_x, by) = (w - 22.0 - ok_w, h - 22.0 - bh);
                     let cancel_x = ok_x - 10.0 - 92.0;
-                    // cancel is an outline, the action solid (danger red when it deletes)
-                    let hot = hover == Hit::Cancel;
-                    if hot {
-                        p.round(cancel_x, by, 92.0, 38.0, 19.0, paint::ink(0.06));
-                    }
-                    p.round_stroke(cancel_x, by, 92.0, 38.0, 19.0, paint::ink(0.22), 1.0);
-                    let lw = p.measure("Cancel", 13.5, MEDIUM);
-                    p.text_mid("Cancel", cancel_x + (92.0 - lw) / 2.0, by + 19.0, 13.5, MEDIUM, paint::text(), 92.0);
-                    let hot = hover == Hit::Ok;
-                    let (label, fill) = if delete {
-                        (gone.as_str(), if hot { paint::color(236, 93, 97, 1.0) } else { paint::color(229, 72, 77, 1.0) })
-                    } else {
-                        (keep.as_str(), paint::ink(if hot { 0.2 } else { 0.13 }))
-                    };
-                    p.round(ok_x, by, ok_w, 38.0, 19.0, fill);
-                    let lw = p.measure(label, 13.5, SEMIBOLD);
-                    // white on the red; the plain one is a neutral button
-                    let ink = if delete { paint::color(255, 255, 255, 1.0) } else { paint::text() };
-                    p.text_mid(label, ok_x + (ok_w - lw) / 2.0, by + 19.0, 13.5, SEMIBOLD, ink, ok_w);
+                    // Cancel is Secondary; the action Primary, or Danger once it deletes the file
+                    crate::ui::button(p, settings_page::Rect::new(cancel_x, by, 92.0, bh), "Cancel", None, crate::ui::Kind::Secondary, hover == Hit::Cancel, true);
+                    let (label, kind) = if delete { (gone.as_str(), crate::ui::Kind::Danger) } else { (keep.as_str(), crate::ui::Kind::Primary) };
+                    crate::ui::button(p, settings_page::Rect::new(ok_x, by, ok_w, bh), label, None, kind, hover == Hit::Ok, true);
                 };
                 let surface = self.gfx.surface(w * k, h * k, |dc| unsafe {
                     dc.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
@@ -3326,8 +3314,9 @@ impl Manager {
                 caret_v.SetIsVisible(false)?;
                 if let Some((track, knob)) = &live_switch {
                     let r = settings_page::Rect::new(24.0, 158.0, settings_page::SWITCH.0, settings_page::SWITCH.1);
-                    // slides when flipped; set in place when the sheet first opens
-                    let flip = track.Opacity().is_ok_and(|o| (o > 0.5) != delete);
+                    // slides when flipped; set in place (no motion) the first time it's drawn
+                    let placed = knob.Size().is_ok_and(|s| s.X > 0.0);
+                    let flip = placed && track.Opacity().is_ok_and(|o| (o > 0.5) != delete);
                     settings_page::place_switch(&self.gfx, track, knob, r, delete, true, k, flip)?;
                 }
             }
@@ -3637,8 +3626,7 @@ fn paint_row(p: &P, j: &JobView, rw: f32, selected: bool, hovered: bool, hover_b
         if !show {
             return;
         }
-        p.round(cx - 15.0, cy - 15.0, 30.0, 30.0, 11.0, paint::ink(if on { 0.14 } else { 0.05 }));
-        p.glyph(g, cx, cy, 10.5, if on { paint::text() } else { paint::dim() });
+        crate::ui::button(p, settings_page::Rect::new(cx - 15.0, cy - 15.0, 30.0, 30.0), "", Some(g), crate::ui::Kind::Secondary, on, true);
     };
     if finished && missing {
         if j.expired {
@@ -3954,6 +3942,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             let _ = KillTimer(Some(hwnd), wparam.0);
             return LRESULT(0);
         },
+        WM_CLOSE if with(|m| m.settings.close_quits) == Some(true) => {
+            // Settings > General: closing quits (the window's size is kept first)
+            with(|m| {
+                let r = shell::window_rect(hwnd);
+                let k = m.k;
+                if unsafe { !IsZoomed(hwnd).as_bool() } {
+                    crate::stash::queue(format!("dls:window:{}x{}", ((r.right - r.left) as f32 / k) as i32, ((r.bottom - r.top) as f32 / k) as i32));
+                }
+            });
+            crate::stash::queue(crate::menu::ids::QUIT.into());
+            return LRESULT(0);
+        }
         WM_CLOSE => {
             // closing hides it; Stash keeps running in the tray
             with(|m| {

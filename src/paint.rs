@@ -61,6 +61,10 @@ pub fn accent_text() -> D2D1_COLOR_F {
 pub fn accent_strong() -> D2D1_COLOR_F {
     if light() { color(140, 52, 6, 1.0) } else { color(255, 220, 196, 1.0) }
 }
+/// Links ("Change…", "Open Torrent File…"): the brand orange on dark, a deeper one on light.
+pub fn link() -> D2D1_COLOR_F {
+    if light() { color(196, 86, 16, 1.0) } else { accent() }
+}
 pub fn danger_text() -> D2D1_COLOR_F {
     if light() { color(196, 43, 48, 1.0) } else { color(245, 120, 124, 1.0) }
 }
