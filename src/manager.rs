@@ -2625,6 +2625,7 @@ impl Manager {
                 "again" => icons::DOWNLOAD,
                 "remove" => icons::TRASH,
                 "cancel" => icons::CANCEL,
+                "files" => icons::LIST,
                 _ => return None,
             })
         };

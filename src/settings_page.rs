@@ -469,8 +469,8 @@ impl SettingsPage {
             title: "Torrents",
             keys: "torrent bittorrent magnet",
             rows: vec![
-                Row::new("Upload limit", Some("How fast torrents share back. Separate from the speed limit."), "upload seed bandwidth throttle cap rate", up),
-                Row::new("Stop seeding at ratio", Some("Once you've shared this many times what you downloaded."), "seed ratio share upload stop", Ctl::Seg {
+                Row::new("Upload limit", Some("Separate from the speed limit."), "upload seed bandwidth throttle cap rate", up),
+                Row::new("Stop seeding at ratio", Some("Shared back this many times over."), "seed ratio share upload stop", Ctl::Seg {
                     id: "t-ratio",
                     opts: vec!["Never".into(), "1.0".into(), "2.0".into(), "5.0".into()],
                     sel: ratio,
