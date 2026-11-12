@@ -54,6 +54,7 @@ fn main() {
         let _ = OleInitialize(None);
     }
     // let the browser extensions find us (the Store build can't write these keys)
+    shell::repair_start_at_login();
     if !shell::is_packaged() && std::env::var_os("STASH_DATA").is_none() {
         std::thread::spawn(ipc::register_native_host);
     }

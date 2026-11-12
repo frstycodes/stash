@@ -11,7 +11,13 @@ Unicode true
 !endif
 
 !define APP "Stash"
-!define EXE "stash.exe"
+; Installed as StashDownloads.exe, not stash.exe: Discord's list of games has one
+; called "Stash" that it spots as "stash\stash.exe", which is exactly where an older
+; installer put us (Programs\Stash\stash.exe), so Discord showed you "playing Stash".
+!define EXE "StashDownloads.exe"
+; what the build makes, and the name older installers used
+!define BUILT "stash.exe"
+!define LEGACY "stash.exe"
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP}"
 !define RUN_KEY "Software\Microsoft\Windows\CurrentVersion\Run"
 
@@ -51,25 +57,30 @@ VIAddVersionKey "LegalCopyright" "Copyright 2026 Sandesh Pandey. PolyForm Noncom
 
 !insertmacro MUI_LANGUAGE "English"
 
-; A running copy holds the exe open; close it first.
+; A running copy holds the exe open; close it first (under its old name too).
 !macro StopStash
   nsExec::Exec 'taskkill /F /IM ${EXE}'
+  Pop $0
+  nsExec::Exec 'taskkill /F /IM ${LEGACY}'
   Pop $0
   Sleep 300
 !macroend
 
 ; ...and wait until it lets go (a copy that's still exiting, or being looked at by
 ; Windows Error Reporting, keeps the file locked): up to 15 seconds.
-Function WaitForExe
+; $3 is the file to wait for.
+Function WaitForFile
   StrCpy $1 0
   loop:
-    IfFileExists "$INSTDIR\${EXE}" 0 done
+    IfFileExists "$3" 0 done
     ClearErrors
-    FileOpen $2 "$INSTDIR\${EXE}" a
+    FileOpen $2 "$3" a
     IfErrors 0 free
     IntOp $1 $1 + 1
     IntCmp $1 60 done
     nsExec::Exec 'taskkill /F /IM ${EXE}'
+    Pop $0
+    nsExec::Exec 'taskkill /F /IM ${LEGACY}'
     Pop $0
     Sleep 250
     Goto loop
@@ -81,10 +92,19 @@ FunctionEnd
 Section "${APP}" SecApp
   SectionIn RO
   !insertmacro StopStash
-  Call WaitForExe
+  StrCpy $3 "$INSTDIR\${EXE}"
+  Call WaitForFile
+  StrCpy $3 "$INSTDIR\${LEGACY}"
+  Call WaitForFile
   SetOutPath "$INSTDIR"
-  File "..\target\release\${EXE}"
+  File "/oname=${EXE}" "..\target\release\${BUILT}"
   File "..\LICENSE.md"
+  ; the old name goes, and whatever pointed at it follows the new one
+  Delete "$INSTDIR\${LEGACY}"
+  ReadRegStr $0 HKCU "${RUN_KEY}" "${APP}"
+  ${If} $0 != ""
+    WriteRegStr HKCU "${RUN_KEY}" "${APP}" '"$INSTDIR\${EXE}"'
+  ${EndIf}
   ; the browser extensions, to load unpacked until they're in the stores
   SetOutPath "$INSTDIR\browser"
   File "..\browser\README.md"
@@ -129,6 +149,7 @@ Section "Uninstall"
   !insertmacro StopStash
   RMDir /r "$INSTDIR\browser"
   Delete "$INSTDIR\${EXE}"
+  Delete "$INSTDIR\${LEGACY}"
   Delete "$INSTDIR\LICENSE.md"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"

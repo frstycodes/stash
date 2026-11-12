@@ -19,7 +19,7 @@ Build the extensions:
 
 ## How it works
 
-`stash.exe` is the extension's native messaging host. The browser starts it with the extension's origin, and the extension sends it one length-prefixed JSON message per download:
+Stash's own exe (`StashDownloads.exe` when installed, `stash.exe` when built from source) is the extension's native messaging host. The browser starts it with the extension's origin, and the extension sends it one length-prefixed JSON message per download:
 
 ```json
 { "type": "download", "download": { "url": "…", "filename": "…", "referrer": "…", "cookies": "…", "userAgent": "…" } }

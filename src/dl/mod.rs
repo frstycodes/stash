@@ -171,7 +171,8 @@ enum Cmd {
     Pause(u64),
     Resume(u64),
     StartNow(u64),
-    Remove { id: u64, delete_files: bool },
+    /// `permanent`: the file skips the Recycle Bin (Shift+Delete).
+    Remove { id: u64, delete_files: bool, permanent: bool },
     Again(u64),
     Priority(u64, Priority),
     PauseAll,
@@ -366,7 +367,12 @@ impl Engine {
         self.send(Cmd::Again(id));
     }
     pub fn remove(&self, id: u64, delete_files: bool) {
-        self.send(Cmd::Remove { id, delete_files });
+        self.send(Cmd::Remove { id, delete_files, permanent: false });
+    }
+
+    /// Remove a download and delete its file for good, not to the Recycle Bin.
+    pub fn remove_permanently(&self, id: u64) {
+        self.send(Cmd::Remove { id, delete_files: true, permanent: true });
     }
     pub fn set_priority(&self, id: u64, p: Priority) {
         self.send(Cmd::Priority(id, p));
@@ -517,12 +523,12 @@ impl Actor {
                 }
                 self.start(id);
             }
-            Cmd::Remove { id, delete_files } => self.remove(id, delete_files).await,
+            Cmd::Remove { id, delete_files, permanent } => self.remove(id, delete_files, permanent).await,
             Cmd::Again(id) => {
                 let Some(old) = self.jobs.iter().find(|j| j.id == id).cloned() else { return };
                 let gone = old.state.finished() && old.path.as_ref().is_some_and(|p| !p.exists());
                 if gone || old.state == State::Failed {
-                    self.remove(id, false).await;
+                    self.remove(id, false, false).await;
                 }
                 self.add(AddRequest {
                     source: old.source.clone(),
@@ -553,7 +559,7 @@ impl Actor {
             Cmd::ClearFinished => {
                 let ids: Vec<u64> = self.jobs.iter().filter(|j| j.state == State::Done).map(|j| j.id).collect();
                 for id in ids {
-                    self.remove(id, false).await;
+                    self.remove(id, false, false).await;
                 }
             }
             Cmd::Configure(c) => {
@@ -735,7 +741,7 @@ impl Actor {
         }
     }
 
-    async fn remove(&mut self, id: u64, delete_files: bool) {
+    async fn remove(&mut self, id: u64, delete_files: bool, permanent: bool) {
         if let Some(r) = self.running.remove(&id) {
             r.task.abort();
         }
@@ -752,10 +758,11 @@ impl Actor {
         if let Some(f) = &job.torrent_file {
             let _ = std::fs::remove_file(f);
         }
-        // a finished download's file (or a torrent's folder) goes to the Recycle Bin, never deleted outright
+        // a finished download's file (or a torrent's folder) goes to the Recycle Bin,
+        // unless the user asked for it to go for good (Shift+Delete, after a confirmation)
         if delete_files {
             if let Some(p) = job.path.as_ref().filter(|p| p.exists()) {
-                crate::shell::recycle(p);
+                if permanent { crate::shell::delete_permanently(p) } else { crate::shell::recycle(p) }
             }
         }
     }
@@ -1027,6 +1034,21 @@ fn save(jobs: &[Job]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shift+Delete's delete skips the Recycle Bin, and takes folders too.
+    #[test]
+    fn delete_permanently() {
+        let dir = std::env::temp_dir().join("stash-permanent-delete-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+        let file = dir.join("file.txt");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::write(dir.join("inner").join("more.txt"), b"y").unwrap();
+        crate::shell::delete_permanently(&file);
+        assert!(!file.exists());
+        crate::shell::delete_permanently(&dir);
+        assert!(!dir.exists());
+    }
 
     #[test]
     fn expiry() {

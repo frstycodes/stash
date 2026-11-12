@@ -276,7 +276,8 @@ enum Line {
 enum SheetKind {
     Add { field: Field, dir: PathBuf, priority: Priority, error: Option<String> },
     /// `name` and `path` describe the first; `ids.len() > 1` asks about all of them.
-    Remove { ids: Vec<u64>, name: String, path: String, delete: bool },
+    /// `permanent`: Shift+Delete, which deletes the files for good after asking.
+    Remove { ids: Vec<u64>, name: String, path: String, delete: bool, permanent: bool },
 }
 
 /// The right-click menu while it's open: for `ids` (the selection), at (x, y) in DIPs.
@@ -499,6 +500,13 @@ impl Manager {
                 let i = self.lines.iter().position(|l| matches!(l, Line::Job(_))).unwrap_or(0);
                 let y = self.list_top() + self.line_y(i) - self.scroll + 30.0;
                 self.open_menu(SIDEBAR + 260.0, y);
+            }
+            "delete" => {
+                // the Shift+Delete sheet for the first finished download whose file is there
+                let id = self.jobs.iter().find(|j| j.state.finished() && j.path.as_ref().is_some_and(|p| p.exists())).map(|j| j.id);
+                if let Some(id) = id {
+                    self.ask_delete(vec![id]);
+                }
             }
             "add" => self.open_add(Some("https://example.com/files/big-archive.zip".into())),
             "remove" => {
@@ -2515,6 +2523,16 @@ impl Manager {
     /// Remove downloads from the list. Unfinished ones are cancelled (their partial
     /// file goes); when finished files are still on the PC, ask whether they go too.
     fn ask_remove(&mut self, ids: Vec<u64>) {
+        self.ask_remove_with(ids, false);
+    }
+
+    /// Shift+Delete, as in Explorer: delete the files for good (after asking), and take
+    /// the downloads off the list. With no file on disk, it's a plain remove.
+    fn ask_delete(&mut self, ids: Vec<u64>) {
+        self.ask_remove_with(ids, true);
+    }
+
+    fn ask_remove_with(&mut self, ids: Vec<u64>, permanent: bool) {
         let has_file = |j: &JobView| j.state.finished() && j.path.as_ref().is_some_and(|p| p.exists());
         let jobs: Vec<JobView> = ids.iter().filter_map(|id| self.job(*id).cloned()).collect();
         let Some(first) = jobs.iter().find(|j| has_file(j)).cloned() else {
@@ -2536,7 +2554,7 @@ impl Manager {
             let total: u64 = jobs.iter().filter(|j| has_file(j)).filter_map(|j| j.total).sum();
             (format!("{}  and {more} more", first.name), format!("{files} of {} files still on your PC  \u{b7}  {}", jobs.len(), paint::bytes(total)))
         };
-        self.open_sheet(SheetKind::Remove { ids: jobs.iter().map(|j| j.id).collect(), name, path, delete: false });
+        self.open_sheet(SheetKind::Remove { ids: jobs.iter().map(|j| j.id).collect(), name, path, delete: permanent, permanent });
     }
 
     // ---------- the right-click menu ----------
@@ -2951,7 +2969,12 @@ impl Manager {
             v if v == VK_DELETE.0 => {
                 let ids = self.sel_in_order();
                 if !ids.is_empty() {
-                    self.act("remove", &ids);
+                    // Shift+Delete skips the Recycle Bin, after asking, as in Explorer
+                    if unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0 {
+                        self.ask_delete(ids);
+                    } else {
+                        self.act("remove", &ids);
+                    }
                 }
             }
             v if ctrl && v == b'C' as u16 => {
@@ -3020,6 +3043,8 @@ impl Manager {
     fn sheet_size(&self, kind: &SheetKind) -> (f32, f32) {
         match kind {
             SheetKind::Add { .. } => (SHEET_W, ADD_H),
+            // no switch to show when it's a permanent delete
+            SheetKind::Remove { permanent: true, .. } => (420.0, REMOVE_H - 46.0),
             SheetKind::Remove { .. } => (420.0, REMOVE_H),
         }
     }
@@ -3148,8 +3173,8 @@ impl Manager {
                     return Hit::Ok;
                 }
             }
-            SheetKind::Remove { .. } => {
-                if inside(22.0, 152.0, w - 44.0, 34.0) {
+            SheetKind::Remove { permanent, .. } => {
+                if !permanent && inside(22.0, 152.0, w - 44.0, 34.0) {
                     return Hit::AlsoDelete;
                 }
                 let ok_w = 178.0;
@@ -3257,12 +3282,21 @@ impl Manager {
                 caret_v.SetOffset(Vector3 { X: cx * k, Y: 85.0 * k, Z: 0.0 })?;
                 caret_v.SetIsVisible(!all)?;
             }
-            SheetKind::Remove { ids, name, path, delete } => {
-                let (w, h) = (420.0, REMOVE_H);
+            SheetKind::Remove { ids, name, path, delete, permanent } => {
+                let permanent = *permanent;
+                let (w, h) = (420.0, if permanent { REMOVE_H - 46.0 } else { REMOVE_H });
                 let (name, path, delete) = (name.clone(), path.clone(), *delete);
                 let many = ids.len() > 1;
                 let n = ids.len();
-                let (title, desc, switch, keep, gone) = if many {
+                let (title, desc, switch, keep, gone) = if permanent {
+                    (
+                        if many { format!("Permanently delete {n} downloads?") } else { "Permanently delete this file?".to_string() },
+                        if many { "Their files are deleted from your PC, not moved to the Recycle Bin." } else { "It's deleted from your PC, not moved to the Recycle Bin." },
+                        "",
+                        String::new(),
+                        "Delete Permanently".to_string(),
+                    )
+                } else if many {
                     (
                         format!("Remove {n} downloads from the list?"),
                         "Some of their files are still on your PC.",
@@ -3293,9 +3327,12 @@ impl Manager {
                     }
                     p.text(&name, 76.0, 87.0, 13.5, MEDIUM, paint::text(), w - 44.0 - 70.0);
                     p.text(&path, 76.0, 107.0, 12.0, REGULAR, paint::dim(), w - 44.0 - 70.0);
-                    // the switch (its live parts sit on this track), then its label
+                    // the switch (its live parts sit on this track), then its label; a
+                    // permanent delete has no choice to make
                     let sx = 24.0;
-                    settings_page::paint_switch_track(p, settings_page::Rect::new(sx, 158.0, settings_page::SWITCH.0, settings_page::SWITCH.1), true);
+                    if !permanent {
+                        settings_page::paint_switch_track(p, settings_page::Rect::new(sx, 158.0, settings_page::SWITCH.0, settings_page::SWITCH.1), true);
+                    }
                     p.text_mid(switch, sx + 52.0, 169.0, 13.0, REGULAR, paint::text(), w - 100.0);
                     let ok_w = 178.0;
                     let bh = crate::ui::BUTTON_H;
@@ -3313,6 +3350,8 @@ impl Manager {
                 set_surface(&self.gfx, &card, &surface, w * k, h * k)?;
                 caret_v.SetIsVisible(false)?;
                 if let Some((track, knob)) = &live_switch {
+                    let _ = track.SetIsVisible(!permanent);
+                    let _ = knob.SetIsVisible(!permanent);
                     let r = settings_page::Rect::new(24.0, 158.0, settings_page::SWITCH.0, settings_page::SWITCH.1);
                     // slides when flipped; set in place (no motion) the first time it's drawn
                     let placed = knob.Size().is_ok_and(|s| s.X > 0.0);
@@ -3330,7 +3369,10 @@ impl Manager {
             return true;
         }
         if vk == VK_RETURN.0 {
-            self.submit_sheet();
+            // a permanent delete can't be undone: it takes a click, not a stray Enter
+            if !matches!(self.sheet, Some(Sheet { kind: SheetKind::Remove { permanent: true, .. }, .. })) {
+                self.submit_sheet();
+            }
             return true;
         }
         let Some(Sheet { kind: SheetKind::Add { field, error, .. }, .. }) = &mut self.sheet else { return false };
@@ -3368,17 +3410,23 @@ impl Manager {
                 self.close_sheet();
                 self.clamp_scroll(true);
             }
-            SheetKind::Remove { ids, delete, .. } => {
-                let (ids, delete) = (ids.clone(), *delete);
+            SheetKind::Remove { ids, delete, permanent, .. } => {
+                let (ids, delete, permanent) = (ids.clone(), *delete, *permanent);
                 for id in &ids {
                     // an unfinished one is cancelled, its partial file with it
                     let unfinished = self.job(*id).is_some_and(|j| !j.state.finished());
-                    dl::engine().remove(*id, delete || unfinished);
+                    if permanent && !unfinished {
+                        dl::engine().remove_permanently(*id);
+                    } else {
+                        dl::engine().remove(*id, delete || unfinished);
+                    }
                 }
                 self.picked.clear();
                 self.close_sheet();
                 let n = ids.len();
                 let note = match (n, delete) {
+                    _ if permanent && n == 1 => "Deleted permanently".to_string(),
+                    _ if permanent => format!("{n} downloads deleted permanently"),
                     (1, true) => "Removed, and the file moved to the Recycle Bin".to_string(),
                     (1, false) => "Removed from your downloads".to_string(),
                     (_, true) => format!("Removed {n} downloads, and their files moved to the Recycle Bin"),

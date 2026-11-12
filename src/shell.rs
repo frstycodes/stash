@@ -308,6 +308,22 @@ pub fn reveal(path: &Path) {
     }
 }
 
+/// Delete a file or folder for good, skipping the Recycle Bin (Explorer's Shift+Delete).
+pub fn delete_permanently(path: &Path) {
+    use windows::Win32::UI::Shell::{FO_DELETE, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHFILEOPSTRUCTW, SHFileOperationW};
+    let mut from: Vec<u16> = path.as_os_str().encode_wide().collect();
+    from.extend([0, 0]); // double-null terminated list
+    let mut op = SHFILEOPSTRUCTW {
+        wFunc: FO_DELETE,
+        pFrom: PCWSTR(from.as_ptr()),
+        fFlags: (FOF_NOCONFIRMATION.0 | FOF_SILENT.0 | FOF_NOERRORUI.0) as u16,
+        ..Default::default()
+    };
+    unsafe {
+        SHFileOperationW(&mut op);
+    }
+}
+
 pub fn recycle(path: &Path) {
     use windows::Win32::UI::Shell::{FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, SHFILEOPSTRUCTW, SHFileOperationW};
     let mut from: Vec<u16> = path.as_os_str().encode_wide().collect();
@@ -353,6 +369,22 @@ pub fn start_at_login() -> bool {
         .open(RUN_KEY)
         .and_then(|k| k.get_string("Stash"))
         .is_ok()
+}
+
+/// The sign-in entry points at a file that's gone (an install renamed the exe):
+/// point it at this one. Leaves a missing entry, or one that works, alone.
+pub fn repair_start_at_login() {
+    if is_packaged() || std::env::var_os("STASH_DATA").is_some() {
+        return;
+    }
+    let Ok(key) = windows_registry::CURRENT_USER.create(RUN_KEY) else { return };
+    let Ok(value) = key.get_string("Stash") else { return };
+    let target = value.trim().trim_matches('"');
+    if !std::path::Path::new(target).exists() {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = key.set_string("Stash", format!("\"{}\"", exe.display()));
+        }
+    }
 }
 
 pub fn set_start_at_login(enabled: bool) {
