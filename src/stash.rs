@@ -2109,6 +2109,14 @@ impl Stash {
                 manager::command(&id);
                 continue;
             }
+            // the downloads list's sort, grouping and auto-clear
+            if id.starts_with("dlw:") {
+                if crate::list_prefs::apply(&mut self.settings.list, &id) {
+                    self.save_settings();
+                    manager::set_settings(&self.settings);
+                }
+                continue;
+            }
             if id.starts_with("dls:") {
                 if let Some(b) = self.apply_dl_setting(&id) {
                     blocking = Some(b);

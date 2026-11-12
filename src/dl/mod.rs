@@ -243,6 +243,8 @@ enum Cmd {
     /// A torrent's files to download (indices; all of them = no filter).
     ChooseFiles(u64, Vec<usize>),
     ConfigureTorrents(TorrentOptions),
+    /// A finished download's file was renamed (by the window): it's at `path` now.
+    Renamed { id: u64, path: PathBuf },
 }
 
 /// Messages from running downloads back to the engine.
@@ -513,6 +515,10 @@ impl Engine {
     pub fn configure(&self, c: Config) {
         self.send(Cmd::Configure(c));
     }
+    /// A finished download's file has a new name (the window renamed it on disk).
+    pub fn renamed(&self, id: u64, path: PathBuf) {
+        self.send(Cmd::Renamed { id, path });
+    }
 
     /// The newer settings (retry, schedule, proxy, sorting…).
     pub fn set_prefs(&self, p: Prefs) {
@@ -771,6 +777,14 @@ impl Actor {
             Cmd::ConfigureTorrents(o) => {
                 if let Some(s) = self.session.get() {
                     torrent::set_upload_limit(&s, o.upload_kbps * 1024);
+                }
+            }
+            Cmd::Renamed { id, path } => {
+                if let Some(j) = self.job(id).filter(|j| j.state.finished()) {
+                    if let Some(name) = path.file_name() {
+                        j.name = name.to_string_lossy().into_owned();
+                    }
+                    j.path = Some(path);
                 }
             }
         }

@@ -64,12 +64,16 @@ const ADD_H: f32 = 262.0;
 const REMOVE_H: f32 = 268.0;
 const FIELD_TEXT: f32 = 13.5;
 const OPT_H: f32 = 50.0;
+const SORT_BTN: f32 = 36.0;
+const RENAME_H: f32 = 200.0;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const T_TOAST: usize = 2;
 const T_DOCK: usize = 3;
 const T_TIP: usize = 4;
 const T_VIEW: usize = 5; // STASH_VIEW's menu or tooltip, once the window is up
+const T_MIDNIGHT: usize = 6; // the day groups move on at midnight
+const T_COPIED: usize = 7; // a copy button's check goes back to the copy glyph
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Filter {
@@ -144,6 +148,18 @@ enum Hit {
     /// The Choose Files sheet (see torrent_sheet).
     Files(crate::torrent_sheet::FHit),
     Video(crate::video_sheet::Hit),
+    // the sort menu's button, by the search
+    SortBtn,
+    // Quick Look and the Where-from popover, and anywhere outside them while one is open
+    Quick(crate::preview::QHit),
+    Info(crate::details::DHit),
+    OverlayOff,
+}
+
+/// A popover over the list: Quick Look, or Where-from details, at (x, y) in DIPs.
+enum Overlay {
+    Preview { q: crate::preview::Preview, x: f32, y: f32, w: f32, h: f32, hover: Option<crate::preview::QHit> },
+    Details { d: crate::details::Details, x: f32, y: f32, hover: Option<crate::details::DHit> },
 }
 
 /// A single-line text field: the search box and the New Download link field.
@@ -291,6 +307,8 @@ enum SheetKind {
     Form(Box<forms::Form>),
     /// Which of a torrent's files to download.
     Files(crate::torrent_sheet::FilesSheet),
+    /// Rename a finished download's file.
+    Rename { id: u64, path: PathBuf, field: Field, error: Option<String> },
 }
 
 /// The right-click menu while it's open: for `ids` (the selection), at (x, y) in DIPs.
@@ -389,6 +407,25 @@ pub struct Manager {
     toast_text: String,
     /// The New Download sheet's video (read from the pasted page).
     vsheet: crate::video_sheet::State,
+    overlay: Option<Overlay>,
+    overlay_v: SpriteVisual,
+    press: Option<(f32, f32, u64)>, // where a finished row was pressed (DIPs), for dragging it out
+    pending_select: Option<u64>,    // a plain click on a multi-selection selects just it on release
+    cleared: std::collections::HashSet<u64>, // taken off the list by auto-clear already
+    shas: HashMap<PathBuf, crate::details::Sha>,
+    copied: Option<&'static str>, // the Where-from copy button that just copied
+}
+
+/// What the preview and hashing threads have delivered.
+static PREVIEW_DONE: std::sync::Mutex<Vec<crate::preview::Loaded>> = std::sync::Mutex::new(Vec::new());
+static SHA_DONE: std::sync::Mutex<Vec<(PathBuf, std::result::Result<String, String>)>> = std::sync::Mutex::new(Vec::new());
+const WM_APP_PREVIEW: u32 = WM_APP + 43;
+const WM_APP_SHA: u32 = WM_APP + 44;
+
+fn post_self(msg: u32) {
+    unsafe {
+        let _ = PostMessageW(Some(HWND(MGR_HWND.load(std::sync::atomic::Ordering::Relaxed) as *mut _)), msg, WPARAM(0), LPARAM(0));
+    }
 }
 
 thread_local! {
@@ -469,6 +506,7 @@ pub fn show(gfx: &Gfx, settings: &Settings, links: Option<Vec<String>>) {
     }
     with(|m| {
         let _ = m.rise_in();
+        m.arm_midnight();
         m.missing.clear(); // files may have moved since
         m.on_snapshot(true);
         if let Some(links) = links {
@@ -551,6 +589,54 @@ impl Manager {
                     self.ask_remove(vec![id]);
                 }
             }
+            v if ["preview", "info", "rename"].iter().any(|p| v.starts_with(p)) => {
+                // the nth (default first) finished download whose file is there: "preview2"
+                let kind = v.trim_end_matches(|c: char| c.is_ascii_digit());
+                let nth: usize = v[kind.len()..].parse().unwrap_or(1).max(1);
+                let id = self.list_ids().into_iter().filter(|id| self.job(*id).is_some_and(|j| j.state.finished() && j.path.as_ref().is_some_and(|p| p.exists()))).nth(nth - 1);
+                if let Some(id) = id {
+                    self.select_only(id);
+                    self.on_selection();
+                    match kind {
+                        "preview" => self.open_preview(id),
+                        "info" => {
+                            self.open_details(id);
+                            self.click(Hit::Info(crate::details::DHit::Sha), false);
+                        }
+                        _ => self.open_rename(id),
+                    }
+                }
+            }
+            "sort" => self.open_sort_menu(),
+            "menudone" => {
+                // the menu for the first finished download whose file is there
+                let id = self.list_ids().into_iter().find(|id| self.job(*id).is_some_and(|j| j.state.finished() && j.path.as_ref().is_some_and(|p| p.exists())));
+                if let (Some(id), Some((_, y))) = (id, id.and_then(|id| self.row_point(id))) {
+                    self.select_only(id);
+                    self.on_selection();
+                    self.open_menu(SIDEBAR + 260.0, y);
+                }
+            }
+            "drop" => {
+                // as if a link and a .torrent file (its path with spaces) were dropped
+                let dir = dl::data_dir().join("drop test");
+                let _ = std::fs::create_dir_all(&dir);
+                let t = dir.join("my show s01.torrent");
+                let _ = std::fs::write(&t, b"d4:infod4:name4:testee");
+                self.on_link_drop(vec!["https://example.com/files/dropped.zip".into()], vec![t]);
+            }
+            "tipname" => {
+                // the tooltip of the first row whose name doesn't fit
+                let id = self.list_ids().into_iter().find(|id| self.name_cut(*id));
+                if let Some(id) = id {
+                    self.hover = Hit::Row(id);
+                    self.show_tip();
+                }
+            }
+            "tipclose" => {
+                self.hover = Hit::CapClose;
+                self.show_tip();
+            }
             "tip" => {
                 self.hover = Hit::DockTool(1);
                 self.set_dock_open(true);
@@ -615,7 +701,10 @@ pub fn set_settings(s: &Settings) {
         paint::set_units(s.downloads.bits, s.downloads.binary);
         if m.view == Page::Settings {
             m.build_page(true);
+        } else {
+            m.rebuild_list();
         }
+        m.auto_clear();
         let _ = m.paint_sidebar();
         m.force_repaint();
     });
@@ -758,6 +847,7 @@ impl Manager {
         let blurs = vec![sprite()?, sprite()?, sprite()?];
         let (page_view, page_blurs) = (sprite()?, vec![sprite()?, sprite()?, sprite()?]);
         let (menu_v, tip) = (sprite()?, sprite()?);
+        let overlay_v = sprite()?;
         let page = SettingsPage::new(&gfx)?;
         // one material: Mica edge to edge (Windows 10 gets one solid color)
         paint::set_light(settings.theme.is_light());
@@ -781,6 +871,7 @@ impl Manager {
             dropdown.cast()?,
             toast.cast()?,
             caption.cast()?,
+            overlay_v.cast()?,
             menu_v.cast()?,
             tip.cast()?,
         ] {
@@ -788,6 +879,8 @@ impl Manager {
         }
         menu_v.SetOpacity(0.0)?;
         tip.SetOpacity(0.0)?;
+        overlay_v.SetOpacity(0.0)?;
+        overlay_v.SetShadow(&popover_shadow(&gfx, unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() } as f32 / 96.0, false)?)?;
         let k0 = unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() } as f32 / 96.0;
         for (v, small) in [(&menu_v, false), (&dropdown, false), (&toast, false), (&tip, true)] {
             v.SetShadow(&popover_shadow(&gfx, k0, small)?)?;
@@ -803,9 +896,10 @@ impl Manager {
         search_caret.StartAnimation(&HSTRING::from("Opacity"), &blink(&gfx)?)?;
         search_caret.SetIsVisible(false)?;
 
-        let drop = crate::droptarget::DropTarget::new(hwnd, |e| {
-            if let crate::droptarget::Event::Drop { paths, .. } = e {
-                with(|m| m.on_drop(paths));
+        // links and .torrent files dropped on the window open New Download (as a copy, never a move)
+        let drop = crate::linkdrop::LinkDrop::new(hwnd, |e| {
+            if let crate::linkdrop::Event::Drop { links, torrents } = e {
+                with(|m| m.on_link_drop(links, torrents));
             }
         });
         unsafe {
@@ -886,6 +980,13 @@ impl Manager {
             settings,
             toast_text: String::new(),
             vsheet: Default::default(),
+            overlay: None,
+            overlay_v,
+            press: None,
+            pending_select: None,
+            cleared: Default::default(),
+            shas: HashMap::new(),
+            copied: None,
         })
     }
 
@@ -958,6 +1059,7 @@ impl Manager {
         if r.right - r.left < 1 || r.bottom - r.top < 1 {
             return; // minimized
         }
+        self.close_overlay(); // it was placed for the old size
         self.k = shell::scale_factor(self.hwnd);
         self.w = (r.right - r.left) as f32 / self.k;
         self.h = (r.bottom - r.top) as f32 / self.k;
@@ -1084,6 +1186,7 @@ impl Manager {
         self.picked.retain(|id| jobs.iter().any(|j| j.id == *id));
         let _ = self.paint_dock();
         if structural {
+            self.auto_clear();
             let _ = self.paint_sidebar();
             if self.view != Page::Settings {
                 self.rebuild_list();
@@ -1141,13 +1244,12 @@ impl Manager {
             }
         }
         let searching = !q.words.is_empty();
+        let prefs = self.settings.list.clone();
         kept.sort_by(|(sa, a), (sb, b)| {
             if searching {
                 sb.partial_cmp(sa).unwrap_or(std::cmp::Ordering::Equal)
             } else {
-                let ta = a.finished_at.unwrap_or(a.added);
-                let tb = b.finished_at.unwrap_or(b.added);
-                tb.cmp(&ta).then(b.id.cmp(&a.id))
+                crate::list_prefs::compare(prefs.sort, a, b)
             }
         });
         let mut lines = Vec::new();
@@ -1155,6 +1257,40 @@ impl Manager {
         if !active.is_empty() {
             lines.push(Line::Group(format!("In progress  ·  {}", active.len())));
             lines.extend(active.into_iter().cloned().map(Line::Job));
+        }
+        // finished ones: by site, by type, in one group, or (sorted by date) by day
+        let done: Vec<&JobView> = kept.iter().map(|(_, j)| j).filter(|j| j.state.finished()).collect();
+        let by_key = |key: &dyn Fn(&JobView) -> String, lines: &mut Vec<Line>| {
+            let mut order: Vec<String> = Vec::new();
+            for j in &done {
+                let k = key(j);
+                if !order.contains(&k) {
+                    order.push(k);
+                }
+            }
+            for k in order {
+                let g: Vec<&&JobView> = done.iter().filter(|j| key(j) == k).collect();
+                lines.push(Line::Group(format!("{k}  ·  {}", g.len())));
+                lines.extend(g.into_iter().map(|j| Line::Job((*j).clone())));
+            }
+        };
+        if prefs.group_site {
+            by_key(&|j| Some(crate::list_prefs::site_of(j)).filter(|s| !s.is_empty()).unwrap_or_else(|| "Other".into()), &mut lines);
+            self.lines = lines;
+            return;
+        }
+        if prefs.sort == crate::list_prefs::SortBy::Type && !searching {
+            by_key(&|j| crate::list_prefs::type_label(&j.name).to_string(), &mut lines);
+            self.lines = lines;
+            return;
+        }
+        if prefs.sort != crate::list_prefs::SortBy::Added && !searching {
+            if !done.is_empty() {
+                lines.push(Line::Group(format!("Finished  ·  {}", done.len())));
+                lines.extend(done.iter().map(|j| Line::Job((*j).clone())));
+            }
+            self.lines = lines;
+            return;
         }
         for when in [When::Today, When::Yesterday, When::Week, When::Month, When::Older] {
             let g: Vec<&JobView> = kept
@@ -1310,8 +1446,13 @@ impl Manager {
         let (scroll_x, all, focus) = (self.search.scroll_x, self.search.all, self.search_focus);
         let hover = self.hover.clone();
         let full_w = paint::advance(&dw, &text, FIELD_TEXT * k) / k;
+        let on_list = self.view != Page::Settings;
         self.sprite_from(&self.header.clone(), cw, HEAD, |p| {
-            p.text_mid(title, 24.0, 33.0, 21.0, SEMIBOLD, paint::text(), (sx - 40.0).max(80.0));
+            p.text_mid(title, 24.0, 33.0, 21.0, SEMIBOLD, paint::text(), (sx - if on_list { 84.0 } else { 40.0 }).max(80.0));
+            if on_list {
+                let r = settings_page::Rect::new(sx - SORT_BTN - 8.0, sy, SORT_BTN, SORT_BTN);
+                crate::ui::button(p, r, "", Some(crate::details::SORT), crate::ui::Kind::Ghost, hover == Hit::SortBtn, true);
+            }
             if !searching {
                 return;
             }
@@ -2144,6 +2285,7 @@ impl Manager {
         self.selected = None;
         self.picked.clear();
         self.close_menu();
+        self.close_overlay();
         self.hide_tip();
         self.focus_search(false);
         let settings = view == Page::Settings;
@@ -2184,6 +2326,9 @@ impl Manager {
         if let Some(m) = &self.menu {
             return m.model.hit(x - m.x, y - m.y).map_or(Hit::MenuOff, Hit::Menu);
         }
+        if let Some(h) = self.overlay_hit(x, y) {
+            return h;
+        }
         if let Some(i) = self.option_at(x, y) {
             return Hit::Option(i);
         }
@@ -2209,6 +2354,9 @@ impl Manager {
         if y < HEAD {
             if self.view != Page::Settings {
                 let (sx, sy, sw, sh) = self.search_rect();
+                if x >= sx - SORT_BTN - 8.0 && x < sx - 8.0 && y >= sy && y < sy + SORT_BTN {
+                    return Hit::SortBtn;
+                }
                 if x >= sx && x < sx + sw && y >= sy && y < sy + sh {
                     if !self.search.text.is_empty() && x >= sx + sw - 32.0 {
                         return Hit::SearchClear;
@@ -2308,8 +2456,11 @@ impl Manager {
         if any(|x| matches!(x, Hit::Filter(_) | Hit::Settings | Hit::UpdateCard)) {
             let _ = self.paint_sidebar();
         }
-        if any(|x| matches!(x, Hit::Search | Hit::SearchClear)) {
+        if any(|x| matches!(x, Hit::Search | Hit::SearchClear | Hit::SortBtn)) {
             let _ = self.paint_header();
+        }
+        if self.overlay.is_some() {
+            self.overlay_hover(&h);
         }
         if any(|x| matches!(x, Hit::Chip(_))) {
             let _ = self.paint_chips();
@@ -2365,7 +2516,17 @@ impl Manager {
         if !matches!(hit, Hit::Search | Hit::SearchClear | Hit::Option(_) | Hit::Chip(_)) && self.search_focus {
             self.focus_search(false);
         }
+        if self.overlay.is_some() && !matches!(hit, Hit::Quick(_) | Hit::Info(_)) {
+            self.close_overlay();
+            if matches!(hit, Hit::OverlayOff) {
+                return None;
+            }
+        }
         match hit {
+            Hit::SortBtn => self.open_sort_menu(),
+            Hit::Quick(h) => self.overlay_click_quick(h),
+            Hit::Info(h) => self.overlay_click_info(h),
+            Hit::OverlayOff => {}
             Hit::Menu(popup::MHit::Item(i)) => {
                 let Some(m) = self.menu.take() else { return None };
                 self.close_menu();
@@ -2434,6 +2595,9 @@ impl Manager {
                     self.anchor = Some(id);
                 } else if shift && self.anchor.is_some() {
                     self.select_range(id);
+                } else if !double && self.picked.len() > 1 && self.picked.contains(&id) {
+                    self.selected = Some(id);
+                    self.pending_select = Some(id);
                 } else {
                     self.select_only(id);
                     if double {
@@ -2567,6 +2731,35 @@ impl Manager {
                     self.open_files(id, first);
                 }
             }
+            a if a.starts_with("dlw:") => crate::stash::queue(a.to_string()),
+            "quicklook" => {
+                if let Some(id) = ids.first() {
+                    self.open_preview(*id);
+                }
+            }
+            "info" => {
+                if let Some(id) = ids.first() {
+                    self.open_details(*id);
+                }
+            }
+            "rename" => {
+                if let Some(id) = ids.first() {
+                    self.open_rename(*id);
+                }
+            }
+            "copyfile" => {
+                let files = self.files_of(ids);
+                if !files.is_empty() && crate::file_ops::copy_files(&files) {
+                    self.show_toast(&if files.len() == 1 { "File copied. Paste it in a folder.".to_string() } else { format!("{} files copied. Paste them in a folder.", files.len()) });
+                }
+            }
+            "copypath" => {
+                let files = self.files_of(ids);
+                if !files.is_empty() {
+                    shell::set_clipboard_text(&files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\r\n"));
+                    self.show_toast(if files.len() == 1 { "Path copied" } else { "Paths copied" });
+                }
+            }
             "pause" => {
                 for id in ids {
                     if self.job(*id).is_some_and(|j| matches!(j.state, State::Active | State::Queued | State::Seeding)) {
@@ -2669,6 +2862,11 @@ impl Manager {
                 "remove" => icons::TRASH,
                 "cancel" => icons::CANCEL,
                 "files" => icons::LIST,
+                "quicklook" => crate::details::EYE,
+                "info" => crate::details::INFO,
+                "copyfile" => crate::details::COPY,
+                "copypath" => crate::details::FILE,
+                "rename" => crate::details::PEN,
                 _ => return None,
             })
         };
@@ -2680,9 +2878,20 @@ impl Manager {
             let missing = self.is_missing(j);
             let mut items = vec![
                 action("open", "Open".into(), Some("Enter"), done && !missing),
-                action("reveal", "Show in Folder".into(), None, !missing),
-                Item::Sep,
+                action("reveal", "Show in Folder".into(), Some("Ctrl+E"), !missing),
             ];
+            let file = done && !missing && j.path.as_ref().is_some_and(|p| p.exists());
+            if done {
+                items.push(action("quicklook", "Quick Look".into(), Some("Space"), file));
+            }
+            items.push(action("info", "Where From\u{2026}".into(), Some("Ctrl+I"), true));
+            items.push(Item::Sep);
+            if done {
+                items.push(action("copyfile", "Copy File".into(), None, file));
+                items.push(action("copypath", "Copy Path".into(), None, file));
+                items.push(action("rename", "Rename\u{2026}".into(), Some("F2"), file && j.kind == Kind::Http && j.state == State::Done));
+                items.push(Item::Sep);
+            }
             if !done {
                 let (id, label, glyph) = match j.state {
                     State::Active | State::Queued | State::Seeding => ("pause", "Pause", "pause"),
@@ -2749,6 +2958,10 @@ impl Manager {
             items.push(Item::Priority(unfinished.iter().all(|j| j.priority == first).then_some(first)));
         }
         items.push(Item::Sep);
+        let files = self.files_of(ids).len();
+        if files > 0 {
+            items.push(action("copyfile", if files == 1 { "Copy 1 File".to_string() } else { format!("Copy {files} Files") }, None, true));
+        }
         items.push(action("copy", format!("Copy {n} Links"), Some("Ctrl+C"), true));
         items.push(Item::Sep);
         items.push(action("remove", format!("Remove {n} from List\u{2026}"), Some("Del"), true));
@@ -2759,6 +2972,7 @@ impl Manager {
     /// to stay inside the window.
     fn open_menu(&mut self, x: f32, y: f32) {
         self.hide_tip();
+        self.close_overlay();
         let ids = self.sel_in_order();
         if ids.is_empty() {
             return;
@@ -2846,6 +3060,15 @@ impl Manager {
         let multi = self.picked.len() > 1;
         Some(match h {
             Hit::DockAdd => "New download  (Ctrl+N)".into(),
+            Hit::CapMin => "Minimize".into(),
+            Hit::CapMax => if unsafe { IsZoomed(self.hwnd).as_bool() } { "Restore down" } else { "Maximize" }.into(),
+            Hit::CapClose if self.settings.close_quits => "Close: Stash quits".into(),
+            Hit::CapClose => "Close: Stash keeps downloading in the tray".into(),
+            Hit::Settings if self.view != Page::Settings => "Settings  (Ctrl+,)".into(),
+            Hit::SearchClear => "Clear search  (Esc)".into(),
+            Hit::SortBtn => "Sort and group".into(),
+            Hit::Chip(_) => "Remove this filter".into(),
+            Hit::Row(id) if self.name_cut(*id) => self.job(*id)?.name.clone(),
             Hit::DockTool(i) if multi => ["Pause selected", "Resume selected", "Remove selected"][(*i).min(2)].into(),
             Hit::DockTool(i) => DOCK_TOOLS.get(*i)?.1.into(),
             Hit::RowBtn(id, b) => {
@@ -2869,7 +3092,24 @@ impl Manager {
 
     /// Where a tooltip points: the button's center x and its top and bottom (DIPs).
     fn tip_anchor(&self, h: &Hit) -> Option<(f32, f32, f32)> {
+        let (sx, sy, sw, sh) = self.search_rect();
         match h {
+            Hit::CapMin | Hit::CapMax | Hit::CapClose => {
+                let i = [Hit::CapMin, Hit::CapMax, Hit::CapClose].iter().position(|x| x == h)? as f32;
+                Some((self.w - CAP_W * (3.0 - i) + CAP_W / 2.0, 0.0, CAP_H))
+            }
+            Hit::Settings => Some((SIDEBAR / 2.0, self.h - 52.0, self.h - 18.0)),
+            Hit::SearchClear => Some((sx + sw - 18.0, sy, sy + sh)),
+            Hit::SortBtn => Some((sx - 8.0 - SORT_BTN / 2.0, sy, sy + SORT_BTN)),
+            Hit::Chip(i) => {
+                let (chx, chw) = *self.chip_rects().get(*i)?;
+                Some((SIDEBAR + chx + chw - 13.0, HEAD, HEAD + 30.0))
+            }
+            Hit::Row(id) => {
+                let i = self.lines.iter().position(|l| matches!(l, Line::Job(j) if j.id == *id))?;
+                let top = self.list_top() + self.line_y(i) - self.scroll + 8.0;
+                Some((SIDEBAR + 12.0 + 68.0 + 120.0, top, top + 22.0))
+            }
             Hit::DockAdd => Some((self.w - 22.0 - 22.0, self.dock_y(), self.dock_y() + 44.0)),
             Hit::DockTool(i) => Some((SIDEBAR + self.tool_x(*i) + 20.0, self.dock_y() + 2.0, self.dock_y() + 42.0)),
             Hit::RowBtn(id, b) => {
@@ -2888,7 +3128,7 @@ impl Manager {
     /// After a hover change: the hovered button's tooltip shows after a short rest
     /// (at once if another one was just up), and goes when the pointer leaves.
     fn update_tip(&mut self) {
-        if self.tip_text(&self.hover).is_none() || self.menu.is_some() {
+        if self.tip_text(&self.hover).is_none() || self.menu.is_some() || self.overlay.is_some() {
             self.hide_tip();
             return;
         }
@@ -2906,12 +3146,14 @@ impl Manager {
         let (Some(text), Some((cx, top, bottom))) = (self.tip_text(&hover), self.tip_anchor(&hover)) else { return };
         let k = self.k;
         let dw = self.gfx.dwrite.clone();
-        let w = popup::tip_w(&text, |t, size, _| paint::advance(&dw, t, size * k) / k);
+        // (measured in the regular weight; tooltips draw in medium, so long ones get room)
+        let w = (popup::tip_w(&text, |t, size, _| paint::advance(&dw, t, size * k) / k) * 1.04).ceil().min(self.w - 16.0);
         let mut y = top - 6.0 - popup::TIP_H;
-        if matches!(hover, Hit::RowBtn(..)) && y < self.list_top() {
+        if (matches!(hover, Hit::RowBtn(..) | Hit::Row(_)) && y < self.list_top()) || y < 4.0 {
             y = bottom + 6.0;
         }
-        let x = (cx - w / 2.0).clamp(SIDEBAR + 4.0, self.w - w - 4.0);
+        let left = if matches!(hover, Hit::Settings) { 4.0 } else { SIDEBAR + 4.0 };
+        let x = (cx - w / 2.0).clamp(left, (self.w - w - 4.0).max(left));
         let was_on = self.tip_on;
         self.tip_on = true;
         let _ = (|| -> Result<()> {
@@ -2946,13 +3188,47 @@ impl Manager {
         })();
     }
 
-    fn on_drop(&mut self, paths: Vec<PathBuf>) {
-        let dir = default_dir(&self.settings);
-        for p in paths {
-            if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("torrent")) {
-                dl::engine().add(AddRequest { source: p.display().to_string(), dir: dir.clone(), ..Default::default() });
+    /// Links or .torrent files dropped on the window: into New Download, after what's
+    /// already there if it's open. (A torrent whose path has spaces is copied somewhere
+    /// without, as the link field splits on spaces.)
+    fn on_link_drop(&mut self, links: Vec<String>, torrents: Vec<PathBuf>) {
+        let mut items = links;
+        for t in torrents {
+            let s = t.display().to_string();
+            if !s.contains(char::is_whitespace) {
+                items.push(s);
+                continue;
+            }
+            let dir = dl::data_dir().join("dropped");
+            let name: String = t.file_name().map(|n| n.to_string_lossy().chars().map(|c| if c.is_whitespace() { '_' } else { c }).collect()).unwrap_or_else(|| "dropped.torrent".into());
+            let to = dir.join(name);
+            if std::fs::create_dir_all(&dir).is_ok() && std::fs::copy(&t, &to).is_ok() {
+                items.push(to.display().to_string());
             }
         }
+        if items.is_empty() {
+            return;
+        }
+        self.close_overlay();
+        unsafe {
+            let _ = SetForegroundWindow(self.hwnd);
+        }
+        if let Some(Sheet { kind: SheetKind::Add { field, error, .. }, .. }) = &mut self.sheet {
+            let mut text = field.string();
+            for i in &items {
+                if !text.split_whitespace().any(|t| t == i) {
+                    if !text.trim().is_empty() {
+                        text.push(' ');
+                    }
+                    text.push_str(i);
+                }
+            }
+            field.set(text.trim());
+            *error = None;
+            let _ = self.paint_sheet();
+            return;
+        }
+        self.open_add(Some(items.join(" ")));
     }
 
     fn on_key(&mut self, vk: u16) -> bool {
@@ -2963,8 +3239,24 @@ impl Manager {
         if self.menu.is_some() {
             return self.menu_key(vk);
         }
+        if self.overlay.is_some() && self.overlay_key(vk, ctrl) {
+            return true;
+        }
         self.hide_tip();
-        if ctrl && vk == b'F' as u16 {
+        // window-wide: Settings, the three lists, re-checking files
+        if ctrl && vk == VK_OEM_COMMA.0 {
+            self.set_view(Page::Settings);
+            return true;
+        }
+        if ctrl && (b'1' as u16..=b'3' as u16).contains(&vk) {
+            self.set_view(Page::List(FILTERS[(vk - b'1' as u16) as usize].0));
+            return true;
+        }
+        if vk == VK_F5.0 {
+            self.recheck_files();
+            return true;
+        }
+        if ctrl && (vk == b'F' as u16 || vk == b'L' as u16) {
             self.focus_search(true);
             self.search.all = !self.search.text.is_empty();
             let _ = self.paint_header();
@@ -3024,11 +3316,17 @@ impl Manager {
                     self.open_add(clip);
                 }
             }
-            v if v == VK_DOWN.0 || v == VK_UP.0 => {
-                let next = match (pos, v == VK_DOWN.0) {
+            v if v == VK_DOWN.0 || v == VK_UP.0 || v == VK_HOME.0 || v == VK_END.0 || v == VK_PRIOR.0 || v == VK_NEXT.0 => {
+                let last = ids.len().saturating_sub(1);
+                let page = (((self.h - self.list_top() - DOCK_H - 40.0) / ROW) as usize).max(2) - 1;
+                let next = match (pos, v) {
+                    (_, v) if v == VK_HOME.0 => 0,
+                    (_, v) if v == VK_END.0 => last,
                     (None, _) => 0,
-                    (Some(p), true) => (p + 1).min(ids.len().saturating_sub(1)),
-                    (Some(p), false) => p.saturating_sub(1),
+                    (Some(p), v) if v == VK_DOWN.0 => (p + 1).min(last),
+                    (Some(p), v) if v == VK_UP.0 => p.saturating_sub(1),
+                    (Some(p), v) if v == VK_NEXT.0 => (p + page).min(last),
+                    (Some(p), _) => p.saturating_sub(page),
                 };
                 if let Some(&id) = ids.get(next) {
                     // Shift extends the selection from the anchor; plain arrows move it
@@ -3048,6 +3346,30 @@ impl Manager {
                         self.clamp_scroll(true);
                     }
                     self.on_selection();
+                    // Quick Look follows the selection
+                    if matches!(self.overlay, Some(Overlay::Preview { .. })) {
+                        self.follow_preview(id);
+                    }
+                }
+            }
+            v if ctrl && v == b'Y' as u16 => {
+                if let Some(id) = self.selected {
+                    self.open_preview(id);
+                }
+            }
+            v if ctrl && v == b'I' as u16 => {
+                if let Some(id) = self.selected {
+                    self.open_details(id);
+                }
+            }
+            v if ctrl && v == b'E' as u16 => {
+                if let Some(id) = self.selected {
+                    command(&format!("dl:reveal:{id}"));
+                }
+            }
+            v if v == VK_F2.0 => {
+                if let Some(id) = self.selected {
+                    self.open_rename(id);
                 }
             }
             v if ctrl && v == b'A' as u16 => {
@@ -3064,6 +3386,11 @@ impl Manager {
                 // one row pauses or resumes; several all pause, unless all are paused
                 let ids = self.sel_in_order();
                 if let [id] = ids[..] {
+                    // a finished one: Quick Look
+                    if self.job(id).is_some_and(|j| j.state.finished()) {
+                        self.open_preview(id);
+                        return true;
+                    }
                     self.toggle(id);
                 } else if !ids.is_empty() {
                     let running = ids.iter().any(|id| self.job(*id).is_some_and(|j| matches!(j.state, State::Active | State::Queued | State::Seeding)));
@@ -3107,7 +3434,7 @@ impl Manager {
         if self.form_char(ch) {
             return;
         }
-        if let Some(Sheet { kind: SheetKind::Add { field, error, .. }, .. }) = &mut self.sheet {
+        if let Some(Sheet { kind: SheetKind::Add { field, error, .. } | SheetKind::Rename { field, error, .. }, .. }) = &mut self.sheet {
             field.insert(&ch.to_string());
             *error = None;
             self.video_link_changed();
@@ -3116,6 +3443,10 @@ impl Manager {
         if self.sheet.is_some() {
             return;
         }
+        if ch.is_whitespace() && self.overlay.is_some() {
+            return;
+        }
+        self.close_overlay();
         if !self.search_focus && !ch.is_whitespace() {
             // typing anywhere searches
             self.focus_search(true);
@@ -3178,6 +3509,7 @@ impl Manager {
             SheetKind::Remove { .. } => (420.0, REMOVE_H),
             SheetKind::Form(f) => f.size(),
             SheetKind::Files(f) => (crate::torrent_sheet::W, f.height()),
+            SheetKind::Rename { .. } => (420.0, RENAME_H),
         }
     }
 
@@ -3352,6 +3684,18 @@ impl Manager {
                 }
                 if inside(w - 24.0 - 120.0 - ok_extra, 214.0 + dy, 120.0 + ok_extra, 36.0) {
                     return Hit::Ok;
+                }
+            }
+            SheetKind::Rename { .. } => {
+                let bh = crate::ui::BUTTON_H;
+                if inside(22.0, 78.0, w - 44.0, 36.0) {
+                    return Hit::Field;
+                }
+                if inside(w - 22.0 - 110.0, h - 22.0 - bh, 110.0, bh) {
+                    return Hit::Ok;
+                }
+                if inside(w - 22.0 - 110.0 - 10.0 - 92.0, h - 22.0 - bh, 92.0, bh) {
+                    return Hit::Cancel;
                 }
             }
             SheetKind::Remove { permanent, cancel, .. } => {
@@ -3593,6 +3937,59 @@ impl Manager {
                 set_surface(&self.gfx, &card, &surface, w * k, h * k)?;
                 caret_v.SetIsVisible(false)?;
             }
+            SheetKind::Rename { path, field, error, .. } => {
+                let (w, h) = (420.0, RENAME_H);
+                let text = field.string();
+                let field_w = w - 44.0 - 24.0;
+                let before: String = field.text[..field.caret].iter().collect();
+                let caret_x = paint::advance(&dw, &before, FIELD_TEXT * k) / k;
+                if caret_x - field.scroll_x > field_w {
+                    field.scroll_x = caret_x - field_w;
+                } else if caret_x < field.scroll_x {
+                    field.scroll_x = (caret_x - 20.0).max(0.0);
+                }
+                let (scroll_x, all) = (field.scroll_x, field.all);
+                let full_w = paint::advance(&dw, &text, FIELD_TEXT * k) / k;
+                let folder = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+                let (error, ok) = (error.clone(), crate::file_ops::name_problem(&text).is_none());
+                let draw = |p: &P| {
+                    p.popover(0.0, 0.0, w, h, 26.0);
+                    p.text("Rename", 22.0, 20.0, 16.5, SEMIBOLD, paint::text(), w - 44.0);
+                    p.text(&format!("In {folder}"), 22.0, 46.0, 12.5, REGULAR, paint::dim(), w - 44.0);
+                    p.round(22.0, 78.0, w - 44.0, 36.0, 13.0, paint::well(0.25));
+                    p.round_stroke(22.0, 78.0, w - 44.0, 36.0, 13.0, paint::rgb(paint::ORANGE, 0.75), 1.5);
+                    unsafe {
+                        p.dc.PushAxisAlignedClip(&D2D_RECT_F { left: 32.0 * k, top: 80.0 * k, right: (w - 32.0) * k, bottom: 112.0 * k }, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                    }
+                    if all {
+                        p.round(34.0 - scroll_x, 86.0, full_w.min(field_w + scroll_x), 20.0, 4.0, paint::rgb(paint::ORANGE, 0.4));
+                    }
+                    p.text_mid(&text, 34.0 - scroll_x, 96.0, FIELD_TEXT, REGULAR, paint::text(), 100_000.0);
+                    unsafe {
+                        p.dc.PopAxisAlignedClip();
+                    }
+                    if let Some(e) = &error {
+                        p.text(e, 24.0, 120.0, 11.5, REGULAR, paint::red(), w - 48.0);
+                    }
+                    let bh = crate::ui::BUTTON_H;
+                    let (ok_x, by) = (w - 22.0 - 110.0, h - 22.0 - bh);
+                    crate::ui::button(p, settings_page::Rect::new(ok_x - 10.0 - 92.0, by, 92.0, bh), "Cancel", None, crate::ui::Kind::Secondary, hover == Hit::Cancel, true);
+                    crate::ui::button(p, settings_page::Rect::new(ok_x, by, 110.0, bh), "Rename", None, crate::ui::Kind::Primary, hover == Hit::Ok, ok);
+                };
+                let surface = self.gfx.surface(w * k, h * k, |dc| unsafe {
+                    dc.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                    draw(&P { dc, dw: &dw, k });
+                })?;
+                set_surface(&self.gfx, &card, &surface, w * k, h * k)?;
+                let cx = (34.0 + caret_x - scroll_x).min(w - 32.0);
+                caret_v.SetSize(Vector2 { X: (1.5 * k).max(1.0), Y: 18.0 * k })?;
+                caret_v.SetOffset(Vector3 { X: cx * k, Y: 87.0 * k, Z: 0.0 })?;
+                caret_v.SetIsVisible(!all)?;
+                if let Some((track, knob)) = &live_switch {
+                    let _ = track.SetIsVisible(false);
+                    let _ = knob.SetIsVisible(false);
+                }
+            }
         }
         Ok(())
     }
@@ -3612,7 +4009,7 @@ impl Manager {
         if self.is_form() {
             return self.form_key(vk, ctrl);
         }
-        let Some(Sheet { kind: SheetKind::Add { field, error, .. }, .. }) = &mut self.sheet else { return false };
+        let Some(Sheet { kind: SheetKind::Add { field, error, .. } | SheetKind::Rename { field, error, .. }, .. }) = &mut self.sheet else { return false };
         if !field.key(vk, ctrl) {
             return false;
         }
@@ -3701,6 +4098,24 @@ impl Manager {
                 }
                 dl::engine().choose_files(f.id, f.chosen());
                 self.close_sheet();
+            }
+            SheetKind::Rename { id, path, field, error } => {
+                let (id, path, name) = (*id, path.clone(), field.string());
+                match crate::file_ops::rename(&path, &name) {
+                    Ok(to) => {
+                        dl::engine().renamed(id, to.clone());
+                        self.file_icons.remove(&path);
+                        self.missing.remove(&id);
+                        self.close_sheet();
+                        if to != path {
+                            self.show_toast("Renamed");
+                        }
+                    }
+                    Err(e) => {
+                        *error = Some(e);
+                        let _ = self.paint_sheet();
+                    }
+                }
             }
         }
     }
@@ -4088,6 +4503,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             return LRESULT(0);
         },
         WM_MOUSEMOVE => {
+            // a finished row pressed and pulled far enough: drag its files (all picked) out
+            if let Some(paths) = with(|m| m.drag_paths(x, y, wparam.0)).flatten() {
+                crate::linkdrop::SUPPRESS.store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::file_ops::drag(hwnd, &paths);
+                crate::linkdrop::SUPPRESS.store(false, std::sync::atomic::Ordering::Relaxed);
+                with(|m| {
+                    // a move takes them away: check again
+                    m.missing.clear();
+                    m.on_snapshot(true);
+                });
+                return LRESULT(0);
+            }
             with(|m| {
                 if !m.tracking {
                     m.tracking = true;
@@ -4097,6 +4524,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let cursor = match &h {
                     Hit::Search | Hit::Field | Hit::Form(forms::FHit::Field(_)) => IDC_IBEAM,
                     Hit::None | Hit::Caption | Hit::Row(_) | Hit::Sheet | Hit::Backdrop | Hit::Dock | Hit::Menu(_) | Hit::MenuOff => IDC_ARROW,
+                    Hit::OverlayOff | Hit::Quick(crate::preview::QHit::Card) | Hit::Info(crate::details::DHit::Card) => IDC_ARROW,
                     Hit::Page(settings_page::Hit::None) => IDC_ARROW,
                     _ => IDC_HAND,
                 };
@@ -4192,12 +4620,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
             blocking = with(|m| {
                 let h = m.hit(x as f32 / m.k, y as f32 / m.k);
+                m.press = if let Hit::Row(id) = h { Some((x as f32 / m.k, y as f32 / m.k, id)) } else { None };
                 m.click(h, msg == WM_LBUTTONDBLCLK)
             })
             .flatten();
         }
         WM_LBUTTONUP => {
-            with(|m| m.page.press(None));
+            with(|m| {
+                m.page.press(None);
+                m.press = None;
+                // a plain click on a multi-selection that didn't become a drag
+                if let Some(id) = m.pending_select.take() {
+                    m.select_only(id);
+                    m.on_selection();
+                }
+            });
         }
         WM_RBUTTONUP => {
             with(|m| {
@@ -4229,6 +4666,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 m.close_menu();
                 m.hide_tip();
+                m.close_overlay();
                 if m.view == Page::Settings {
                     m.page.scroll_by(-delta / 120.0 * 90.0);
                 } else {
@@ -4264,6 +4702,43 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         WM_APP_VIDEO => {
             with(|m| m.on_video());
+            return LRESULT(0);
+        }
+        WM_APP_PREVIEW => {
+            with(|m| m.on_preview_loaded());
+            return LRESULT(0);
+        }
+        WM_APP_SHA => {
+            with(|m| m.on_sha());
+            return LRESULT(0);
+        }
+        WM_TIMER if wparam.0 == T_MIDNIGHT => {
+            // a new day: Today becomes Yesterday, and old finished ones may go
+            with(|m| {
+                m.auto_clear();
+                if m.view != Page::Settings {
+                    m.rebuild_list();
+                }
+                m.arm_midnight();
+            });
+            return LRESULT(0);
+        }
+        WM_TIMECHANGE => {
+            with(|m| {
+                if m.view != Page::Settings {
+                    m.rebuild_list();
+                }
+                m.arm_midnight();
+            });
+        }
+        WM_TIMER if wparam.0 == T_COPIED => {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), T_COPIED);
+            }
+            with(|m| {
+                m.copied = None;
+                m.paint_overlay();
+            });
             return LRESULT(0);
         }
         WM_TIMER if wparam.0 == T_VIEW => {
@@ -4323,4 +4798,419 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         return LRESULT(0);
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+// ---------- the list's newer tools: sorting, Quick Look, Where From, renaming ----------
+
+impl Manager {
+    /// Wake at the next local midnight, so the day groups move on.
+    fn arm_midnight(&self) {
+        let ms = crate::list_prefs::ms_to_midnight(now(), local_offset()).min(u32::MAX as u64) as u32;
+        unsafe {
+            let _ = SetTimer(Some(self.hwnd), T_MIDNIGHT, ms, None);
+        }
+    }
+
+    /// Settings > Clear finished downloads after: take old ones off the list (files stay).
+    fn auto_clear(&mut self) {
+        for id in crate::list_prefs::expired(&self.jobs, self.settings.list.auto_clear_days, now()) {
+            if self.cleared.insert(id) {
+                dl::engine().remove(id, false);
+            }
+        }
+    }
+
+    /// Whether a row's name is cut short (so its tooltip shows it whole).
+    fn name_cut(&self, id: u64) -> bool {
+        let Some(j) = self.job(id) else { return false };
+        let k = self.k;
+        let dw = &self.gfx.dwrite;
+        let mut head = 0.0;
+        if !j.state.finished() {
+            if let Some(f) = j.fraction() {
+                head += paint::advance(dw, &format!("{:.0}%", f * 100.0), 12.5 * k) / k;
+            }
+            if j.state == State::Active && j.phase.is_none() {
+                head += 10.0 + paint::advance(dw, &paint::speed(j.speed), 12.5 * k) / k;
+            }
+        }
+        let avail = (self.row_w() - 96.0 - 68.0 - head - 16.0).max(60.0);
+        paint::advance(dw, &j.name, 14.0 * k) / k > avail - 2.0
+    }
+
+    /// The finished files of these downloads that are still on disk.
+    fn files_of(&self, ids: &[u64]) -> Vec<PathBuf> {
+        ids.iter()
+            .filter_map(|id| self.job(*id))
+            .filter(|j| j.state.finished() && !self.is_missing(j))
+            .filter_map(|j| j.path.clone())
+            .filter(|p| p.exists())
+            .collect()
+    }
+
+    /// The middle of a row's icon on screen, if the row is on the list.
+    fn row_point(&self, id: u64) -> Option<(f32, f32)> {
+        let i = self.lines.iter().position(|l| matches!(l, Line::Job(j) if j.id == id))?;
+        let y = self.list_top() + self.line_y(i) - self.scroll + ROW / 2.0;
+        Some((SIDEBAR + 12.0 + 34.0, y.clamp(self.list_top(), self.h)))
+    }
+
+    /// Pressed on a finished row and pulled past the drag distance: the files to drag.
+    fn drag_paths(&mut self, x: i32, y: i32, buttons: usize) -> Option<Vec<PathBuf>> {
+        if buttons & 0x0001 == 0 {
+            self.press = None; // MK_LBUTTON is up
+            return None;
+        }
+        let (px, py, id) = self.press?;
+        let (fx, fy) = (x as f32 / self.k, y as f32 / self.k);
+        let (dx, dy) = unsafe { (GetSystemMetrics(SM_CXDRAG) as f32 / self.k, GetSystemMetrics(SM_CYDRAG) as f32 / self.k) };
+        if (fx - px).abs() < dx.max(4.0) && (fy - py).abs() < dy.max(4.0) {
+            return None;
+        }
+        self.press = None;
+        let ids = if self.picked.contains(&id) { self.sel_in_order() } else { vec![id] };
+        let files = self.files_of(&ids);
+        if files.is_empty() {
+            return None;
+        }
+        self.pending_select = None;
+        self.hide_tip();
+        Some(files)
+    }
+
+    /// F5: look again for finished files that were moved or deleted.
+    fn recheck_files(&mut self) {
+        self.missing.clear();
+        self.file_icons.retain(|p, _| p.exists());
+        self.on_snapshot(true);
+        let n = self.jobs.iter().filter(|j| j.state.finished()).count();
+        let gone = self.jobs.iter().filter(|j| j.state.finished() && self.is_missing(j)).count();
+        let note = match (n, gone) {
+            (0, _) => "No finished downloads to check".to_string(),
+            (n, 0) => format!("All {n} files are where they were"),
+            (n, g) => format!("{g} of {n} files were moved or deleted"),
+        };
+        self.show_toast(&note);
+    }
+
+    // ---------- the sort menu ----------
+
+    fn open_sort_menu(&mut self) {
+        use popup::Item;
+        self.hide_tip();
+        self.close_overlay();
+        if self.search_focus {
+            self.focus_search(false);
+        }
+        let l = self.settings.list.clone();
+        let check = |on: bool| on.then_some(icons::CHECK);
+        let mut items: Vec<Item> = crate::list_prefs::SORTS
+            .iter()
+            .map(|(by, id, label)| Item::Action { id: format!("dlw:sort:{id}"), label: label.to_string(), icon: check(l.sort == *by), keys: None, enabled: true, danger: false })
+            .collect();
+        items.push(Item::Sep);
+        items.push(Item::Action { id: "dlw:group".into(), label: "Group by Site".into(), icon: check(l.group_site), keys: None, enabled: true, danger: false });
+        let k = self.k;
+        let dw = self.gfx.dwrite.clone();
+        let model = popup::Menu::new(items, |t, size, _| paint::advance(&dw, t, size * k) / k);
+        let (sx, sy, _, _) = self.search_rect();
+        let w = model.w;
+        let mx = (sx - 8.0 - w).max(SIDEBAR + 8.0);
+        let my = sy + SORT_BTN + 6.0;
+        self.menu = Some(MenuState { model, x: mx, y: my, hover: None, ids: Vec::new() });
+        let _ = (|| -> Result<()> {
+            self.paint_menu()?;
+            let v = &self.menu_v;
+            v.SetOffset(Vector3 { X: mx * k, Y: my * k, Z: 0.0 })?;
+            v.SetCenterPoint(Vector3 { X: w * k, Y: 0.0, Z: 0.0 })?;
+            let c = &self.gfx.compositor;
+            let o = c.CreateScalarKeyFrameAnimation()?;
+            o.InsertKeyFrame(0.0, 0.0)?;
+            o.InsertKeyFrameWithEasingFunction(1.0, 1.0, &self.ease_out()?)?;
+            o.SetDuration(ms(110))?;
+            v.StartAnimation(&HSTRING::from("Opacity"), &o)?;
+            let sc = c.CreateVector3KeyFrameAnimation()?;
+            sc.InsertKeyFrame(0.0, Vector3 { X: 0.95, Y: 0.95, Z: 1.0 })?;
+            sc.InsertKeyFrameWithEasingFunction(1.0, Vector3 { X: 1.0, Y: 1.0, Z: 1.0 }, &self.ease_out()?)?;
+            sc.SetDuration(ms(170))?;
+            v.StartAnimation(&HSTRING::from("Scale"), &sc)
+        })();
+    }
+
+    // ---------- popovers over the list ----------
+
+    fn overlay_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        Some(match self.overlay.as_ref()? {
+            Overlay::Preview { x, y, w, h, .. } => (*x, *y, *w, *h),
+            Overlay::Details { d, x, y, .. } => (*x, *y, crate::details::W, d.height()),
+        })
+    }
+
+    fn overlay_hit(&self, x: f32, y: f32) -> Option<Hit> {
+        let (ox, oy, w, h) = self.overlay_rect()?;
+        let (lx, ly) = (x - ox, y - oy);
+        if !(0.0..w).contains(&lx) || !(0.0..h).contains(&ly) {
+            return Some(Hit::OverlayOff);
+        }
+        Some(match self.overlay.as_ref()? {
+            Overlay::Preview { .. } => Hit::Quick(crate::preview::hit(w, h, lx, ly)),
+            Overlay::Details { d, .. } => Hit::Info(d.hit(lx, ly)),
+        })
+    }
+
+    fn overlay_hover(&mut self, h: &Hit) {
+        let changed = match &mut self.overlay {
+            Some(Overlay::Preview { hover, .. }) => {
+                let n = if let Hit::Quick(q) = h { Some(*q) } else { None };
+                std::mem::replace(hover, n) != n
+            }
+            Some(Overlay::Details { hover, .. }) => {
+                let n = if let Hit::Info(d) = h { Some(*d) } else { None };
+                std::mem::replace(hover, n) != n
+            }
+            None => false,
+        };
+        if changed {
+            self.paint_overlay();
+        }
+    }
+
+    fn paint_overlay(&self) {
+        let off = local_offset();
+        let copied = self.copied;
+        let k = self.k;
+        let _ = match &self.overlay {
+            None => Ok(()),
+            Some(Overlay::Preview { q, x, y, w, h, hover }) => self
+                .sprite_from(&self.overlay_v, *w, *h, |p| crate::preview::paint(p, q, *w, *h, *hover, off))
+                .and_then(|_| self.overlay_v.SetOffset(Vector3 { X: (x * k).round(), Y: (y * k).round(), Z: 0.0 })),
+            Some(Overlay::Details { d, x, y, hover }) => self
+                .sprite_from(&self.overlay_v, crate::details::W, d.height(), |p| d.paint(p, *hover, copied, off))
+                .and_then(|_| self.overlay_v.SetOffset(Vector3 { X: (x * k).round(), Y: (y * k).round(), Z: 0.0 })),
+        };
+    }
+
+    /// Show a popover, growing from `from` (its trigger, in window DIPs); one already
+    /// up is swapped in place.
+    fn show_overlay(&mut self, ov: Overlay, from: (f32, f32)) {
+        self.close_menu();
+        self.hide_tip();
+        if self.search_focus {
+            self.focus_search(false);
+        }
+        let was_open = self.overlay.is_some();
+        self.overlay = Some(ov);
+        self.copied = None;
+        self.paint_overlay();
+        let Some((x, y, _, _)) = self.overlay_rect() else { return };
+        let k = self.k;
+        let v = self.overlay_v.clone();
+        let _ = (|| -> Result<()> {
+            v.SetCenterPoint(Vector3 { X: (from.0 - x) * k, Y: (from.1 - y) * k, Z: 0.0 })?;
+            let c = &self.gfx.compositor;
+            if was_open {
+                v.StopAnimation(&HSTRING::from("Opacity"))?;
+                v.StopAnimation(&HSTRING::from("Scale"))?;
+                v.SetOpacity(1.0)?;
+                return v.SetScale(Vector3 { X: 1.0, Y: 1.0, Z: 1.0 });
+            }
+            let o = c.CreateScalarKeyFrameAnimation()?;
+            o.InsertKeyFrame(0.0, 0.0)?;
+            o.InsertKeyFrameWithEasingFunction(1.0, 1.0, &self.ease_out()?)?;
+            o.SetDuration(ms(150))?;
+            v.StartAnimation(&HSTRING::from("Opacity"), &o)?;
+            let sc = c.CreateVector3KeyFrameAnimation()?;
+            sc.InsertKeyFrame(0.0, Vector3 { X: 0.92, Y: 0.92, Z: 1.0 })?;
+            sc.InsertKeyFrameWithEasingFunction(1.0, Vector3 { X: 1.0, Y: 1.0, Z: 1.0 }, &self.ease_out()?)?;
+            sc.SetDuration(ms(240))?;
+            v.StartAnimation(&HSTRING::from("Scale"), &sc)
+        })();
+    }
+
+    fn close_overlay(&mut self) {
+        if self.overlay.take().is_none() {
+            return;
+        }
+        self.copied = None;
+        let _ = (|| -> Result<()> {
+            let c = &self.gfx.compositor;
+            let o = c.CreateScalarKeyFrameAnimation()?;
+            o.InsertExpressionKeyFrame(0.0, &HSTRING::from("this.StartingValue"))?;
+            o.InsertKeyFrame(1.0, 0.0)?;
+            o.SetDuration(ms(110))?;
+            self.overlay_v.StartAnimation(&HSTRING::from("Opacity"), &o)?;
+            let sc = c.CreateVector3KeyFrameAnimation()?;
+            sc.InsertExpressionKeyFrame(0.0, &HSTRING::from("this.StartingValue"))?;
+            sc.InsertKeyFrameWithEasingFunction(1.0, Vector3 { X: 0.96, Y: 0.96, Z: 1.0 }, &self.ease_out()?)?;
+            sc.SetDuration(ms(110))?;
+            self.overlay_v.StartAnimation(&HSTRING::from("Scale"), &sc)
+        })();
+    }
+
+    /// Keys while a popover is up. True if the key was for it.
+    fn overlay_key(&mut self, vk: u16, ctrl: bool) -> bool {
+        match &self.overlay {
+            Some(Overlay::Preview { q, .. }) => {
+                if vk == VK_ESCAPE.0 || vk == VK_SPACE.0 || (ctrl && vk == b'Y' as u16) {
+                    self.close_overlay();
+                    return true;
+                }
+                if vk == VK_RETURN.0 {
+                    let id = q.id;
+                    self.close_overlay();
+                    self.open(id);
+                    return true;
+                }
+                false // the arrows move the selection, and Quick Look follows
+            }
+            Some(Overlay::Details { .. }) => {
+                self.close_overlay();
+                vk == VK_ESCAPE.0
+            }
+            None => false,
+        }
+    }
+
+    /// Quick Look for a finished download whose file is there.
+    fn open_preview(&mut self, id: u64) {
+        let Some(q) = self.new_preview(id) else { return };
+        let (w, h) = crate::preview::size(self.cw(), self.h - HEAD);
+        let x = SIDEBAR + (self.cw() - w) / 2.0;
+        let y = HEAD + ((self.h - HEAD - h) / 2.0 - 8.0).max(8.0);
+        let from = self.row_point(id).unwrap_or((x + w / 2.0, y + h / 2.0));
+        self.show_overlay(Overlay::Preview { q, x, y, w, h, hover: None }, from);
+    }
+
+    fn new_preview(&mut self, id: u64) -> Option<crate::preview::Preview> {
+        let j = self.job(id)?.clone();
+        let Some(path) = j.path.clone().filter(|p| j.state.finished() && p.exists()) else {
+            if j.state.finished() {
+                self.show_toast("The file isn\u{2019}t there any more");
+            }
+            return None;
+        };
+        let q = crate::preview::Preview::new(id, &j.name, &path, j.total);
+        q.load(|l| {
+            PREVIEW_DONE.lock().unwrap().push(l);
+            post_self(WM_APP_PREVIEW);
+        });
+        Some(q)
+    }
+
+    /// The selection moved with Quick Look up: show the new one in the same place.
+    fn follow_preview(&mut self, id: u64) {
+        let fresh = self.job(id).is_some_and(|j| j.state.finished() && j.path.as_ref().is_some_and(|p| p.exists()));
+        if !fresh {
+            self.close_overlay();
+            return;
+        }
+        if let Some(n) = self.new_preview(id) {
+            if let Some(Overlay::Preview { q, .. }) = &mut self.overlay {
+                *q = n;
+            }
+            self.paint_overlay();
+        }
+    }
+
+    fn on_preview_loaded(&mut self) {
+        let done: Vec<crate::preview::Loaded> = std::mem::take(&mut *PREVIEW_DONE.lock().unwrap());
+        let mut changed = false;
+        for l in done {
+            if let Some(Overlay::Preview { q, .. }) = &mut self.overlay {
+                changed |= q.take(l);
+            }
+        }
+        if changed {
+            self.paint_overlay();
+        }
+    }
+
+    /// Where From: the popover under the row (above it near the window's foot).
+    fn open_details(&mut self, id: u64) {
+        let Some(j) = self.job(id).cloned() else { return };
+        let sha = j.path.as_ref().and_then(|p| self.shas.get(p).cloned()).unwrap_or(crate::details::Sha::Idle);
+        let d = crate::details::Details::new(&j, sha);
+        let h = d.height();
+        let w = crate::details::W;
+        let (px, py) = self.row_point(id).unwrap_or((SIDEBAR + self.cw() / 2.0, self.h / 2.0));
+        let x = (SIDEBAR + 12.0 + 56.0).clamp(SIDEBAR + 8.0, (self.w - w - 8.0).max(SIDEBAR + 8.0));
+        let below = py + ROW / 2.0 - 2.0;
+        let y = if below + h + 8.0 < self.h { below } else { (py - ROW / 2.0 + 2.0 - h).max(8.0) };
+        self.show_overlay(Overlay::Details { d, x, y, hover: None }, (px, py));
+    }
+
+    fn overlay_click_quick(&mut self, h: crate::preview::QHit) {
+        let Some(Overlay::Preview { q, .. }) = &self.overlay else { return };
+        let id = q.id;
+        match h {
+            crate::preview::QHit::Open => {
+                self.close_overlay();
+                self.open(id);
+            }
+            crate::preview::QHit::Reveal => {
+                self.close_overlay();
+                command(&format!("dl:reveal:{id}"));
+            }
+            crate::preview::QHit::Card => {}
+        }
+    }
+
+    fn overlay_click_info(&mut self, h: crate::details::DHit) {
+        let Some(Overlay::Details { d, .. }) = &mut self.overlay else { return };
+        match h {
+            crate::details::DHit::Copy(key) => {
+                if let Some(v) = d.value(key) {
+                    shell::set_clipboard_text(&v);
+                    self.copied = Some(key);
+                    unsafe {
+                        let _ = SetTimer(Some(self.hwnd), T_COPIED, 1400, None);
+                    }
+                }
+            }
+            crate::details::DHit::Sha => {
+                let Some(path) = d.path.clone() else { return };
+                d.sha = crate::details::Sha::Working;
+                self.shas.insert(path.clone(), crate::details::Sha::Working);
+                let _ = std::thread::Builder::new().name("stash-sha256".into()).spawn(move || {
+                    let r = crate::file_ops::sha256(&path).map_err(|e| e.to_string());
+                    SHA_DONE.lock().unwrap().push((path, r));
+                    post_self(WM_APP_SHA);
+                });
+            }
+            crate::details::DHit::Card => return,
+        }
+        self.paint_overlay();
+    }
+
+    fn on_sha(&mut self) {
+        let done: Vec<(PathBuf, std::result::Result<String, String>)> = std::mem::take(&mut *SHA_DONE.lock().unwrap());
+        for (path, r) in done {
+            let sha = match r {
+                Ok(h) => crate::details::Sha::Done(h),
+                Err(_) => crate::details::Sha::Failed("Couldn\u{2019}t read the file.".into()),
+            };
+            if let Some(Overlay::Details { d, .. }) = &mut self.overlay {
+                if d.path.as_ref() == Some(&path) {
+                    d.sha = sha.clone();
+                }
+            }
+            self.shas.insert(path, sha);
+        }
+        self.paint_overlay();
+    }
+
+    /// Rename a finished download's file (in its folder), in a small sheet.
+    fn open_rename(&mut self, id: u64) {
+        let Some(j) = self.job(id).cloned() else { return };
+        let Some(path) = j.path.clone().filter(|p| j.state == State::Done && j.kind == Kind::Http && p.exists()) else { return };
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut field = Field::default();
+        field.set(&name);
+        // the caret before the extension, as Explorer selects only the name
+        if let Some(dot) = name.rfind('.').filter(|d| *d > 0) {
+            field.caret = name[..dot].chars().count();
+        }
+        self.close_overlay();
+        self.open_sheet(SheetKind::Rename { id, path, field, error: None });
+    }
 }

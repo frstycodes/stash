@@ -1,16 +1,21 @@
 #![windows_subsystem = "windows"]
 
 mod blur;
+mod details;
 mod dl;
 mod droptarget;
+mod file_ops;
 mod files;
 mod gfx;
 mod icons;
 mod ipc;
+mod linkdrop;
+mod list_prefs;
 mod manager;
 mod menu;
 mod paint;
 mod popup;
+mod preview;
 mod search;
 mod settings;
 mod settings_page;

@@ -94,6 +94,9 @@ pub struct Settings {
     pub downloads: DlSettings,
     /// Download new versions in the background (GitHub builds; the Store updates its own).
     pub auto_update: bool,
+    /// The downloads list: its sort, grouping and auto-clear.
+    #[serde(default)]
+    pub list: crate::list_prefs::ListSettings,
 }
 
 /// The download manager's settings.
@@ -158,6 +161,7 @@ impl Default for Settings {
             current: None,
             downloads: DlSettings::default(),
             auto_update: true,
+            list: Default::default(),
         }
     }
 }
