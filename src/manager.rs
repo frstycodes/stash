@@ -136,6 +136,8 @@ enum Hit {
     Cancel,
     Ok,
     AlsoDelete,
+    /// The Choose Files sheet (see torrent_sheet).
+    Files(crate::torrent_sheet::FHit),
 }
 
 /// A single-line text field: the search box and the New Download link field.
@@ -279,6 +281,8 @@ enum SheetKind {
     /// `permanent`: Shift+Delete, which deletes the files for good after asking.
     /// `cancel`: stopping several unfinished downloads (their partial files go too).
     Remove { ids: Vec<u64>, name: String, path: String, delete: bool, permanent: bool, cancel: bool },
+    /// Which of a torrent's files to download.
+    Files(crate::torrent_sheet::FilesSheet),
 }
 
 /// The right-click menu while it's open: for `ids` (the selection), at (x, y) in DIPs.
@@ -552,6 +556,22 @@ fn update_card() -> Option<(String, String, bool)> {
         crate::update::Status::Downloading(v) => Some(("Updating".into(), format!("Downloading Stash {v}…"), false)),
         crate::update::Status::Ready { version, .. } => Some(("Update ready".into(), format!("Stash {version} is downloaded."), true)),
         _ => None,
+    }
+}
+
+/// A torrent is waiting for its files to be chosen: bring up the window and ask.
+/// (Not over another sheet: it asks again with the next news.)
+pub fn ask_files(gfx: &Gfx, settings: &Settings, id: u64) {
+    show(gfx, settings, None);
+    let shown = with(|m| {
+        if m.sheet.is_some() {
+            return false;
+        }
+        m.on_snapshot(false);
+        m.open_files(id, true)
+    });
+    if shown != Some(true) {
+        crate::torrent_sheet::unask(id);
     }
 }
 
@@ -2427,6 +2447,13 @@ impl Manager {
                 }
                 let _ = self.paint_sheet();
             }
+            Hit::Files(h) => {
+                if let Some(Sheet { kind: SheetKind::Files(f), .. }) = &mut self.sheet {
+                    if f.click(h) {
+                        let _ = self.paint_sheet();
+                    }
+                }
+            }
             Hit::AlsoDelete => {
                 if let Some(Sheet { kind: SheetKind::Remove { delete, .. }, .. }) = &mut self.sheet {
                     *delete = !*delete;
@@ -2497,6 +2524,12 @@ impl Manager {
                 self.show_toast(&note);
             }
             "remove" => self.ask_remove(ids.to_vec()),
+            "files" => {
+                if let Some(id) = ids.first().copied() {
+                    let first = self.job(id).is_some_and(|j| j.choose_files);
+                    self.open_files(id, first);
+                }
+            }
             "pause" => {
                 for id in ids {
                     if self.job(*id).is_some_and(|j| matches!(j.state, State::Active | State::Queued | State::Seeding)) {
@@ -2616,6 +2649,10 @@ impl Manager {
                 items.push(action("now", "Start Now".into(), None, j.state == State::Queued));
                 items.push(Item::Priority(Some(j.priority)));
                 items.push(Item::Sep);
+            }
+            if j.kind == Kind::Torrent {
+                let many = dl::torrent_files(j.id).is_some_and(|l| l.files.len() > 1);
+                items.push(action("files", "Choose Files\u{2026}".into(), None, many));
             }
             let copy = if j.source.starts_with("magnet:") { "Copy Magnet Link" } else { "Copy Download Link" };
             items.push(action("copy", copy.into(), Some("Ctrl+C"), true));
@@ -3067,7 +3104,15 @@ impl Manager {
             // no switch to show when it's a permanent delete
             SheetKind::Remove { permanent: true, .. } | SheetKind::Remove { cancel: true, .. } => (420.0, REMOVE_H - 46.0),
             SheetKind::Remove { .. } => (420.0, REMOVE_H),
+            SheetKind::Files(f) => (crate::torrent_sheet::W, f.height()),
         }
+    }
+
+    /// Open the Choose Files sheet for a torrent; false if its files aren't known yet.
+    fn open_files(&mut self, id: u64, first: bool) -> bool {
+        let Some(f) = crate::torrent_sheet::FilesSheet::new(id, first) else { return false };
+        self.open_sheet(SheetKind::Files(f));
+        true
     }
 
     fn sheet_origin(&self, kind: &SheetKind) -> (f32, f32) {
@@ -3206,6 +3251,15 @@ impl Manager {
                 if inside(w - 22.0 - ok_w - 10.0 - 92.0, h - 22.0 - bh, 92.0, bh) {
                     return Hit::Cancel;
                 }
+            }
+            SheetKind::Files(f) => {
+                use crate::torrent_sheet::FHit;
+                return match f.hit(x, y) {
+                    Some(FHit::Ok) => Hit::Ok,
+                    Some(FHit::Cancel) => Hit::Cancel,
+                    Some(h) => Hit::Files(h),
+                    None => Hit::Sheet,
+                };
             }
         }
         Hit::Sheet
@@ -3392,6 +3446,22 @@ impl Manager {
                     settings_page::place_switch(&self.gfx, track, knob, r, delete, true, k, flip)?;
                 }
             }
+            SheetKind::Files(f) => {
+                use crate::torrent_sheet::FHit;
+                let fh = match hover {
+                    Hit::Files(h) => Some(h),
+                    Hit::Ok => Some(FHit::Ok),
+                    Hit::Cancel => Some(FHit::Cancel),
+                    _ => None,
+                };
+                let (w, h) = (crate::torrent_sheet::W, f.height());
+                let surface = self.gfx.surface(w * k, h * k, |dc| unsafe {
+                    dc.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                    f.paint(&P { dc, dw: &dw, k }, fh);
+                })?;
+                set_surface(&self.gfx, &card, &surface, w * k, h * k)?;
+                caret_v.SetIsVisible(false)?;
+            }
         }
         Ok(())
     }
@@ -3467,6 +3537,13 @@ impl Manager {
                     (_, false) => format!("Removed {n} downloads from the list"),
                 };
                 self.show_toast(&note);
+            }
+            SheetKind::Files(f) => {
+                if !f.can_submit() {
+                    return;
+                }
+                dl::engine().choose_files(f.id, f.chosen());
+                self.close_sheet();
             }
         }
     }
@@ -3968,6 +4045,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_MOUSEWHEEL => {
             let delta = (wparam.0 >> 16) as u16 as i16 as f32;
             with(|m| {
+                if let Some(Sheet { kind: SheetKind::Files(f), .. }) = &mut m.sheet {
+                    if f.scroll_by(if delta > 0.0 { -3 } else { 3 }) {
+                        let _ = m.paint_sheet();
+                    }
+                    return;
+                }
                 if m.sheet.is_some() {
                     return;
                 }

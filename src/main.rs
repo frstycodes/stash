@@ -17,6 +17,7 @@ mod settings_page;
 mod shell;
 mod stash;
 mod thumbs;
+mod torrent_sheet;
 mod ui;
 mod update;
 

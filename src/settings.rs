@@ -113,11 +113,14 @@ pub struct DlSettings {
     pub bits: bool,
     /// Sizes in binary units (MiB, 1024) instead of decimal (MB, 1000).
     pub binary: bool,
+    /// Torrent settings: upload limit, seed limits, UPnP, choosing files.
+    #[serde(default)]
+    pub torrents: crate::dl::TorrentOptions,
 }
 
 impl Default for DlSettings {
     fn default() -> Self {
-        Self { max_active: 3, connections: 8, limit_kbps: 0, seed: false, folder: None, window: None, bits: false, binary: false }
+        Self { max_active: 3, connections: 8, limit_kbps: 0, seed: false, folder: None, window: None, bits: false, binary: false, torrents: Default::default() }
     }
 }
 

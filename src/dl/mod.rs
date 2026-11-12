@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use limiter::Limiter;
+pub use torrent::{file_list as torrent_files, FileEntry, Options as TorrentOptions};
 
 /// Progress is pushed to the UI this often while something is downloading.
 const TICK: Duration = Duration::from_millis(500);
@@ -104,6 +105,8 @@ pub struct JobView {
     pub referrer: Option<String>,
     /// The link carries an expiry that has passed (signed links), so it can't be fetched again.
     pub expired: bool,
+    /// A torrent waiting for the user to choose which of its files to download.
+    pub choose_files: bool,
 }
 
 impl JobView {
@@ -188,6 +191,9 @@ enum Cmd {
     ClearFinished,
     Configure(Config),
     Shutdown(std::sync::mpsc::Sender<()>),
+    /// A torrent's files to download (indices; all of them = no filter).
+    ChooseFiles(u64, Vec<usize>),
+    ConfigureTorrents(TorrentOptions),
 }
 
 /// Messages from running downloads back to the engine.
@@ -198,6 +204,10 @@ pub(crate) enum Ev {
     TorrentMeta { id: u64, name: String, total: u64, info_hash: String, torrent_file: PathBuf, path: PathBuf },
     TorrentAdded { id: u64, handle: Arc<librqbit::ManagedTorrent> },
     Failed { id: u64, error: String },
+    /// The BitTorrent session is up, with the torrents it had last time.
+    SessionStarted,
+    /// A torrent's metadata is in: which files? (None = all)
+    TorrentFiles { id: u64, reply: tokio::sync::oneshot::Sender<Option<Vec<usize>>> },
 }
 
 pub fn is_source(s: &str) -> bool {
@@ -292,6 +302,18 @@ struct Job {
     connections: usize,
     #[serde(skip)]
     last_done: u64,
+    // Torrent: the files chosen (None = all), whether that question is still open, and
+    // what's been uploaded and for how long it has seeded (for the seed limits).
+    #[serde(default)]
+    only_files: Option<Vec<usize>>,
+    #[serde(default)]
+    choosing: bool,
+    #[serde(default)]
+    uploaded: u64,
+    #[serde(default)]
+    seeded_secs: u64,
+    #[serde(skip)]
+    last_uploaded: u64,
 }
 
 impl Job {
@@ -323,6 +345,7 @@ impl Job {
             finished_at: self.finished_at,
             referrer: self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("referer")).map(|(_, v)| v.clone()),
             expired: link_expired(&self.source),
+            choose_files: self.choosing && self.state == State::Active,
         }
     }
 }
@@ -403,6 +426,18 @@ impl Engine {
         self.send(Cmd::Configure(c));
     }
 
+    /// The torrent settings. Also call before the first torrent starts (they're read
+    /// when the BitTorrent session starts).
+    pub fn configure_torrents(&self, o: TorrentOptions) {
+        torrent::set_options(o);
+        self.send(Cmd::ConfigureTorrents(o));
+    }
+
+    /// Download only these files of a torrent (indices from `torrent_files`).
+    pub fn choose_files(&self, id: u64, files: Vec<usize>) {
+        self.send(Cmd::ChooseFiles(id, files));
+    }
+
     /// Save progress and stop every download (on quit). Waits up to a second.
     pub fn shutdown(&self) {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -434,6 +469,8 @@ struct Actor {
     dirty: bool,
     last_save: Instant,
     last_tick: Instant,
+    /// Torrents waiting for the user to choose their files.
+    choosing: HashMap<u64, tokio::sync::oneshot::Sender<Option<Vec<usize>>>>,
 }
 
 impl Actor {
@@ -445,8 +482,12 @@ impl Actor {
             if j.state == State::Active {
                 j.state = State::Queued;
             }
-            if j.state == State::Seeding {
+            // (seeding carries on after a restart, while seeding is on)
+            if j.state == State::Seeding && !config.seed {
                 j.state = State::Done;
+            }
+            if j.kind == Kind::Torrent {
+                torrent::remember(j.id, j.torrent_file.clone(), j.only_files.clone());
             }
         }
         let next_id = jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
@@ -475,11 +516,15 @@ impl Actor {
             dirty: false,
             last_save: Instant::now(),
             last_tick: Instant::now(),
+            choosing: HashMap::new(),
         }
     }
 
     async fn run(mut self, mut rx: UnboundedReceiver<Cmd>) {
         let mut ev_rx = self.ev_rx.take().unwrap();
+        if self.jobs.iter().any(|j| j.state == State::Seeding) {
+            tokio::spawn(torrent::start_session(self.session.clone(), self.config.limit_bps, self.ev_tx.clone()));
+        }
         self.schedule();
         self.publish();
         let mut tick = tokio::time::interval(TICK);
@@ -595,6 +640,12 @@ impl Actor {
                 self.config = c;
             }
             Cmd::Shutdown(_) => {}
+            Cmd::ChooseFiles(id, chosen) => self.choose_files(id, chosen).await,
+            Cmd::ConfigureTorrents(o) => {
+                if let Some(s) = self.session.get() {
+                    torrent::set_upload_limit(&s, o.upload_kbps * 1024);
+                }
+            }
         }
     }
 
@@ -641,6 +692,11 @@ impl Actor {
             phase: None,
             connections: 0,
             last_done: 0,
+            only_files: None,
+            choosing: false,
+            uploaded: 0,
+            seeded_secs: 0,
+            last_uploaded: 0,
         };
         self.next_id += 1;
         self.next_order += 1;
@@ -726,6 +782,9 @@ impl Actor {
                     session: self.session.clone(),
                     client,
                     events,
+                    headers: job.headers.clone(),
+                    only_files: job.only_files.clone(),
+                    ask_files: torrent::options().choose_files && (job.torrent_file.is_none() || job.choosing),
                 };
                 let handle = tokio::spawn(task.run());
                 self.running.insert(id, Running { task: handle, http: None });
@@ -735,6 +794,8 @@ impl Actor {
 
     async fn pause(&mut self, id: u64) {
         self.persist_progress();
+        // a file question still open: the torrent asks again when it's resumed
+        self.choosing.remove(&id);
         if let Some(r) = self.running.remove(&id) {
             if r.http.is_some() {
                 r.task.abort();
@@ -759,6 +820,8 @@ impl Actor {
             r.task.abort();
         }
         let handle = self.torrents.remove(&id);
+        self.choosing.remove(&id);
+        torrent::forget(id);
         let Some(pos) = self.jobs.iter().position(|j| j.id == id) else { return };
         let job = self.jobs.remove(pos);
         if let (Some(h), Some(s)) = (handle, self.session.get()) {
@@ -830,6 +893,7 @@ impl Actor {
             }
             Ev::TorrentMeta { id, name, total, info_hash, torrent_file, path } => {
                 if let Some(j) = self.job(id) {
+                    torrent::remember(id, Some(torrent_file.clone()), j.only_files.clone());
                     j.name = name;
                     j.total = Some(total);
                     j.info_hash = Some(info_hash);
@@ -839,7 +903,7 @@ impl Actor {
                 }
             }
             Ev::TorrentAdded { id, handle } => {
-                let still_wanted = self.jobs.iter().any(|j| j.id == id && j.state == State::Active);
+                let still_wanted = self.jobs.iter().any(|j| j.id == id && matches!(j.state, State::Active | State::Seeding));
                 if still_wanted {
                     self.torrents.insert(id, handle);
                 } else if let Some(s) = self.session.get() {
@@ -856,13 +920,21 @@ impl Actor {
                 self.persist_progress();
                 self.running.remove(&id);
                 if let Some(j) = self.job(id) {
-                    if j.state == State::Active {
+                    if matches!(j.state, State::Active | State::Seeding) {
                         j.state = State::Failed;
                         j.error = Some(error);
                         j.speed = 0;
                         j.phase = None;
                         j.connections = 0;
                     }
+                }
+            }
+            Ev::SessionStarted => self.adopt_session_torrents().await,
+            Ev::TorrentFiles { id, reply } => {
+                if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id && j.state == State::Active) {
+                    j.choosing = true;
+                    j.phase = Some("Choose files\u{2026}");
+                    self.choosing.insert(id, reply);
                 }
             }
         }
@@ -872,6 +944,7 @@ impl Actor {
         let dt = self.last_tick.elapsed().as_secs_f64().max(0.05);
         self.last_tick = Instant::now();
         let seed = self.config.seed;
+        let opts = torrent::options();
         let mut stop_seeding = Vec::new();
         let mut failed = Vec::new();
         for j in &mut self.jobs {
@@ -914,6 +987,18 @@ impl Actor {
                         S::Live if j.done == 0 && st.live.as_ref().is_some_and(|l| l.snapshot.peer_stats.live == 0) => Some("Finding peers…"),
                         _ => None,
                     };
+                    torrent::add_uploaded(&mut j.uploaded, &mut j.last_uploaded, st.uploaded_bytes);
+                    if j.state == State::Seeding {
+                        j.seeded_secs += dt.round() as u64;
+                        if torrent::seed_limit_reached(j.uploaded, j.total.unwrap_or(0), j.seeded_secs, &opts) {
+                            j.state = State::Done;
+                            j.up_speed = 0;
+                            j.peers = None;
+                            stop_seeding.push(j.id);
+                            self.dirty = true;
+                            continue;
+                        }
+                    }
                     if let Some(live) = &st.live {
                         j.speed = live.download_speed.as_bytes();
                         j.up_speed = live.upload_speed.as_bytes();
@@ -923,7 +1008,7 @@ impl Actor {
                         j.finished_at = Some(now());
                         j.speed = 0;
                         j.phase = None;
-                        if seed {
+                        if seed && !torrent::seed_limit_reached(j.uploaded, j.total.unwrap_or(0), 0, &opts) {
                             j.state = State::Seeding;
                         } else {
                             j.state = State::Done;
@@ -950,6 +1035,94 @@ impl Actor {
             }
         }
         self.dirty |= self.jobs.iter().any(|j| j.state == State::Active);
+    }
+
+    /// The user chose a torrent's files: answer the open question, or change a running
+    /// (or finished) torrent's choice. Wanting more of a finished one downloads again.
+    async fn choose_files(&mut self, id: u64, chosen: Vec<usize>) {
+        let Some(list) = torrent::file_list(id) else { return };
+        let only = torrent::only_files(&chosen, &list.files);
+        torrent::remember(id, None, only.clone());
+        if let Some(reply) = self.choosing.remove(&id) {
+            let _ = reply.send(only.clone());
+        }
+        let handle = self.torrents.get(&id).cloned();
+        let Some(j) = self.job(id) else { return };
+        let grew = torrent::selection_grew(j.only_files.as_deref(), only.as_deref());
+        j.only_files = only.clone();
+        if j.choosing {
+            j.choosing = false;
+            j.phase = Some("Checking files\u{2026}");
+        }
+        if grew && j.state.finished() {
+            j.state = State::Queued;
+            j.finished_at = None;
+        }
+        if let (Some(h), Some(s)) = (handle, self.session.get()) {
+            let all: std::collections::HashSet<usize> = match &only {
+                Some(o) => o.iter().copied().collect(),
+                None => list.files.iter().map(|f| f.index).collect(),
+            };
+            let _ = s.update_only_files(&h, &all).await;
+        }
+    }
+
+    /// The session brought back the torrents it had last time: match them to downloads.
+    /// Ones nobody has any more go (their files stay); ones that were seeding carry on;
+    /// the rest wait, paused, until their download starts.
+    async fn adopt_session_torrents(&mut self) {
+        let Some(s) = self.session.get() else { return };
+        let managed: Vec<Arc<librqbit::ManagedTorrent>> = s.with_torrents(|it| it.map(|(_, h)| h.clone()).collect());
+        let mut seeding_without = Vec::new();
+        for h in managed {
+            let hash = h.info_hash().as_string();
+            let Some(j) = self.jobs.iter().find(|j| j.info_hash.as_deref() == Some(hash.as_str())) else {
+                let _ = s.delete(librqbit::api::TorrentIdOrHash::Id(h.id()), false).await;
+                continue;
+            };
+            let (id, state) = (j.id, j.state);
+            if self.torrents.contains_key(&id) {
+                continue;
+            }
+            match state {
+                // its own task is adding it: that finds this one
+                State::Active => {}
+                State::Seeding => {
+                    if h.is_paused() {
+                        let _ = s.unpause(&h).await;
+                    }
+                    self.torrents.insert(id, h);
+                }
+                _ => {
+                    if !h.is_paused() {
+                        let _ = s.pause(&h).await;
+                    }
+                    self.torrents.insert(id, h);
+                }
+            }
+        }
+        // seeding ones the session didn't have (from before it kept a record): add them
+        for j in self.jobs.iter().filter(|j| j.state == State::Seeding && !self.torrents.contains_key(&j.id)) {
+            if let Some(f) = j.torrent_file.clone().filter(|f| f.exists()) {
+                seeding_without.push((j.id, j.source.clone(), j.dir.clone(), f, j.only_files.clone()));
+            }
+        }
+        for (id, source, dir, file, only) in seeding_without {
+            let task = torrent::Task {
+                id,
+                source,
+                dir,
+                torrent_file: Some(file),
+                limit_bps: self.config.limit_bps,
+                session: self.session.clone(),
+                client: self.client.clone(),
+                events: self.ev_tx.clone(),
+                headers: Vec::new(),
+                only_files: only,
+                ask_files: false,
+            };
+            tokio::spawn(task.run());
+        }
     }
 
     fn publish(&mut self) {

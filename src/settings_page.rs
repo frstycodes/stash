@@ -250,6 +250,10 @@ pub fn place_switch(gfx: &Gfx, track: &SpriteVisual, knob: &SpriteVisual, r: Rec
     knob.StartAnimation(&HSTRING::from("Offset"), &a)
 }
 
+/// Settings > Torrents: the seed ratio and seeding time presets (0 = never stop).
+const TORRENT_RATIOS: [f32; 4] = [0.0, 1.0, 2.0, 5.0];
+const TORRENT_MINUTES: [u64; 4] = [0, 30, 120, 1440];
+
 fn ms(v: i64) -> TimeSpan {
     TimeSpan { Duration: v * 10_000 }
 }
@@ -445,6 +449,41 @@ impl SettingsPage {
                     "torrent magnet default associate handler",
                     Ctl::Switch { id: "magnets", on: v.magnets, enabled: !v.packaged },
                 ),
+            ],
+            foot: None,
+        });
+
+        // torrents: their upload, when seeding stops, and how they reach peers
+        let t = &d.torrents;
+        let up_units = ((t.upload_kbps as f64 * 1024.0) / per_unit).round() as u64;
+        let (sel, custom) = pick(&[0, 1, 5], up_units, "t-up");
+        let up = Ctl::Seg {
+            id: "t-up",
+            opts: with_custom(&[0, 1, 5], &|p| if p == 0 { "None".to_string() } else { format!("{p} {unit}") }),
+            sel,
+            custom: custom.then_some((up_units.max(1), unit)),
+        };
+        let ratio = TORRENT_RATIOS.iter().position(|r| (*r - t.seed_ratio).abs() < 0.01);
+        let minutes = TORRENT_MINUTES.iter().position(|m| *m == t.seed_minutes);
+        sections.push(Section {
+            title: "Torrents",
+            keys: "torrent bittorrent magnet",
+            rows: vec![
+                Row::new("Upload limit", Some("How fast torrents share back. Separate from the speed limit."), "upload seed bandwidth throttle cap rate", up),
+                Row::new("Stop seeding at ratio", Some("Once you've shared this many times what you downloaded."), "seed ratio share upload stop", Ctl::Seg {
+                    id: "t-ratio",
+                    opts: vec!["Never".into(), "1.0".into(), "2.0".into(), "5.0".into()],
+                    sel: ratio,
+                    custom: None,
+                }),
+                Row::new("Stop seeding after", Some("However much has been shared by then."), "seed time minutes hours stop", Ctl::Seg {
+                    id: "t-minutes",
+                    opts: vec!["Never".into(), "30 min".into(), "2 hours".into(), "1 day".into()],
+                    sel: minutes,
+                    custom: None,
+                }),
+                Row::new("Choose files before downloading", Some("When a torrent has more than one file."), "select files pick only torrent", Ctl::Switch { id: "t-choose", on: t.choose_files, enabled: true }),
+                Row::new("Forward the port on your router", Some("UPnP lets more peers reach you. Applies the next time torrents start."), "upnp port forwarding router nat firewall", Ctl::Switch { id: "t-upnp", on: t.upnp, enabled: true }),
             ],
             foot: None,
         });
@@ -933,6 +972,9 @@ impl SettingsPage {
                     "sort" => cmd(format!("sort:{}", ["added", "modified", "name", "kind"][*i])),
                     "count" => cmd(format!("limit:{}", val?)),
                     "size" => cmd(format!("size:{}", ["small", "medium", "large", "extra-large"][*i])),
+                    "t-up" => cmd(format!("dls:t-up:{}", to_kbps(val.unwrap_or(0)))),
+                    "t-ratio" => cmd(format!("dls:t-ratio:{}", TORRENT_RATIOS[(*i).min(3)])),
+                    "t-minutes" => cmd(format!("dls:t-minutes:{}", TORRENT_MINUTES[(*i).min(3)])),
                     _ => None,
                 }
             }
@@ -941,6 +983,10 @@ impl SettingsPage {
                 match *id {
                     "max" => cmd(format!("dls:max:{}", step(d.max_active as u64, up).min(50))),
                     "conn" => cmd(format!("dls:conn:{}", step(d.connections as u64, up).min(32))),
+                    "t-up" => {
+                        let units = ((d.torrents.upload_kbps as f64 * 1024.0) / per_unit).round() as u64;
+                        cmd(format!("dls:t-up:{}", to_kbps(step(units.max(1), up))))
+                    }
                     "limit" => {
                         let units = ((d.limit_kbps as f64 * 1024.0) / per_unit).round() as u64;
                         cmd(format!("dls:limit:{}", to_kbps(step(units.max(1), up))))
@@ -951,6 +997,8 @@ impl SettingsPage {
             Hit::Switch(id) => match *id {
                 "seed" => cmd("dls:seed".into()),
                 "magnets" => cmd("dls:magnets".into()),
+                "t-choose" => cmd("dls:t-choose".into()),
+                "t-upnp" => cmd("dls:t-upnp".into()),
                 "login" => cmd("login".into()),
                 "show-stack" => cmd("show-stack:flip".into()),
                 "arrivals" => cmd("arrivals:flip".into()),

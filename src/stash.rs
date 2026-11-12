@@ -576,6 +576,7 @@ impl Stash {
         // The download engine: its own thread; it pokes us when there's news.
         let dl_config = with(|s| s.settings.downloads.config()).unwrap_or_default();
         dl::init(dl_config, || post(WM_APP_DL));
+        dl::engine().configure_torrents(with(|s| s.settings.downloads.torrents).unwrap_or_default());
         // updates for the GitHub builds: checked daily, downloaded in the background
         crate::update::set_auto(with(|s| s.settings.auto_update).unwrap_or(true));
         crate::update::start(|| post(WM_APP_UPDATE));
@@ -996,6 +997,10 @@ impl Stash {
         let Some(engine) = dl::engine_opt() else { return };
         let snap = engine.snapshot();
         manager::refresh();
+        // a torrent waiting to be told which files to download
+        for id in crate::torrent_sheet::take_new_questions(&snap.jobs) {
+            manager::ask_files(&self.gfx, &self.settings, id);
+        }
         let mut inflight: Vec<JobView> = snap.jobs.iter().filter(|j| !j.state.finished()).cloned().collect();
         inflight.sort_by(|a, b| (b.state == DlState::Active).cmp(&(a.state == DlState::Active)).then(b.added.cmp(&a.added)).then(b.id.cmp(&a.id)));
         let mut elsewhere = false;
@@ -1238,6 +1243,7 @@ impl Stash {
             "magnets" => shell::set_handles_magnets(!shell::handles_magnets()),
             "bits" => d.bits = value == "1",
             "binary" => d.binary = value == "1",
+            k if d.torrents.apply(k, value) => {}
             "browser" => {
                 let local = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join("browser"))).filter(|p| p.is_dir());
                 match local {
@@ -1249,6 +1255,7 @@ impl Stash {
         }
         self.save_settings();
         dl::engine().configure(self.settings.downloads.config());
+        dl::engine().configure_torrents(self.settings.downloads.torrents);
         crate::paint::set_units(self.settings.downloads.bits, self.settings.downloads.binary);
         manager::set_settings(&self.settings);
         None
