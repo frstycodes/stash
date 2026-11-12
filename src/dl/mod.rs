@@ -162,6 +162,12 @@ pub fn engine_opt() -> Option<&'static Engine> {
     ENGINE.get()
 }
 
+/// A file name from outside (a browser, a torrent) made safe to save under; None if
+/// nothing usable is left.
+pub fn safe_name(name: &str) -> Option<String> {
+    Some(http::sanitize(name)).filter(|n| !n.is_empty())
+}
+
 pub fn engine() -> &'static Engine {
     ENGINE.get().expect("download engine not started")
 }
@@ -287,6 +293,11 @@ struct Job {
 }
 
 impl Job {
+    /// A browser's cookies are only for getting this download; once it's done they go.
+    fn forget_cookies(&mut self) {
+        self.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("cookie") && !k.eq_ignore_ascii_case("authorization"));
+    }
+
     fn view(&self) -> JobView {
         JobView {
             id: self.id,
@@ -761,7 +772,10 @@ impl Actor {
         // a finished download's file (or a torrent's folder) goes to the Recycle Bin,
         // unless the user asked for it to go for good (Shift+Delete, after a confirmation)
         if delete_files {
-            if let Some(p) = job.path.as_ref().filter(|p| p.exists()) {
+            // never the folder it was saved into (or anything outside it): a torrent named
+            // "." or ".." must not take the Downloads folder with it
+            let inside = |p: &&PathBuf| p.parent().is_some_and(|d| d.starts_with(&job.dir)) && p.file_name().is_some();
+            if let Some(p) = job.path.as_ref().filter(|p| p.exists()).filter(inside) {
                 if permanent { crate::shell::delete_permanently(p) } else { crate::shell::recycle(p) }
             }
         }
@@ -809,6 +823,7 @@ impl Actor {
                     j.speed = 0;
                     j.connections = 0;
                     j.finished_at = Some(now());
+                    j.forget_cookies();
                 }
             }
             Ev::TorrentMeta { id, name, total, info_hash, torrent_file, path } => {
@@ -856,6 +871,7 @@ impl Actor {
         self.last_tick = Instant::now();
         let seed = self.config.seed;
         let mut stop_seeding = Vec::new();
+        let mut failed = Vec::new();
         for j in &mut self.jobs {
             if !matches!(j.state, State::Active | State::Seeding) {
                 continue;
@@ -880,6 +896,14 @@ impl Actor {
                     if let Some(e) = st.error.clone() {
                         j.state = State::Failed;
                         j.error = Some(e);
+                        j.speed = 0;
+                        j.phase = None;
+                        // let go of it, so Resume or Retry can start it afresh
+                        if let Some(r) = self.running.remove(&j.id) {
+                            r.task.abort();
+                        }
+                        failed.push(j.id);
+                        self.dirty = true;
                         continue;
                     }
                     use librqbit::TorrentStatsState as S;
@@ -912,6 +936,11 @@ impl Actor {
             }
         }
         if let Some(s) = self.session.get() {
+            for id in failed {
+                if let Some(h) = self.torrents.remove(&id) {
+                    let _ = s.delete(librqbit::api::TorrentIdOrHash::Id(h.id()), false).await;
+                }
+            }
             for id in stop_seeding {
                 if let Some(h) = self.torrents.get(&id) {
                     let _ = s.pause(h).await;
@@ -972,10 +1001,8 @@ pub fn link_expired(url: &str) -> bool {
 
 /// "20260101T120000Z"
 fn parse_amz_date(s: &str) -> Option<u64> {
-    if s.len() < 15 {
-        return None;
-    }
-    let iso = format!("{}-{}-{}T{}:{}:{}Z", &s[0..4], &s[4..6], &s[6..8], &s[9..11], &s[11..13], &s[13..15]);
+    // (it comes from the link, so it may be anything: never slice blindly)
+    let iso = format!("{}-{}-{}T{}:{}:{}Z", s.get(0..4)?, s.get(4..6)?, s.get(6..8)?, s.get(9..11)?, s.get(11..13)?, s.get(13..15)?);
     parse_iso_date(&iso)
 }
 
@@ -1016,7 +1043,22 @@ fn store() -> PathBuf {
 }
 
 fn load() -> Vec<Job> {
-    std::fs::read_to_string(store()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    let f = store();
+    let Ok(text) = std::fs::read_to_string(&f) else { return Vec::new() };
+    match serde_json::from_str::<Vec<Job>>(&text) {
+        Ok(mut jobs) => {
+            // browser cookies are only kept while a download still needs them
+            for j in jobs.iter_mut().filter(|j| j.state.finished()) {
+                j.forget_cookies();
+            }
+            jobs
+        }
+        Err(_) => {
+            // unreadable: keep it aside rather than letting the next save overwrite it
+            let _ = std::fs::rename(&f, f.with_extension(format!("json.unreadable-{}", now())));
+            Vec::new()
+        }
+    }
 }
 
 fn save(jobs: &[Job]) {
@@ -1025,7 +1067,12 @@ fn save(jobs: &[Job]) {
     if let Ok(json) = serde_json::to_string(jobs) {
         // write then rename, so a crash mid-write never loses the list
         let tmp = f.with_extension("json.tmp");
-        if std::fs::write(&tmp, json).is_ok() {
+        let written = std::fs::File::create(&tmp).and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()
+        });
+        if written.is_ok() {
             let _ = std::fs::rename(&tmp, &f);
         }
     }
@@ -1034,6 +1081,26 @@ fn save(jobs: &[Job]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn odd_link_dates_dont_crash() {
+        assert_eq!(parse_amz_date("2026é0101T1200000Z"), None);
+        assert_eq!(parse_amz_date("ééééééééé"), None);
+        assert!(parse_amz_date("20260101T120000Z").is_some());
+    }
+
+    #[test]
+    fn names_from_outside_are_made_safe() {
+        assert_eq!(safe_name(".."), None);
+        assert_eq!(safe_name("."), None);
+        assert_eq!(safe_name("  "), None);
+        assert_eq!(safe_name("C:evil.exe").as_deref(), Some("C_evil.exe"));
+        assert_eq!(safe_name("a:b").as_deref(), Some("a_b"));
+        assert_eq!(safe_name("invoice\u{202E}txt.exe").as_deref(), Some("invoicetxt.exe"));
+        assert_eq!(safe_name("con.txt").as_deref(), Some("_con.txt"));
+        assert_eq!(safe_name("COM1").as_deref(), Some("_COM1"));
+        assert_eq!(safe_name("report.pdf").as_deref(), Some("report.pdf"));
+    }
 
     /// Shift+Delete's delete skips the Recycle Bin, and takes folders too.
     #[test]
@@ -1163,19 +1230,36 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let url = std::env::var("STASH_TEST_URL").unwrap_or("https://proof.ovh.net/files/10Mb.dat".into());
         let engine = Engine::start(Config { max_active: 2, connections: 6, limit_bps: 0, seed: false }, || {});
-        engine.add(AddRequest { source: url, dir: dir.clone(), ..Default::default() });
+        // the same file twice at once: each gets its own name ("x (2).dat", not "x.dat (2)")
+        // (the same link twice is one download, so the second asks with a query)
+        engine.add(AddRequest { source: url.clone(), dir: dir.clone(), ..Default::default() });
+        engine.add(AddRequest { source: format!("{url}?again"), dir: dir.clone(), ..Default::default() });
         let start = Instant::now();
         loop {
             std::thread::sleep(Duration::from_millis(500));
             let s = engine.snapshot();
-            let j = s.jobs.last().unwrap();
-            println!("{:?} {:?} {}/{:?} {} B/s conns={} {:?}", j.state, j.phase, j.done, j.total, j.speed, j.connections, j.error);
-            if matches!(j.state, State::Done | State::Failed) || start.elapsed().as_secs() > 90 {
-                assert_eq!(j.state, State::Done);
-                let p = j.path.clone().unwrap();
-                assert_eq!(std::fs::metadata(&p).unwrap().len(), j.total.unwrap());
-                println!("saved {}", p.display());
-                engine.remove(j.id, false);
+            for j in &s.jobs {
+                println!("{:?} {:?} {}/{:?} {} B/s conns={} {:?}", j.state, j.phase, j.done, j.total, j.speed, j.connections, j.error);
+            }
+            let over = s.jobs.iter().all(|j| matches!(j.state, State::Done | State::Failed));
+            if over || start.elapsed().as_secs() > 90 {
+                let mut names = Vec::new();
+                for j in &s.jobs {
+                    assert_eq!(j.state, State::Done);
+                    let p = j.path.clone().unwrap();
+                    assert_eq!(std::fs::metadata(&p).unwrap().len(), j.total.unwrap());
+                    // marked as from the internet, like a browser would
+                    let mut zone = p.as_os_str().to_owned();
+                    zone.push(":Zone.Identifier");
+                    assert!(std::fs::read_to_string(PathBuf::from(zone)).unwrap().contains("ZoneId=3"));
+                    println!("saved {}", p.display());
+                    names.push(p.file_name().unwrap().to_string_lossy().into_owned());
+                    engine.remove(j.id, false);
+                }
+                names.sort();
+                assert_eq!(names.len(), 2);
+                assert_ne!(names[0], names[1]);
+                assert!(names.iter().all(|n| n.ends_with(".dat")), "{names:?}");
                 break;
             }
         }

@@ -170,6 +170,15 @@ pub fn save(settings: &Settings) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(json) = serde_json::to_string_pretty(settings) {
-        let _ = std::fs::write(f, json);
+        // write then rename, so a crash mid-save can't leave half a file (and lost settings)
+        let tmp = f.with_extension("json.tmp");
+        let written = std::fs::File::create(&tmp).and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()
+        });
+        if written.is_ok() {
+            let _ = std::fs::rename(&tmp, &f);
+        }
     }
 }

@@ -2744,12 +2744,26 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_COPYDATA if is_tile => {
             if let Some(r) = ipc::receive(lparam) {
                 // reply first, so the sender isn't kept waiting on our UI
+                let ok = ipc::takes(&r);
                 unsafe {
-                    let _ = ReplyMessage(LRESULT(1));
+                    let _ = ReplyMessage(LRESULT(ok as isize));
                 }
-                handle(r);
+                if ok {
+                    handle(r);
+                }
+                return LRESULT(ok as isize);
             }
-            return LRESULT(1);
+            return LRESULT(0);
+        }
+        // Windows is shutting down or signing out: save where every download got to
+        WM_QUERYENDSESSION if is_tile => return LRESULT(1),
+        WM_ENDSESSION if is_tile => {
+            if wparam.0 != 0 {
+                if let Some(e) = dl::engine_opt() {
+                    e.shutdown();
+                }
+            }
+            return LRESULT(0);
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_DPICHANGED if is_tile => {
             with(|s| s.relayout_if_needed());

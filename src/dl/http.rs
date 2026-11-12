@@ -180,8 +180,7 @@ impl Task {
                 let total = if status.as_u16() == 206 { content_range_total(&resp) } else { resp.content_length() };
                 let name = self.name.clone().filter(|_| self.from_browser).unwrap_or_else(|| file_name(&resp, &self.url));
                 std::fs::create_dir_all(&self.dir).map_err(|e| format!("Can't create the folder: {e}"))?;
-                let temp = crate::files::unique_dest(&self.dir, &format!("{name}.stashpart"));
-                let file = std::fs::File::create(&temp).map_err(|e| format!("Can't create the file: {e}"))?;
+                let (temp, file) = claim(&self.dir, &name)?;
                 if let Some(t) = total {
                     file.set_len(t).map_err(|e| format!("Not enough disk space: {e}"))?;
                 }
@@ -192,9 +191,12 @@ impl Task {
             }
         };
 
+        let url = resp_url(&first.1).unwrap_or(self.url.clone());
+        // a site's cookies are for that site: not for wherever it redirects us
+        let headers = if same_site(&url, &self.url) { self.headers.clone() } else { without_credentials(&self.headers) };
         let ctx = Arc::new(Ctx {
-            url: resp_url(&first.1).unwrap_or(self.url.clone()),
-            headers: self.headers.clone(),
+            url,
+            headers,
             client: self.client.clone(),
             limiter: self.limiter.clone(),
             progress: self.progress.clone(),
@@ -206,7 +208,7 @@ impl Task {
         if resumable && total.is_some() && [".exe", ".dll", ".scr"].iter().any(|e| shown_name.ends_with(e)) {
             let icon = super::app_icon(self.id);
             if !icon.exists() {
-                let (client, url, headers) = (self.client.clone(), ctx.url.clone(), self.headers.clone());
+                let (client, url, headers) = (self.client.clone(), ctx.url.clone(), ctx.headers.clone());
                 tokio::spawn(async move {
                     let _ = early_icon(&client, &url, &headers, &icon).await;
                 });
@@ -216,7 +218,7 @@ impl Task {
         if resumable && total.is_some() && [".jpg", ".jpeg", ".jfif"].iter().any(|e| shown_name.ends_with(e)) {
             let preview = super::photo_preview(self.id);
             if !preview.exists() {
-                let (client, url, headers) = (self.client.clone(), ctx.url.clone(), self.headers.clone());
+                let (client, url, headers) = (self.client.clone(), ctx.url.clone(), ctx.headers.clone());
                 tokio::spawn(async move {
                     let _ = early_photo(&client, &url, &headers, &preview).await;
                 });
@@ -245,11 +247,13 @@ impl Task {
             return Err("The download stopped before the end".into());
         }
         let done = self.progress.done.load(Ordering::Relaxed);
+        let host_url = ctx.url.clone();
         drop(ctx);
         set_hidden(&temp, false);
         let final_name = temp.file_name().unwrap().to_string_lossy().trim_end_matches(".stashpart").to_string();
-        let dest = crate::files::unique_dest(&self.dir, &final_name);
-        std::fs::rename(&temp, &dest).map_err(|e| format!("Can't finish the file: {e}"))?;
+        let dest = finish(&temp, &self.dir, &final_name)?;
+        let referrer = self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("referer")).map(|(_, v)| v.as_str());
+        mark_from_internet(&dest, &host_url, referrer);
         // the real file has its own icon or thumbnail now
         let _ = std::fs::remove_file(super::app_icon(self.id));
         let _ = std::fs::remove_file(super::photo_preview(self.id));
@@ -569,10 +573,25 @@ pub fn name_from_url(url: &str) -> Option<String> {
     Some(sanitize(&name)).filter(|n| !n.is_empty())
 }
 
-fn sanitize(name: &str) -> String {
-    let cleaned: String = name.chars().map(|c| if c.is_control() || r#"<>:"/\|?*"#.contains(c) { '_' } else { c }).collect();
-    let trimmed = cleaned.trim().trim_end_matches(['.', ' ']);
-    trimmed.chars().take(180).collect()
+/// A name that's safe to save under: no folders, drives (`C:x`), streams (`a:b`), or
+/// characters Windows refuses, no right-to-left tricks that hide the real extension
+/// (`invoice\u{202E}txt.exe`), and not a reserved device name. Empty if nothing is left.
+pub(super) fn sanitize(name: &str) -> String {
+    let bidi = |c: char| matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !bidi(*c))
+        .map(|c| if c.is_control() || r#"<>:"/\|?*"#.contains(c) { '_' } else { c })
+        .collect();
+    let trimmed = cleaned.trim().trim_start_matches('.').trim_end_matches(['.', ' ']).trim();
+    let mut out: String = trimmed.chars().take(180).collect();
+    let stem = out.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && stem.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        out.insert(0, '_');
+    }
+    out
 }
 
 fn ext_for_type(t: &str) -> Option<&'static str> {
@@ -595,6 +614,83 @@ fn ext_for_type(t: &str) -> Option<&'static str> {
         "application/x-bittorrent" => "torrent",
         _ => return None,
     })
+}
+
+/// Reserve a name for a new download: `<name>.stashpart`, where neither it nor the
+/// finished `<name>` exists yet ("name (2).zip" otherwise). Created here, so two downloads
+/// can't pick the same one.
+fn claim(dir: &Path, name: &str) -> Result<(PathBuf, std::fs::File), String> {
+    let (stem, ext) = split_name(name);
+    for n in 1..10_000 {
+        let candidate = if n == 1 { name.to_string() } else { format!("{stem} ({n}){ext}") };
+        if dir.join(&candidate).exists() {
+            continue;
+        }
+        let temp = dir.join(format!("{candidate}.stashpart"));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(f) => return Ok((temp, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Can't create the file: {e}")),
+        }
+    }
+    Err("Can't find a free name for the file".into())
+}
+
+fn split_name(name: &str) -> (String, String) {
+    let p = Path::new(name);
+    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    (stem, ext)
+}
+
+/// Move the finished download to its real name, never over a file that's there already.
+fn finish(temp: &Path, dir: &Path, name: &str) -> Result<PathBuf, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{MOVE_FILE_FLAGS, MoveFileExW};
+    let wide = |p: &Path| p.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let from = wide(temp);
+    let mut last = String::new();
+    for _ in 0..20 {
+        let dest = crate::files::unique_dest(dir, name);
+        let to = wide(&dest);
+        // no MOVEFILE_REPLACE_EXISTING: if another download just took the name, try the next
+        match unsafe { MoveFileExW(windows::core::PCWSTR(from.as_ptr()), windows::core::PCWSTR(to.as_ptr()), MOVE_FILE_FLAGS(0)) } {
+            Ok(()) => return Ok(dest),
+            Err(e) => {
+                last = e.message().to_string();
+                if !dest.exists() {
+                    break;
+                }
+            }
+        }
+    }
+    Err(format!("Can't finish the file: {last}"))
+}
+
+/// What a browser does: note that the file came from the internet (its "Mark of the
+/// Web"), so Windows checks it with SmartScreen before it runs and Office opens it in
+/// Protected View.
+fn mark_from_internet(path: &Path, url: &str, referrer: Option<&str>) {
+    let clean = |s: &str| s.replace(['\r', '\n'], "");
+    let mut zone = String::from("[ZoneTransfer]\r\nZoneId=3\r\n");
+    if let Some(r) = referrer.filter(|r| r.starts_with("http")) {
+        zone += &format!("ReferrerUrl={}\r\n", clean(r));
+    }
+    if url.starts_with("http") {
+        zone += &format!("HostUrl={}\r\n", clean(url));
+    }
+    let mut stream = path.as_os_str().to_owned();
+    stream.push(":Zone.Identifier");
+    let _ = std::fs::write(PathBuf::from(stream), zone);
+}
+
+fn same_site(a: &str, b: &str) -> bool {
+    let host = |u: &str| reqwest::Url::parse(u).ok().map(|u| (u.host_str().map(str::to_ascii_lowercase), u.port_or_known_default()));
+    host(a).is_some() && host(a) == host(b)
+}
+
+fn without_credentials(h: &[(String, String)]) -> Vec<(String, String)> {
+    h.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("cookie") && !k.eq_ignore_ascii_case("authorization")).cloned().collect()
 }
 
 fn set_hidden(path: &Path, hidden: bool) {

@@ -41,8 +41,7 @@ impl BrowserDownload {
     /// Just the file name (browsers may hand over a full path).
     pub fn name(&self) -> Option<String> {
         let f = self.filename.as_ref()?;
-        let name = f.rsplit(['\\', '/']).next()?.trim();
-        (!name.is_empty()).then(|| name.to_string())
+        crate::dl::safe_name(f.rsplit(['\\', '/']).next()?)
     }
 }
 
@@ -91,9 +90,19 @@ pub fn forward(r: &Request) -> bool {
         // let it bring its window to the front
         let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(u32::MAX);
         let mut result = 0usize;
-        SendMessageTimeoutW(hwnd, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const _ as isize), SMTO_ABORTIFHUNG, 5000, Some(&mut result));
+        // it answers 1 once it has taken the request; a timeout (or a hung Stash) is a no,
+        // so a browser keeps its own copy of the download
+        let sent = SendMessageTimeoutW(hwnd, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const _ as isize), SMTO_ABORTIFHUNG, 5000, Some(&mut result));
+        sent.0 != 0 && result == 1
     }
-    true
+}
+
+/// Whether the running Stash can take this request (answered before it's handled).
+pub fn takes(r: &Request) -> bool {
+    match r {
+        Request::Add(list) => crate::dl::engine_opt().is_some() && list.iter().any(|d| crate::dl::is_source(&d.url)),
+        _ => true,
+    }
 }
 
 /// Read a WM_COPYDATA from `forward`.
@@ -143,7 +152,15 @@ pub fn run_native_host() {
         let reply = match serde_json::from_slice::<HostMessage>(&buf) {
             Ok(m) if m.kind == "ping" => serde_json::json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") }),
             Ok(m) if m.kind == "download" && m.download.is_some() => {
-                let ok = ensure_running() && forward(&Request::Add(vec![m.download.unwrap()]));
+                // a Stash that's only just started may need a moment before it can take it
+                let req = Request::Add(vec![m.download.unwrap()]);
+                let ok = ensure_running()
+                    && (0..15).any(|i| {
+                        if i > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        }
+                        forward(&req)
+                    });
                 serde_json::json!({ "ok": ok })
             }
             Ok(m) if m.kind == "show" => serde_json::json!({ "ok": ensure_running() && forward(&Request::Show) }),

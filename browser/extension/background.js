@@ -48,17 +48,21 @@ const passThrough = new Set();
 api.downloads.onCreated.addListener(async (item) => {
   const url = item.finalUrl || item.url;
   if (!/^https?:/i.test(url) || passThrough.has(item.id)) return;
+  // private windows stay private: their downloads (and cookies) aren't handed over
+  if (item.incognito) return;
   const s = await settings();
   if (!s.enabled) return;
   if (s.minSizeMB > 0 && item.totalBytes > 0 && item.totalBytes < s.minSizeMB * 1e6) return;
+  // hold the browser's copy while we ask, so it can't finish first and land twice
+  const paused = await api.downloads.pause(item.id).then(() => true, () => false);
   const reply = await handOver(url, item.filename, item.referrer);
-  if (!reply?.ok) return; // Stash isn't there: let the browser carry on
-  try {
-    await api.downloads.cancel(item.id);
-    await api.downloads.erase({ id: item.id });
-  } catch {
-    // already finished (tiny files): nothing to cancel
+  if (!reply?.ok) {
+    // Stash isn't there (or said no): let the browser carry on
+    if (paused) await api.downloads.resume(item.id).catch(() => {});
+    return;
   }
+  await api.downloads.cancel(item.id).catch(() => {});
+  await api.downloads.erase({ id: item.id }).catch(() => {});
   flash();
 });
 
@@ -74,7 +78,8 @@ api.runtime.onStartup?.addListener(menus);
 api.contextMenus.onClicked.addListener(async (info, tab) => {
   const url = info.linkUrl || info.srcUrl;
   if (!url) return;
-  const reply = await handOver(url, null, info.pageUrl || tab?.url);
+  // blob: and data: links only exist inside the page: the browser has to save those
+  const reply = /^https?:/i.test(url) && !tab?.incognito ? await handOver(url, null, info.pageUrl || tab?.url) : null;
   if (reply?.ok) flash();
   else {
     // no Stash: fall back to the browser's own download

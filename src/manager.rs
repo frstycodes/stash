@@ -277,7 +277,8 @@ enum SheetKind {
     Add { field: Field, dir: PathBuf, priority: Priority, error: Option<String> },
     /// `name` and `path` describe the first; `ids.len() > 1` asks about all of them.
     /// `permanent`: Shift+Delete, which deletes the files for good after asking.
-    Remove { ids: Vec<u64>, name: String, path: String, delete: bool, permanent: bool },
+    /// `cancel`: stopping several unfinished downloads (their partial files go too).
+    Remove { ids: Vec<u64>, name: String, path: String, delete: bool, permanent: bool, cancel: bool },
 }
 
 /// The right-click menu while it's open: for `ids` (the selection), at (x, y) in DIPs.
@@ -509,6 +510,12 @@ impl Manager {
                 }
             }
             "add" => self.open_add(Some("https://example.com/files/big-archive.zip".into())),
+            "cancel" => {
+                // the Cancel Downloads sheet, as for two downloads stopped part-way
+                let ids: Vec<u64> = self.jobs.iter().take(2).map(|j| j.id).collect();
+                let name = format!("{}  and 1 more", self.jobs.first().map(|j| j.name.clone()).unwrap_or_default());
+                self.open_sheet(SheetKind::Remove { ids, name, path: "412 MB downloaded so far".into(), delete: false, permanent: false, cancel: true });
+            }
             "remove" => {
                 // the Remove sheet for the first finished download whose file is there
                 let id = self.jobs.iter().find(|j| j.state.finished() && j.path.as_ref().is_some_and(|p| p.exists())).map(|j| j.id);
@@ -2536,6 +2543,16 @@ impl Manager {
         let has_file = |j: &JobView| j.state.finished() && j.path.as_ref().is_some_and(|p| p.exists());
         let jobs: Vec<JobView> = ids.iter().filter_map(|id| self.job(*id).cloned()).collect();
         let Some(first) = jobs.iter().find(|j| has_file(j)).cloned() else {
+            // stopping several downloads part-way throws their progress away: ask first
+            let started = jobs.iter().filter(|j| !j.state.finished() && j.done > 0).count();
+            if started > 1 {
+                let more = jobs.len() - 1;
+                let done: u64 = jobs.iter().filter(|j| !j.state.finished()).map(|j| j.done).sum();
+                let name = format!("{}  and {more} more", jobs[0].name);
+                let path = format!("{} downloaded so far", paint::bytes(done));
+                self.open_sheet(SheetKind::Remove { ids: jobs.iter().map(|j| j.id).collect(), name, path, delete: false, permanent: false, cancel: true });
+                return;
+            }
             for j in &jobs {
                 dl::engine().remove(j.id, !j.state.finished());
             }
@@ -2554,7 +2571,7 @@ impl Manager {
             let total: u64 = jobs.iter().filter(|j| has_file(j)).filter_map(|j| j.total).sum();
             (format!("{}  and {more} more", first.name), format!("{files} of {} files still on your PC  \u{b7}  {}", jobs.len(), paint::bytes(total)))
         };
-        self.open_sheet(SheetKind::Remove { ids: jobs.iter().map(|j| j.id).collect(), name, path, delete: permanent, permanent });
+        self.open_sheet(SheetKind::Remove { ids: jobs.iter().map(|j| j.id).collect(), name, path, delete: permanent, permanent, cancel: false });
     }
 
     // ---------- the right-click menu ----------
@@ -2906,6 +2923,10 @@ impl Manager {
             }
             return false;
         }
+        // Settings hides the list: its keys (Space, Delete, Ctrl+A...) mustn't reach rows you can't see
+        if self.view == Page::Settings && !(ctrl && (vk == b'N' as u16 || vk == b'V' as u16)) {
+            return false;
+        }
         let ids: Vec<u64> = self.lines.iter().filter_map(|l| if let Line::Job(j) = l { Some(j.id) } else { None }).collect();
         let pos = self.selected.and_then(|s| ids.iter().position(|&id| id == s));
         match vk {
@@ -3044,7 +3065,7 @@ impl Manager {
         match kind {
             SheetKind::Add { .. } => (SHEET_W, ADD_H),
             // no switch to show when it's a permanent delete
-            SheetKind::Remove { permanent: true, .. } => (420.0, REMOVE_H - 46.0),
+            SheetKind::Remove { permanent: true, .. } | SheetKind::Remove { cancel: true, .. } => (420.0, REMOVE_H - 46.0),
             SheetKind::Remove { .. } => (420.0, REMOVE_H),
         }
     }
@@ -3173,8 +3194,8 @@ impl Manager {
                     return Hit::Ok;
                 }
             }
-            SheetKind::Remove { permanent, .. } => {
-                if !permanent && inside(22.0, 152.0, w - 44.0, 34.0) {
+            SheetKind::Remove { permanent, cancel, .. } => {
+                if !permanent && !cancel && inside(22.0, 152.0, w - 44.0, 34.0) {
                     return Hit::AlsoDelete;
                 }
                 let ok_w = 178.0;
@@ -3282,13 +3303,23 @@ impl Manager {
                 caret_v.SetOffset(Vector3 { X: cx * k, Y: 85.0 * k, Z: 0.0 })?;
                 caret_v.SetIsVisible(!all)?;
             }
-            SheetKind::Remove { ids, name, path, delete, permanent } => {
-                let permanent = *permanent;
-                let (w, h) = (420.0, if permanent { REMOVE_H - 46.0 } else { REMOVE_H });
-                let (name, path, delete) = (name.clone(), path.clone(), *delete);
+            SheetKind::Remove { ids, name, path, delete, permanent, cancel } => {
+                let (permanent, cancel) = (*permanent, *cancel);
+                // no switch to show: a permanent delete, or cancelling downloads
+                let bare = permanent || cancel;
+                let (w, h) = (420.0, if bare { REMOVE_H - 46.0 } else { REMOVE_H });
+                let (name, path, delete) = (name.clone(), path.clone(), *delete || cancel);
                 let many = ids.len() > 1;
                 let n = ids.len();
-                let (title, desc, switch, keep, gone) = if permanent {
+                let (title, desc, switch, keep, gone) = if cancel {
+                    (
+                        format!("Cancel {n} downloads?"),
+                        "What they've downloaded so far is deleted.",
+                        "",
+                        String::new(),
+                        "Cancel Downloads".to_string(),
+                    )
+                } else if permanent {
                     (
                         if many { format!("Permanently delete {n} downloads?") } else { "Permanently delete this file?".to_string() },
                         if many { "Their files are deleted from your PC, not moved to the Recycle Bin." } else { "It's deleted from your PC, not moved to the Recycle Bin." },
@@ -3330,7 +3361,7 @@ impl Manager {
                     // the switch (its live parts sit on this track), then its label; a
                     // permanent delete has no choice to make
                     let sx = 24.0;
-                    if !permanent {
+                    if !bare {
                         settings_page::paint_switch_track(p, settings_page::Rect::new(sx, 158.0, settings_page::SWITCH.0, settings_page::SWITCH.1), true);
                     }
                     p.text_mid(switch, sx + 52.0, 169.0, 13.0, REGULAR, paint::text(), w - 100.0);
@@ -3339,7 +3370,9 @@ impl Manager {
                     let (ok_x, by) = (w - 22.0 - ok_w, h - 22.0 - bh);
                     let cancel_x = ok_x - 10.0 - 92.0;
                     // Cancel is Secondary; the action Primary, or Danger once it deletes the file
-                    crate::ui::button(p, settings_page::Rect::new(cancel_x, by, 92.0, bh), "Cancel", None, crate::ui::Kind::Secondary, hover == Hit::Cancel, true);
+                    // ("Keep" when the action itself is a cancel, so the two don't read alike)
+                    let dismiss = if cancel { "Keep" } else { "Cancel" };
+                    crate::ui::button(p, settings_page::Rect::new(cancel_x, by, 92.0, bh), dismiss, None, crate::ui::Kind::Secondary, hover == Hit::Cancel, true);
                     let (label, kind) = if delete { (gone.as_str(), crate::ui::Kind::Danger) } else { (keep.as_str(), crate::ui::Kind::Primary) };
                     crate::ui::button(p, settings_page::Rect::new(ok_x, by, ok_w, bh), label, None, kind, hover == Hit::Ok, true);
                 };
@@ -3350,8 +3383,8 @@ impl Manager {
                 set_surface(&self.gfx, &card, &surface, w * k, h * k)?;
                 caret_v.SetIsVisible(false)?;
                 if let Some((track, knob)) = &live_switch {
-                    let _ = track.SetIsVisible(!permanent);
-                    let _ = knob.SetIsVisible(!permanent);
+                    let _ = track.SetIsVisible(!bare);
+                    let _ = knob.SetIsVisible(!bare);
                     let r = settings_page::Rect::new(24.0, 158.0, settings_page::SWITCH.0, settings_page::SWITCH.1);
                     // slides when flipped; set in place (no motion) the first time it's drawn
                     let placed = knob.Size().is_ok_and(|s| s.X > 0.0);
@@ -3410,8 +3443,8 @@ impl Manager {
                 self.close_sheet();
                 self.clamp_scroll(true);
             }
-            SheetKind::Remove { ids, delete, permanent, .. } => {
-                let (ids, delete, permanent) = (ids.clone(), *delete, *permanent);
+            SheetKind::Remove { ids, delete, permanent, cancel, .. } => {
+                let (ids, delete, permanent, cancel) = (ids.clone(), *delete, *permanent, *cancel);
                 for id in &ids {
                     // an unfinished one is cancelled, its partial file with it
                     let unfinished = self.job(*id).is_some_and(|j| !j.state.finished());
@@ -3425,6 +3458,7 @@ impl Manager {
                 self.close_sheet();
                 let n = ids.len();
                 let note = match (n, delete) {
+                    _ if cancel => format!("Cancelled {n} downloads"),
                     _ if permanent && n == 1 => "Deleted permanently".to_string(),
                     _ if permanent => format!("{n} downloads deleted permanently"),
                     (1, true) => "Removed, and the file moved to the Recycle Bin".to_string(),

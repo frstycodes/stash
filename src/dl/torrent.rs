@@ -93,7 +93,8 @@ impl Task {
 
         let info_hash = list.info_hash.as_string();
         let name = list.info.name().map(|n| n.into_owned()).unwrap_or_else(|| info_hash.clone());
-        let name = name.replace(['<', '>', ':', '"', '/', '\\', '|', '?', '*'], "_");
+        // never "", "." or "..": the folder would be the Downloads folder (or above it)
+        let name = super::safe_name(&name).unwrap_or_else(|| info_hash.clone());
         let total = list.info.lengths().total_length();
         let multi = list.info.info().files.is_some();
         let output = if multi { self.dir.join(&name) } else { self.dir.clone() };
