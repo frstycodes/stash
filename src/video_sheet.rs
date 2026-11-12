@@ -188,14 +188,19 @@ impl State {
     pub fn ok_label(&self) -> Option<String> {
         let f = self.found()?;
         let n = if self.whole_list { f.info.playlist.as_ref().map(|p| p.entries.len()).unwrap_or(1) } else { 1 };
-        let what = if self.quality.audio() { "Audio" } else if n == 1 { "Video" } else { "Videos" };
+        let what = match (self.quality.audio(), n == 1) {
+            (true, true) => "Audio",
+            (true, false) => "Audio Files",
+            (false, true) => "Video",
+            (false, false) => "Videos",
+        };
         Some(if n > 1 { format!("Download {n} {what}") } else { format!("Download {what}") })
     }
 
     fn quality_seg(&self, measure: &dyn Fn(&str) -> f32) -> (Rect, Vec<Rect>, Vec<Quality>) {
         let qs = self.choices();
         let labels: Vec<&str> = qs.iter().map(|q| short(*q)).collect();
-        let widths = crate::ui::seg_widths(&labels, |t| measure(t) + 14.0);
+        let widths = crate::ui::seg_widths(&labels, measure);
         let (r, parts) = crate::ui::seg_layout(104.0, TOP + CARD_H + 12.0 + crate::ui::SEG_H / 2.0, &widths);
         (r, parts, qs)
     }
@@ -204,7 +209,7 @@ impl State {
         let f = self.found()?;
         let p = f.info.playlist.as_ref().filter(|p| p.entries.len() > 1)?;
         let labels = ["This video".to_string(), format!("Whole playlist · {}", p.entries.len())];
-        let widths = crate::ui::seg_widths(&[labels[0].as_str(), labels[1].as_str()], |t| measure(t) + 14.0);
+        let widths = crate::ui::seg_widths(&[labels[0].as_str(), labels[1].as_str()], measure);
         let (r, parts) = crate::ui::seg_layout(104.0, TOP + CARD_H + 12.0 + ROW_GAP + crate::ui::SEG_H / 2.0, &widths);
         Some((r, parts, labels))
     }
@@ -246,7 +251,7 @@ impl State {
         } else {
             p.glyph(crate::icons::PLAY, tx + THUMB_W / 2.0, ty + THUMB_H / 2.0, 22.0, paint::dim());
         }
-        if let Some(d) = info.duration.filter(|_| !info.is_live) {
+        if let Some(d) = info.duration.filter(|_| !info.is_live && !self.whole_list) {
             let t = video::duration_text(d);
             let tw = p.measure(&t, 11.0, MEDIUM) + 10.0;
             let (bx, by) = (tx + THUMB_W - tw - 5.0, ty + THUMB_H - 20.0);
@@ -273,7 +278,7 @@ impl State {
         }
         p.text(&meta.join(" · "), mx, y + 34.0, 12.0, REGULAR, paint::dim(), mw);
         let size = match (self.whole_list, info.size(self.quality)) {
-            (true, _) => format!("{} each, into a folder of its own", self.quality.ext().to_uppercase()),
+            (true, _) => format!("Each as {}, in a folder named after the playlist", self.quality.ext().to_uppercase()),
             (false, Some(s)) => format!("{} · about {}", self.quality.ext().to_uppercase(), paint::bytes(s)),
             (false, None) => self.quality.ext().to_uppercase(),
         };

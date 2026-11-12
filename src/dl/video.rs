@@ -335,19 +335,21 @@ pub fn worth_probing(link: &str) -> bool {
 pub async fn probe(link: &str) -> Result<Info, String> {
     let exe = crate::tools::ytdlp().await?;
     let link = link.trim().to_string();
-    let json = run_json(&exe, &["-J", "--no-playlist", "--flat-playlist"], &link).await?;
-    let mut info = parse_info(&json)?;
+    // a video in a playlist ("watch?v=…&list=…"): read the whole list too, at the same time
+    let in_list = reqwest::Url::parse(&link).is_ok_and(|u| u.query_pairs().any(|(k, _)| k == "list"));
+    let video = run_json(&exe, &["-J", "--no-playlist", "--flat-playlist"], &link);
+    let list = async {
+        if in_list { run_json(&exe, &["-J", "--yes-playlist", "--flat-playlist"], &link).await.ok() } else { None }
+    };
+    let (json, list) = tokio::join!(video, list);
+    let mut info = parse_info(&json?)?;
     if info.url.is_empty() {
         info.url = link.clone();
     }
-    // a video in a playlist ("watch?v=…&list=…"): offer the whole list too
-    let in_list = reqwest::Url::parse(&link).is_ok_and(|u| u.query_pairs().any(|(k, _)| k == "list"));
-    if in_list && info.playlist.is_none() {
-        if let Ok(json) = run_json(&exe, &["-J", "--yes-playlist", "--flat-playlist"], &link).await {
-            if let Ok(Info { playlist: Some(p), .. }) = parse_info(&json) {
-                if p.entries.len() > 1 {
-                    info.playlist = Some(p);
-                }
+    if info.playlist.is_none() {
+        if let Some(Ok(Info { playlist: Some(p), .. })) = list.as_deref().map(parse_info) {
+            if p.entries.len() > 1 {
+                info.playlist = Some(p);
             }
         }
     }
