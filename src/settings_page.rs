@@ -446,6 +446,12 @@ impl SettingsPage {
                 Row::new("Speed limit", Some("Leaves room for everything else on your network."), "bandwidth throttle cap rate slow", limit),
                 Row::new("Keep seeding finished torrents", Some("Share pieces back with other people while Stash runs."), "torrent upload share bittorrent", Ctl::Switch { id: "seed", on: d.seed, enabled: true }),
                 Row::new(
+                    "Gaming mode",
+                    Some("While you play online, downloads slow down just enough to keep your ping low."),
+                    "game gaming ping latency lag fps online play bufferbloat",
+                    Ctl::Switch { id: "gaming", on: d.gaming, enabled: true },
+                ),
+                Row::new(
                     "Open magnet links and .torrent files",
                     Some(if v.packaged { "Set this in Windows Settings, under Default apps." } else { "Stash asks before it starts one." }),
                     "torrent magnet default associate handler",
@@ -1000,6 +1006,7 @@ impl SettingsPage {
             }
             Hit::Switch(id) => match *id {
                 "seed" => cmd("dls:seed".into()),
+                "gaming" => cmd("dls:gaming".into()),
                 "magnets" => cmd("dls:magnets".into()),
                 "t-choose" => cmd("dls:t-choose".into()),
                 "t-upnp" => cmd("dls:t-upnp".into()),

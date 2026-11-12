@@ -239,11 +239,38 @@ impl Lazy {
 }
 
 pub fn set_limit(s: &Session, bps: u64) {
-    s.ratelimits.set_download_bps(NonZeroU32::new(bps.min(u32::MAX as u64) as u32));
+    USER_DOWN.store(bps, std::sync::atomic::Ordering::Relaxed);
+    // gaming mode may hold the download lower and the upload hard
+    let (down, up) = super::gaming::torrent_limits(bps);
+    APPLIED.store(super::gaming::effective(0), std::sync::atomic::Ordering::Relaxed);
+    s.ratelimits.set_download_bps(NonZeroU32::new(down.min(u32::MAX as u64) as u32));
+    // the user's own upload limit and gaming mode's: whichever is lower (0 = none)
+    let user_up = USER_UP.load(std::sync::atomic::Ordering::Relaxed);
+    let up = match (up, user_up) {
+        (0, u) | (u, 0) => u,
+        (a, b) => a.min(b),
+    };
+    s.ratelimits.set_upload_bps(NonZeroU32::new(up.min(u32::MAX as u64) as u32));
+}
+
+/// The upload limit from Settings (bytes/s, 0 = none).
+static USER_UP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The download limit last given to `set_limit`, so a new upload limit keeps it.
+static USER_DOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Gaming mode's cap when the session's limits were last set.
+static APPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Re-set the session's limits when gaming mode's cap moved (every engine tick).
+pub fn follow_gaming(s: &Session, bps: u64) {
+    if APPLIED.load(std::sync::atomic::Ordering::Relaxed) != super::gaming::effective(0) {
+        set_limit(s, bps);
+    }
 }
 
 pub fn set_upload_limit(s: &Session, bps: u64) {
-    s.ratelimits.set_upload_bps(NonZeroU32::new(bps.min(u32::MAX as u64) as u32));
+    USER_UP.store(bps, std::sync::atomic::Ordering::Relaxed);
+    set_limit(s, USER_DOWN.load(std::sync::atomic::Ordering::Relaxed));
 }
 
 /// Start the session on its own (at launch, to carry on seeding).

@@ -579,6 +579,7 @@ impl Stash {
         if let Some(p) = with(|s| s.settings.downloads.engine.clone()) {
             dl::preset_prefs(p);
         }
+        dl::gaming::set_enabled(with(|s| s.settings.downloads.gaming).unwrap_or(true));
         dl::init(dl_config, || post(WM_APP_DL));
         dl::engine().configure_torrents(with(|s| s.settings.downloads.torrents).unwrap_or_default());
         // updates for the GitHub builds: checked daily, downloaded in the background
@@ -1010,6 +1011,10 @@ impl Stash {
         for id in crate::torrent_sheet::take_new_questions(&snap.jobs) {
             manager::ask_files(&self.gfx, &self.settings, id);
         }
+        // gaming mode says so in the tray's tooltip
+        if let (Some(tip), Some(tray)) = (dl::gaming::tray_tip_changed(), &self.tray) {
+            let _ = tray.set_tooltip(Some(tip));
+        }
         let mut inflight: Vec<JobView> = snap.jobs.iter().filter(|j| !j.state.finished()).cloned().collect();
         inflight.sort_by(|a, b| (b.state == DlState::Active).cmp(&(a.state == DlState::Active)).then(b.added.cmp(&a.added)).then(b.id.cmp(&a.id)));
         let mut elsewhere = false;
@@ -1242,6 +1247,7 @@ impl Stash {
             "conn" => d.connections = value.parse().unwrap_or(8),
             "limit" => d.limit_kbps = value.parse().unwrap_or(0),
             "seed" => d.seed = !d.seed,
+            "gaming" => d.gaming = !d.gaming,
             "folder" if value == "choose" => return Some(Blocking::PickDownloadFolder),
             "folder" => d.folder = None,
             "window" => {
@@ -1265,6 +1271,7 @@ impl Stash {
         self.save_settings();
         dl::engine().configure(self.settings.downloads.config());
         dl::engine().configure_torrents(self.settings.downloads.torrents);
+        dl::gaming::set_enabled(self.settings.downloads.gaming);
         crate::paint::set_units(self.settings.downloads.bits, self.settings.downloads.binary);
         manager::set_settings(&self.settings);
         None

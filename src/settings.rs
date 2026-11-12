@@ -119,11 +119,18 @@ pub struct DlSettings {
     /// Torrent settings: upload limit, seed limits, UPnP, choosing files.
     #[serde(default)]
     pub torrents: crate::dl::TorrentOptions,
+    /// Gaming mode: slow down while an online game runs, to keep its ping low.
+    #[serde(default = "yes")]
+    pub gaming: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Default for DlSettings {
     fn default() -> Self {
-        Self { max_active: 3, connections: 8, limit_kbps: 0, seed: false, folder: None, window: None, bits: false, binary: false, engine: crate::dl::Prefs::default(), torrents: Default::default() }
+        Self { max_active: 3, connections: 8, limit_kbps: 0, seed: false, folder: None, window: None, bits: false, binary: false, engine: crate::dl::Prefs::default(), torrents: Default::default(), gaming: true }
     }
 }
 
