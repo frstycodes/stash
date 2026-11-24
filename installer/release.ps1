@@ -10,8 +10,11 @@ try {
     if ((git rev-parse --abbrev-ref HEAD) -ne 'main') { throw 'Release from the main branch.' }
     if (git tag --list "v$Version") { throw "v$Version already exists." }
 
+    # only the package's own version (the first one): a dependency table such as
+    # [dependencies.windows] has a `version =` line of its own. (The static
+    # [regex]::Replace's fourth argument is RegexOptions, not a count.)
     $toml = Get-Content Cargo.toml -Raw
-    $toml = [regex]::Replace($toml, '(?m)^version\s*=\s*"[^"]+"', "version = `"$Version`"", 1)
+    $toml = [regex]::new('(?m)^version\s*=\s*"[^"]+"').Replace($toml, "version = `"$Version`"", 1)
     [IO.File]::WriteAllText("$root\Cargo.toml", $toml)
 
     # refresh Cargo.lock with the new version (and check it still builds)
