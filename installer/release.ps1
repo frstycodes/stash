@@ -21,12 +21,18 @@ try {
     $ErrorActionPreference = 'Continue'
     cargo build --release 2>&1 | ForEach-Object { "$_" }
     if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
-    $ErrorActionPreference = 'Stop'
 
-    git add Cargo.toml Cargo.lock
-    git commit -m "Release $Version"
-    git tag -a "v$Version" -m "Stash $Version"
-    git push origin main "v$Version"
+    # git writes notices (line endings, push progress) to stderr, which Windows
+    # PowerShell turns into errors: go by each command's exit code instead
+    function Invoke-Git {
+        git @args 2>&1 | ForEach-Object { "$_" }
+        if ($LASTEXITCODE -ne 0) { throw "git $($args -join ' ') failed" }
+    }
+    Invoke-Git add Cargo.toml Cargo.lock
+    Invoke-Git commit -m "Release $Version"
+    Invoke-Git tag -a "v$Version" -m "Stash $Version"
+    Invoke-Git push origin main "v$Version"
+    $ErrorActionPreference = 'Stop'
     "Pushed v$Version. GitHub Actions is building the release: https://github.com/frstycodes/stash/actions"
 } finally {
     Pop-Location
