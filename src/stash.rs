@@ -172,6 +172,15 @@ pub fn handle(r: ipc::Request) {
     with(|s| s.on_request(r));
 }
 
+/// A game, a video or a presentation has the screen. STASH_TEST_FULLSCREEN=<file> makes
+/// that "the file exists", to test always on top without a full-screen app.
+fn full_screen_in_front() -> bool {
+    match std::env::var_os("STASH_TEST_FULLSCREEN") {
+        Some(f) => std::path::Path::new(&f).exists(),
+        None => crate::toast::fullscreen(),
+    }
+}
+
 /// What sits in the stack: files in the folder, and downloads still on their way there.
 #[derive(Clone)]
 enum Entry {
@@ -1773,7 +1782,7 @@ impl Stash {
     /// Kept above the windows (Settings > General), and nothing full screen in front:
     /// a game, a video or a presentation keeps the screen to itself.
     fn on_top(&self) -> bool {
-        self.settings.always_on_top && self.settings.show_stack && !crate::toast::fullscreen()
+        self.settings.always_on_top && self.settings.show_stack && !full_screen_in_front()
     }
 
     /// Always on top: watch for full-screen apps coming and going, so the stack steps

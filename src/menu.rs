@@ -117,6 +117,8 @@ pub fn stack_menu(s: &Settings, start_at_login: bool, folders: &[String], curren
         &limit,
         &size,
         &corner,
+        // the stack above every window (stepping aside for full-screen apps)
+        &CheckMenuItem::with_id("on-top:flip", "Always on Top", s.show_stack, s.always_on_top, None),
         &PredefinedMenuItem::separator(),
         &CheckMenuItem::with_id(ids::LOGIN, "Start at Login", true, start_at_login, None),
     ]);
@@ -183,4 +185,17 @@ pub fn apply_setting(id: &str, s: &mut Settings) -> bool {
         _ => return false,
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn always_on_top_toggles() {
+        let mut s = Settings::default();
+        assert!(!s.always_on_top, "off until asked for");
+        assert!(apply_setting("on-top:flip", &mut s) && s.always_on_top);
+        assert!(apply_setting("on-top:flip", &mut s) && !s.always_on_top);
+    }
 }
