@@ -1,11 +1,7 @@
-//! The engine's newer settings (retry, schedule, proxy, sorting, what happens when the
+//! The engine's newer settings (retry, schedule, proxy, what happens when the
 //! queue is done), kept apart from `Config` so that one stays a small `Copy` value.
 
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
-
-use super::sort::Category;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -70,10 +66,6 @@ pub struct Prefs {
     /// Keep the PC from sleeping while something downloads.
     pub keep_awake: bool,
     pub schedule: Schedule,
-    /// Put finished downloads into a folder for their type.
-    pub auto_sort: bool,
-    /// A folder per type instead of the default (a subfolder of where it was saved).
-    pub sort_folders: Vec<(Category, PathBuf)>,
     pub proxy: Proxy,
     /// What happens once everything has downloaded.
     pub when_done: WhenDone,
@@ -87,8 +79,6 @@ impl Default for Prefs {
             auto_retry: true,
             keep_awake: true,
             schedule: Schedule::default(),
-            auto_sort: false,
-            sort_folders: Vec::new(),
             proxy: Proxy::default(),
             when_done: WhenDone::Nothing,
             pause_metered: false,
@@ -141,6 +131,9 @@ mod tests {
     #[test]
     fn old_settings_load() {
         let p: Prefs = serde_json::from_str("{}").unwrap();
-        assert!(p.auto_retry && p.keep_awake && !p.auto_sort);
+        assert!(p.auto_retry && p.keep_awake);
+        // settings saved while folder sorting existed still load
+        let old: Prefs = serde_json::from_str(r#"{"auto_sort":true,"sort_folders":[["videos","D:/V"]]}"#).unwrap();
+        assert!(old.auto_retry);
     }
 }

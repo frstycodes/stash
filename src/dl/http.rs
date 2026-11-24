@@ -198,8 +198,6 @@ pub struct Task {
     pub validator: Option<String>,
     /// This download's own speed limit (on top of the shared one).
     pub own_limit: Arc<Limiter>,
-    /// Where finished files go by type, when sorting is on.
-    pub sort: Option<super::SortRule>,
 }
 
 struct Fail {
@@ -316,10 +314,7 @@ impl Task {
                     _ => resp.content_length(),
                 };
                 let name = self.name.clone().filter(|_| self.from_browser).unwrap_or_else(|| file_name(&resp, &self.url));
-                let dir = match &self.sort {
-                    Some(rule) => rule.dir_for(&self.dir, &name),
-                    None => self.dir.clone(),
-                };
+                let dir = self.dir.clone();
                 std::fs::create_dir_all(&dir).map_err(|e| format!("Can't create the folder: {e}"))?;
                 let (temp, file) = claim(&dir, &name)?;
                 if let Some(t) = total {

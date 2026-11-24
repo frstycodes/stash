@@ -376,6 +376,12 @@ impl SettingsPage {
                 }),
                 Row::new("Show the stack on the desktop", Some("The pile of recent files in the corner of your screen."), "stack desktop corner pile hide show tile", Ctl::Switch { id: "show-stack", on: s.show_stack, enabled: true }),
                 Row::new("Show new downloads arriving", Some("The stack comes up over your windows and catches the file."), "animation arrive drop new download stack popup raise", Ctl::Switch { id: "arrivals", on: s.show_arrivals, enabled: s.show_stack }),
+                Row::new(
+                    "Keep the stack on top of windows",
+                    Some("It stays above your apps, and steps aside for full-screen games and videos."),
+                    "always on top topmost above windows pin float stack front",
+                    Ctl::Switch { id: "on-top", on: s.always_on_top, enabled: s.show_stack },
+                ),
                 Row::new("Start when you sign in", None, "startup login boot launch autostart windows", Ctl::Switch { id: "login", on: v.login, enabled: true }),
             ],
             foot: None,
@@ -947,6 +953,25 @@ impl SettingsPage {
             };
             place_switch(&self.gfx, &track, &knob, sw.rect, sw.on, sw.enabled, k, animate && !new)?;
         }
+        // rows a search filtered out (or that went away) take their sprites with them;
+        // they're made afresh if the row comes back
+        let segs: std::collections::HashSet<&str> = self.segs.iter().map(|s| s.id).collect();
+        self.sliders.retain(|id, v| {
+            let keep = segs.contains(id);
+            if !keep {
+                let _ = children.Remove(&*v);
+            }
+            keep
+        });
+        let switches: std::collections::HashSet<&str> = self.switches.iter().map(|s| s.id).collect();
+        self.knobs.retain(|id, (track, knob)| {
+            let keep = switches.contains(id);
+            if !keep {
+                let _ = children.Remove(&*track);
+                let _ = children.Remove(&*knob);
+            }
+            keep
+        });
         Ok(())
     }
 
@@ -1084,6 +1109,7 @@ impl SettingsPage {
                 "t-upnp" => cmd("dls:t-upnp".into()),
                 "login" => cmd("login".into()),
                 "show-stack" => cmd("show-stack:flip".into()),
+                "on-top" => cmd("on-top:flip".into()),
                 "arrivals" => cmd("arrivals:flip".into()),
                 "autoupdate" => cmd("update:auto".into()),
                 id if id.starts_with("dle-") => cmd(format!("dle:flip:{}", &id[4..])),

@@ -158,6 +158,7 @@ pub fn apply_setting(id: &str, s: &mut Settings) -> bool {
         ("close", v) => s.close_quits = v == "quit",
         ("show-stack", _) => s.show_stack = !s.show_stack,
         ("arrivals", _) => s.show_arrivals = !s.show_arrivals,
+        ("on-top", _) => s.always_on_top = !s.always_on_top,
         ("theme", "system") => s.theme = Theme::System,
         ("theme", "light") => s.theme = Theme::Light,
         ("theme", "dark") => s.theme = Theme::Dark,

@@ -28,7 +28,6 @@ pub struct Task {
     pub own_limit: Arc<Limiter>,
     pub progress: Arc<Progress>,
     pub events: UnboundedSender<Ev>,
-    pub sort: Option<super::SortRule>,
 }
 
 /// The parts of an ftp:// link.
@@ -178,10 +177,7 @@ impl Task {
                     let _ = std::fs::remove_file(old);
                 }
                 let name = self.name.clone().or_else(|| http::name_from_url(&self.url)).unwrap_or_else(|| "download".into());
-                let dir = match &self.sort {
-                    Some(rule) => rule.dir_for(&self.dir, &name),
-                    None => self.dir.clone(),
-                };
+                let dir = self.dir.clone();
                 std::fs::create_dir_all(&dir).map_err(|e| format!("Can't create the folder: {e}"))?;
                 let (temp, f) = http::claim(&dir, &name)?;
                 if let Some(s) = size {
@@ -294,7 +290,6 @@ mod tests {
             own_limit: Arc::new(Limiter::new(0)),
             progress: Arc::new(Progress::new(0, &[])),
             events: tx,
-            sort: None,
         };
         rt.block_on(task.run());
         let mut done = false;

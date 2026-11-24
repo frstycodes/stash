@@ -20,7 +20,6 @@ mod net;
 pub mod prefs;
 mod retry;
 mod schedule;
-pub mod sort;
 mod extra;
 
 pub use batch::{count as pattern_count, expand_all, links_in_text};
@@ -192,8 +191,6 @@ pub struct AddRequest {
     pub mirrors: Vec<String>,
     /// This download's own speed limit in bytes/s (0 = none).
     pub limit_bps: u64,
-    /// The folder was picked for this download: don't sort it by type.
-    pub exact_dir: bool,
     /// A video from a web page (the New Download sheet read it with yt-dlp).
     pub video: Option<video::Spec>,
 }
@@ -355,8 +352,6 @@ struct Job {
     limit_bps: u64,
     #[serde(default)]
     mirrors: Vec<String>,
-    #[serde(default)]
-    exact_dir: bool,
 
     /// which of `source` and `mirrors` is in use (0: the source)
     #[serde(skip)]
@@ -520,7 +515,7 @@ impl Engine {
         self.send(Cmd::Renamed { id, path });
     }
 
-    /// The newer settings (retry, schedule, proxy, sorting…).
+    /// The newer settings (retry, schedule, proxy…).
     pub fn set_prefs(&self, p: Prefs) {
         self.send(Cmd::Prefs(p));
     }
@@ -721,7 +716,6 @@ impl Actor {
                     checksum: old.checksum.clone(),
                     mirrors: old.mirrors.clone(),
                     limit_bps: old.limit_bps,
-                    exact_dir: old.exact_dir,
                     video: old.video.clone(),
                 });
             }
@@ -832,7 +826,6 @@ impl Actor {
             verified: None,
             limit_bps: req.limit_bps,
             mirrors: req.mirrors.into_iter().map(|m| m.trim().to_string()).filter(|m| is_source(m)).collect(),
-            exact_dir: req.exact_dir,
             mirror: 0,
             tries: 0,
             retry_at: None,
@@ -900,7 +893,6 @@ impl Actor {
                 job.phase = Some("Connecting…");
                 let progress = Arc::new(http::Progress::new(job.done, &job.remaining));
                 let own_limit = Arc::new(Limiter::new(job.limit_bps));
-                let sort = (self.x.prefs.auto_sort && !job.exact_dir && job.temp.is_none()).then(|| SortRule { overrides: self.x.prefs.sort_folders.clone() });
                 let url = job.url().to_string();
                 if url.to_ascii_lowercase().starts_with("ftp://") {
                     let task = ftp::Task {
@@ -914,7 +906,6 @@ impl Actor {
                         own_limit: own_limit.clone(),
                         progress: progress.clone(),
                         events,
-                        sort,
                     };
                     let handle = tokio::spawn(task.run());
                     self.running.insert(id, Running { task: handle, http: Some(progress), limit: Some(own_limit) });
@@ -937,7 +928,6 @@ impl Actor {
                     events,
                     validator: job.validator.clone(),
                     own_limit: own_limit.clone(),
-                    sort,
                 };
                 let handle = tokio::spawn(task.run());
                 self.running.insert(id, Running { task: handle, http: Some(progress), limit: Some(own_limit) });

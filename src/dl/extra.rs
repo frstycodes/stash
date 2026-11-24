@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use super::prefs::{Prefs, Proxy, ProxyMode};
 use super::retry::{self, Failure};
-use super::sort::Category;
 use super::{Actor, Job, Snapshot, State as JobState, auth, net, schedule};
 
 /// How often waiting downloads, the network and the clock are looked at.
@@ -19,18 +18,6 @@ pub(super) const WAIT_NETWORK: &str = "Waiting for the network";
 pub(super) const WAIT_METERED: &str = "Paused on a metered connection";
 pub(super) const WAIT_HOURS: &str = "Waiting for download hours";
 pub(super) const WAIT_LOGIN: &str = "Waiting for you to sign in";
-
-/// Where downloads go by type, when sorting is on.
-#[derive(Clone, Debug)]
-pub struct SortRule {
-    pub overrides: Vec<(Category, PathBuf)>,
-}
-
-impl SortRule {
-    pub fn dir_for(&self, dir: &Path, name: &str) -> PathBuf {
-        super::sort::folder_for(dir, name, &self.overrides).unwrap_or_else(|| dir.to_path_buf())
-    }
-}
 
 static PRESET: Mutex<Option<Prefs>> = Mutex::new(None);
 

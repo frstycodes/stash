@@ -82,6 +82,9 @@ pub struct Settings {
     pub show_stack: bool,
     /// A new download comes up over the windows and drops into the stack.
     pub show_arrivals: bool,
+    /// The stack stays above every app window (and steps aside for full-screen ones),
+    /// instead of sitting on the desktop until you use it.
+    pub always_on_top: bool,
     pub corner: Corner,
     pub sort: Sort,
     pub display: Display,
@@ -181,6 +184,7 @@ impl Default for Settings {
             close_quits: false,
             show_stack: true,
             show_arrivals: true,
+            always_on_top: false,
             corner: Corner::BottomRight,
             sort: Sort::Added,
             display: Display::Stack,

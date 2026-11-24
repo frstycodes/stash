@@ -122,6 +122,8 @@ const T_DROP_DONE: usize = 11; // a new download's icon has landed: hide its win
 const T_ANNOUNCE_END: usize = 12; // a stack raised to show a new download goes back under the windows
 const T_ANNOUNCE_LOWER: usize = 13;
 const T_ANNOUNCE_TEST: usize = 14;
+const T_ON_TOP: usize = 15; // always on top: look again for a full-screen app to step aside for
+const ON_TOP_POLL_MS: u32 = 1500;
 const ANNOUNCE_MS: u32 = 2600; // how long a raised stack stays up to show the download starting
 const DROP_HEIGHT: f32 = 230.0; // how far above the stack a new download's icon starts
 
@@ -338,6 +340,7 @@ pub struct Stash {
     ready: bool,
     pinned: bool,    // opened from the tray: stays open until clicked away
     topmost: bool,   // raised above all apps (while a tray-opened fan is showing)
+    on_top_now: bool, // kept above all apps (always on top, nothing full screen)
     pinned_fg: HWND, // the foreground window when pinned; switching apps closes the fan
     wheel: i32,                     // wheel delta toward the next switch
     demo: Option<Vec<PathBuf>>,     // STASH_DEMO's folders, in place of the real ones
@@ -562,6 +565,7 @@ impl Stash {
             ready: false,
             pinned: false,
             topmost: false,
+            on_top_now: false,
             pinned_fg: HWND::default(),
             wheel: 0,
             demo: demo.clone(),
@@ -603,6 +607,7 @@ impl Stash {
             s.ready = true;
             s.on_downloads();
             crate::system::start(s.tile, &s.settings);
+            s.watch_on_top();
             // Settings > General: open the window when Stash starts (not when a browser
             // extension or an update starts it in the background)
             let quiet = std::env::args().any(|a| a == "--background" || a == "--updated");
@@ -694,6 +699,8 @@ impl Stash {
         if let Some(snap) = dl::engine_opt().map(|e| e.snapshot()) {
             let _ = self.update_dl_overlay(&snap);
         }
+        // (placing them put them at the bottom)
+        self.restack();
     }
 
     /// The tile window's size: whole pixels, so its center matches the fan's origin.
@@ -1763,14 +1770,34 @@ impl Stash {
         uninstall_mouse_hook();
     }
 
-    /// Put both windows at their z-order: above every app while raised, otherwise
-    /// just above the desktop. The fan always sits directly beneath the tile.
+    /// Kept above the windows (Settings > General), and nothing full screen in front:
+    /// a game, a video or a presentation keeps the screen to itself.
+    fn on_top(&self) -> bool {
+        self.settings.always_on_top && self.settings.show_stack && !crate::toast::fullscreen()
+    }
+
+    /// Always on top: watch for full-screen apps coming and going, so the stack steps
+    /// aside for them and comes back after.
+    fn watch_on_top(&mut self) {
+        unsafe {
+            if self.settings.always_on_top && self.settings.show_stack {
+                let _ = SetTimer(Some(self.tile), T_ON_TOP, ON_TOP_POLL_MS, None);
+            } else {
+                let _ = KillTimer(Some(self.tile), T_ON_TOP);
+            }
+        }
+        self.on_top_now = self.on_top();
+        self.restack();
+    }
+
+    /// Put both windows at their z-order: above every app while raised (or kept on top),
+    /// otherwise just above the desktop. The fan always sits directly beneath the tile.
     fn restack(&self) {
         // Each window is moved on its own: one slotted in after a topmost window doesn't
         // reliably change band (it worked once after launch, then stayed under every app).
         // Each move lands at the top (or bottom) of its band, so the order of calls sets
         // badge > tile > fan.
-        if self.topmost {
+        if self.topmost || self.on_top_now {
             shell::raise_topmost(self.fan);
             shell::raise_topmost(self.tile);
             shell::raise_topmost(self.badge);
@@ -1950,6 +1977,17 @@ impl Stash {
                     let _ = KillTimer(Some(self.tile), T_BOUNCE);
                 }
                 let _ = self.bounce();
+            }
+            T_ON_TOP => {
+                let now = self.on_top();
+                if now != self.on_top_now {
+                    self.on_top_now = now;
+                    // closed while a full-screen app takes over, so the fan doesn't hang on
+                    if !now && self.open && !self.pinned {
+                        self.close();
+                    }
+                    self.restack();
+                }
             }
             T_ANNOUNCE_TEST => {
                 unsafe {
@@ -2252,6 +2290,7 @@ impl Stash {
                         self.reload(true);
                         self.prefetch(); // sort, count or size changed
                         self.apply_stack_visible();
+                        self.watch_on_top();
                         manager::set_settings(&self.settings);
                     }
                 }

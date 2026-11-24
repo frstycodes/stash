@@ -410,6 +410,7 @@ pub struct Manager {
     overlay: Option<Overlay>,
     overlay_v: SpriteVisual,
     press: Option<(f32, f32, u64)>, // where a finished row was pressed (DIPs), for dragging it out
+    down_at: (f32, f32),            // where the mouse last went down (DIPs)
     pending_select: Option<u64>,    // a plain click on a multi-selection selects just it on release
     cleared: std::collections::HashSet<u64>, // taken off the list by auto-clear already
     shas: HashMap<PathBuf, crate::details::Sha>,
@@ -989,6 +990,7 @@ impl Manager {
             overlay: None,
             overlay_v,
             press: None,
+            down_at: (0.0, 0.0),
             pending_select: None,
             cleared: Default::default(),
             shas: HashMap::new(),
@@ -2358,17 +2360,16 @@ impl Manager {
         }
         let cx = x - SIDEBAR;
         if y < HEAD {
-            if self.view != Page::Settings {
-                let (sx, sy, sw, sh) = self.search_rect();
-                if x >= sx - SORT_BTN - 8.0 && x < sx - 8.0 && y >= sy && y < sy + SORT_BTN {
-                    return Hit::SortBtn;
+            // the search box is on both the list and Settings; the sort button only on the list
+            let (sx, sy, sw, sh) = self.search_rect();
+            if self.view != Page::Settings && x >= sx - SORT_BTN - 8.0 && x < sx - 8.0 && y >= sy && y < sy + SORT_BTN {
+                return Hit::SortBtn;
+            }
+            if x >= sx && x < sx + sw && y >= sy && y < sy + sh {
+                if !self.search.text.is_empty() && x >= sx + sw - 32.0 {
+                    return Hit::SearchClear;
                 }
-                if x >= sx && x < sx + sw && y >= sy && y < sy + sh {
-                    if !self.search.text.is_empty() && x >= sx + sw - 32.0 {
-                        return Hit::SearchClear;
-                    }
-                    return Hit::Search;
-                }
+                return Hit::Search;
             }
             return Hit::Caption;
         }
@@ -2644,6 +2645,16 @@ impl Manager {
             Hit::Torrent => return Some(Blocking::PickTorrent),
             Hit::Video(h) => {
                 self.vsheet.click(&h);
+                // a clip handle (or the track) follows the mouse until it's let go
+                if let Some(s) = &self.sheet {
+                    let (ox, w) = (self.sheet_origin(&s.kind).0, self.sheet_size(&s.kind).0);
+                    self.vsheet.press(&h, self.down_at.0 - ox, w);
+                    if self.vsheet.dragging() {
+                        unsafe {
+                            SetCapture(self.hwnd);
+                        }
+                    }
+                }
                 let _ = self.place_sheet();
                 let _ = self.paint_sheet();
             }
@@ -3669,7 +3680,7 @@ impl Manager {
                 let dy = self.vsheet.extra_h();
                 let dw = self.gfx.dwrite.clone();
                 let k = self.k;
-                if let Some(h) = self.vsheet.hit(x, y, &|t: &str| paint::advance(&dw, t, 13.0 * k) / k) {
+                if let Some(h) = self.vsheet.hit(x, y, w, &|t: &str| paint::advance(&dw, t, 13.0 * k) / k) {
                     return Hit::Video(h);
                 }
                 if inside(w - 100.0, 136.0 + dy, 80.0, 26.0) {
@@ -4512,6 +4523,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             return LRESULT(0);
         },
         WM_MOUSEMOVE => {
+            // a video clip's handle is being dragged
+            if with(|m| m.drag_clip(x, wparam.0)).unwrap_or(false) {
+                return LRESULT(0);
+            }
             // a finished row pressed and pulled far enough: drag its files (all picked) out
             if let Some(paths) = with(|m| m.drag_paths(x, y, wparam.0)).flatten() {
                 crate::linkdrop::SUPPRESS.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -4532,6 +4547,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let h = m.hit(x as f32 / m.k, y as f32 / m.k);
                 let cursor = match &h {
                     Hit::Search | Hit::Field | Hit::Form(forms::FHit::Field(_)) => IDC_IBEAM,
+                    Hit::Video(crate::video_sheet::Hit::ClipStart | crate::video_sheet::Hit::ClipEnd) => IDC_SIZEWE,
                     Hit::None | Hit::Caption | Hit::Row(_) | Hit::Sheet | Hit::Backdrop | Hit::Dock | Hit::Menu(_) | Hit::MenuOff => IDC_ARROW,
                     Hit::OverlayOff | Hit::Quick(crate::preview::QHit::Card) | Hit::Info(crate::details::DHit::Card) => IDC_ARROW,
                     Hit::Page(settings_page::Hit::None) => IDC_ARROW,
@@ -4628,6 +4644,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
             blocking = with(|m| {
+                m.down_at = (x as f32 / m.k, y as f32 / m.k);
                 let h = m.hit(x as f32 / m.k, y as f32 / m.k);
                 m.press = if let Hit::Row(id) = h { Some((x as f32 / m.k, y as f32 / m.k, id)) } else { None };
                 m.click(h, msg == WM_LBUTTONDBLCLK)
@@ -4636,6 +4653,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         WM_LBUTTONUP => {
             with(|m| {
+                if m.vsheet.dragging() {
+                    m.vsheet.end_drag();
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
+                    let _ = m.paint_sheet();
+                }
                 m.page.press(None);
                 m.press = None;
                 // a plain click on a multi-selection that didn't become a drag
@@ -4663,6 +4687,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         WM_MOUSEWHEEL => {
             let delta = (wparam.0 >> 16) as u16 as i16 as f32;
+            // over a video clip's grip: step it (the lparam is in screen coordinates)
+            let (sx, sy) = ((lparam.0 & 0xffff) as u16 as i16 as i32, ((lparam.0 >> 16) & 0xffff) as u16 as i16 as i32);
+            if with(|m| m.sheet.is_some() && m.wheel_clip(sx, sy, delta as i32)) == Some(true) {
+                return LRESULT(0);
+            }
             with(|m| {
                 if let Some(Sheet { kind: SheetKind::Files(f), .. }) = &mut m.sheet {
                     if f.scroll_by(if delta > 0.0 { -3 } else { 3 }) {
@@ -4862,6 +4891,46 @@ impl Manager {
         let i = self.lines.iter().position(|l| matches!(l, Line::Job(j) if j.id == id))?;
         let y = self.list_top() + self.line_y(i) - self.scroll + ROW / 2.0;
         Some((SIDEBAR + 12.0 + 34.0, y.clamp(self.list_top(), self.h)))
+    }
+
+    /// The mouse moved with a clip handle held: move it. False when nothing's held.
+    fn drag_clip(&mut self, x: i32, buttons: usize) -> bool {
+        if !self.vsheet.dragging() {
+            return false;
+        }
+        if buttons & 0x0001 == 0 {
+            // let go somewhere we didn't hear about
+            self.vsheet.end_drag();
+            let _ = self.paint_sheet();
+            return false;
+        }
+        let Some(s) = &self.sheet else {
+            self.vsheet.end_drag();
+            return false;
+        };
+        let (ox, w) = (self.sheet_origin(&s.kind).0, self.sheet_size(&s.kind).0);
+        if let Some(forward) = self.vsheet.drag_to(x as f32 / self.k - ox, w) {
+            crate::tick::play(forward);
+            let _ = self.paint_sheet();
+        }
+        true
+    }
+
+    /// The wheel over a clip grip steps it; true if it was over one.
+    fn wheel_clip(&mut self, sx: i32, sy: i32, delta: i32) -> bool {
+        let mut pt = POINT { x: sx, y: sy };
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::ScreenToClient(self.hwnd, &mut pt);
+        }
+        let h = self.hit(pt.x as f32 / self.k, pt.y as f32 / self.k);
+        let Hit::Video(vh @ (crate::video_sheet::Hit::ClipStart | crate::video_sheet::Hit::ClipEnd)) = h else { return false };
+        let big = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+        if let Some(forward) = self.vsheet.nudge(&vh, delta, big) {
+            crate::tick::play(forward);
+        }
+        // (the frame preview shows from the first notch, moved or not)
+        let _ = self.paint_sheet();
+        true
     }
 
     /// Pressed on a finished row and pulled past the drag distance: the files to drag.

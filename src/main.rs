@@ -22,6 +22,7 @@ mod settings_page;
 mod shell;
 mod stash;
 mod thumbs;
+mod tick;
 mod torrent_sheet;
 mod tools;
 mod ui;

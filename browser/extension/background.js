@@ -45,9 +45,22 @@ async function handOver(url, filename, referrer) {
 // Ids of downloads we gave back to the browser, so we don't grab them again.
 const passThrough = new Set();
 
+// How old a download may be and still count as "just started". Chromium also fires
+// onCreated for downloads it loads back from its history (at browser start, and when the
+// extension is first installed), which would hand old, finished downloads over again.
+const FRESH_MS = 60_000;
+
+/** A download the person just started, not one the browser remembered from before. */
+function isNew(item) {
+  if (item.state && item.state !== "in_progress") return false;
+  const started = Date.parse(item.startTime);
+  return !Number.isFinite(started) || Date.now() - started < FRESH_MS;
+}
+
 api.downloads.onCreated.addListener(async (item) => {
   const url = item.finalUrl || item.url;
   if (!/^https?:/i.test(url) || passThrough.has(item.id)) return;
+  if (!isNew(item)) return;
   // private windows stay private: their downloads (and cookies) aren't handed over
   if (item.incognito) return;
   const s = await settings();

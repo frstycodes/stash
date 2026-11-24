@@ -68,7 +68,6 @@ pub(super) enum Purpose {
     Countdown { action: WhenDone, ends: Instant },
     Schedule,
     Proxy,
-    Folders,
 }
 
 pub(super) struct Form {
@@ -314,7 +313,6 @@ pub fn apply_engine_command(id: &str, p: &mut Prefs) -> bool {
             "retry" => p.auto_retry = !p.auto_retry,
             "awake" => p.keep_awake = !p.keep_awake,
             "metered" => p.pause_metered = !p.pause_metered,
-            "sort" => p.auto_sort = !p.auto_sort,
             _ => return false,
         },
         "seg" => {
@@ -618,12 +616,6 @@ impl Manager {
                 f.seg = Some(("Use", vec!["Windows", "None", "HTTP", "SOCKS5"], sel));
                 f
             }
-            "folders" => {
-                let mut f = Form::new("Folders by Type", "Empty: a folder of that name where the download is saved.", Purpose::Folders).ok_cancel("Save");
-                let get = |c: dl::sort::Category| p.sort_folders.iter().find(|(k, _)| *k == c).map(|(_, d)| d.display().to_string()).unwrap_or_default();
-                f.inputs = dl::sort::ALL.iter().map(|c| Input::new(c.name(), &get(*c), "Default")).collect();
-                f
-            }
             _ => return,
         };
         self.open_form(f);
@@ -647,7 +639,6 @@ impl Manager {
     /// New downloads from the New Download sheet or More Options: patterns expanded, and
     /// a question first for what's already on this PC.
     pub(super) fn add_links(&mut self, links: Vec<String>, template: AddRequest) {
-        let exact_dir = template.dir != default_dir(&self.settings);
         let all = dl::expand_all(links.iter().map(String::as_str));
         let snap = dl::engine().snapshot();
         let mut dupes = Vec::new();
@@ -658,12 +649,12 @@ impl Manager {
                 dupes.push(l);
                 continue;
             }
-            dl::engine().add(AddRequest { source: l, exact_dir, ..template.clone() });
+            dl::engine().add(AddRequest { source: l, ..template.clone() });
         }
         let Some(existing) = existing else { return };
         let name = existing.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let desc = if dupes.len() == 1 { format!("\u{201c}{name}\u{201d} is already on your PC.") } else { format!("{} of these are already on your PC.", dupes.len()) };
-        let mut f = Form::new("Already downloaded", desc, Purpose::Duplicate { links: dupes, existing, req: AddRequest { exact_dir, ..template } });
+        let mut f = Form::new("Already downloaded", desc, Purpose::Duplicate { links: dupes, existing, req: template });
         f.buttons = vec![("Show Existing".into(), crate::ui::Kind::Secondary), ("Download Again".into(), crate::ui::Kind::Primary)];
         self.open_form(f);
     }
@@ -808,12 +799,6 @@ impl Manager {
                 self.close_sheet();
                 queue_prefs(&p);
             }
-            Purpose::Folders => {
-                let mut p = self.settings.downloads.engine.clone();
-                p.sort_folders = dl::sort::ALL.iter().enumerate().filter(|(i, _)| !value(*i).is_empty()).map(|(i, c)| (*c, PathBuf::from(value(i)))).collect();
-                self.close_sheet();
-                queue_prefs(&p);
-            }
         }
     }
 }
@@ -832,7 +817,7 @@ mod tests {
     #[test]
     fn engine_commands() {
         let mut p = Prefs::default();
-        assert!(apply_engine_command("dle:flip:sort", &mut p) && p.auto_sort);
+        assert!(!apply_engine_command("dle:flip:sort", &mut p), "sorting into folders is gone");
         assert!(apply_engine_command("dle:seg:when:2", &mut p) && p.when_done == WhenDone::ShutDown);
         let mut q = Prefs::default();
         q.pause_metered = true;

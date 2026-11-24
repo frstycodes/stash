@@ -47,12 +47,6 @@ impl SettingsPage {
                     enabled: true,
                 }),
                 Row::new("Download hours", Some(&hours), "schedule scheduler time quiet hours night start stop timer", edit("schedule")),
-                Row::new("Sort into folders by type", Some("Videos, Music, Pictures, Documents, Programs and Archives."), "sort folders type category organize auto", Ctl::Switch {
-                    id: "dle-sort",
-                    on: p.auto_sort,
-                    enabled: true,
-                }),
-                Row::new("Folders for each type", Some("Where each type goes when sorting is on."), "sort folders type category location", edit("folders")),
                 Row::new("Proxy", Some(&proxy), "proxy socks socks5 http network firewall", edit("proxy")),
                 Row::new("When downloads finish", Some("After a 30-second countdown you can cancel."), "shutdown shut down sleep quit exit finish done after queue", Ctl::Seg {
                     id: "dle-when",

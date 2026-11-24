@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::Ev;
@@ -96,16 +96,39 @@ pub struct Spec {
     pub expected: Option<u64>,
     /// The page's picture, shown on the row while it downloads.
     pub thumbnail: Option<String>,
+    /// Only this part of the video: start and end, in seconds.
+    pub clip: Option<(f64, f64)>,
 }
 
 impl Spec {
-    /// The file name it's saved under (yt-dlp is told this exact name).
+    /// The file name it's saved under (yt-dlp is told this exact name). A clip says
+    /// which part it is: "Title (1m05s-2m30s).mp4".
     pub fn file_name(&self) -> String {
         let stem = super::safe_name(&self.title).unwrap_or_else(|| "Video".into());
         // leave room for yt-dlp's ".f137.mp4.part" and long folder paths
         let stem: String = stem.chars().take(120).collect();
-        format!("{}.{}", stem.trim_end_matches(['.', ' ']), self.quality.ext())
+        let stem = stem.trim_end_matches(['.', ' ']);
+        match self.clip {
+            Some((a, b)) => format!("{stem} ({}-{}).{}", stamp(a), stamp(b), self.quality.ext()),
+            None => format!("{stem}.{}", self.quality.ext()),
+        }
     }
+
+    /// yt-dlp's options for downloading only the clip: that section, cut exactly at its
+    /// ends (ffmpeg re-encodes around the cuts, so it starts on the right frame).
+    fn clip_args(&self) -> Vec<String> {
+        match self.clip {
+            Some((a, b)) => vec!["--download-sections".into(), format!("*{a:.1}-{b:.1}"), "--force-keyframes-at-cuts".into()],
+            None => Vec::new(),
+        }
+    }
+}
+
+/// "1m05s", "1h02m03s": a time that can go in a file name (no colons on Windows).
+fn stamp(secs: f64) -> String {
+    let s = secs.round() as u64;
+    let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
+    if h > 0 { format!("{h}h{m:02}m{s:02}s") } else { format!("{m}m{s:02}s") }
 }
 
 // ---------- reading a page ----------
@@ -126,6 +149,59 @@ pub struct Info {
     pub playlist: Option<Playlist>,
     /// The link is the playlist itself, not one video in it.
     pub only_playlist: bool,
+    /// Little frames from across the video (YouTube's storyboards), for previews.
+    pub storyboard: Option<Storyboard>,
+}
+
+/// A video's storyboard: sprite sheets, each a `cols` × `rows` grid of `width` × `height`
+/// frames, one frame every 1/`fps` seconds, sheet after sheet.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Storyboard {
+    pub width: u32,
+    pub height: u32,
+    pub cols: u32,
+    pub rows: u32,
+    pub fps: f64,
+    pub sheets: Vec<String>,
+}
+
+impl Storyboard {
+    /// Which sheet, and which cell in it (column, row), shows the moment `t`.
+    pub fn cell(&self, t: f64) -> Option<(usize, u32, u32)> {
+        let per = (self.cols * self.rows) as usize;
+        if per == 0 || self.fps <= 0.0 || self.sheets.is_empty() {
+            return None;
+        }
+        let i = ((t.max(0.0) * self.fps).floor() as usize).min(self.sheets.len() * per - 1);
+        let cell = (i % per) as u32;
+        Some((i / per, cell % self.cols, cell / self.cols))
+    }
+}
+
+/// The sharpest storyboard that isn't too many sheets to fetch (long videos have lots).
+fn pick_storyboard(formats: &[&Value]) -> Option<Storyboard> {
+    let mut boards: Vec<Storyboard> = formats
+        .iter()
+        .filter(|f| str_of(f, "format_id").is_some_and(|id| id.starts_with("sb")))
+        .filter_map(|f| {
+            let sheets: Vec<String> = f.get("fragments")?.as_array()?.iter().filter_map(|x| str_of(x, "url")).collect();
+            let b = Storyboard {
+                width: num(f, "width")? as u32,
+                height: num(f, "height")? as u32,
+                cols: num(f, "columns")? as u32,
+                rows: num(f, "rows")? as u32,
+                fps: num(f, "fps")?,
+                sheets,
+            };
+            (b.width > 0 && b.cols > 0 && b.rows > 0 && b.fps > 0.0 && !b.sheets.is_empty()).then_some(b)
+        })
+        .collect();
+    boards.sort_by_key(|b| std::cmp::Reverse(b.width));
+    let fits = boards.iter().position(|b| b.sheets.len() <= 30);
+    match fits {
+        Some(i) => Some(boards.swap_remove(i)),
+        None => boards.pop(),
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -208,6 +284,7 @@ pub fn parse_info(json: &str) -> Result<Info, String> {
         sizes,
         playlist: None,
         only_playlist: false,
+        storyboard: pick_storyboard(&formats),
     })
 }
 
@@ -613,6 +690,7 @@ impl Task {
         c.args(["--ignore-config", "--no-playlist", "--newline", "--progress", "--no-colors", "--continue", "--no-mtime", "--ies", "default,-generic"])
             .args(["--progress-template", TEMPLATE])
             .args(self.spec.quality.args())
+            .args(self.spec.clip_args())
             .args(["--embed-thumbnail", "--embed-metadata"])
             .arg("--ffmpeg-location")
             .arg(&ffmpeg)
@@ -635,13 +713,38 @@ impl Task {
         let _tree = kill_tree(&child);
         let stdout = child.stdout.take().ok_or("no output")?;
         let stderr = child.stderr.take().ok_or("no output")?;
+        // stderr: kept for the error message, and for a clip, ffmpeg's progress (yt-dlp
+        // hands a section to ffmpeg and reports nothing itself until it's done). ffmpeg
+        // ends its progress lines with \r, so split on that too.
+        let clip_len = self.spec.clip.map(|(a, b)| b - a).filter(|l| *l > 0.0);
+        let (cprogress, expected) = (progress.clone(), self.spec.expected);
         let errors = tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
+            let mut stderr = stderr;
             let mut all = String::new();
-            while let Ok(Some(l)) = lines.next_line().await {
-                if all.len() < 64_000 {
-                    all.push_str(&l);
-                    all.push('\n');
+            let mut pending: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 4096];
+            let mut meter = ClipMeter::default();
+            loop {
+                let n = match stderr.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                pending.extend_from_slice(&buf[..n]);
+                while let Some(i) = pending.iter().position(|b| *b == b'\r' || *b == b'\n') {
+                    let line: Vec<u8> = pending.drain(..=i).collect();
+                    let l = String::from_utf8_lossy(&line[..line.len() - 1]);
+                    if let (Some(len), Some(p)) = (clip_len, ffmpeg_progress(&l)) {
+                        let (done, total, speed) = meter.add(p, len, expected);
+                        cprogress.done.store(done, Ordering::Relaxed);
+                        cprogress.total.store(total, Ordering::Relaxed);
+                        cprogress.speed.store(speed, Ordering::Relaxed);
+                        cprogress.set_phase(0);
+                        continue; // (hundreds of these: not worth keeping)
+                    }
+                    if !l.trim().is_empty() && all.len() < 64_000 {
+                        all.push_str(&l);
+                        all.push('\n');
+                    }
                 }
             }
             all
@@ -683,6 +786,75 @@ impl Task {
         let total = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let _ = self.events.send(Ev::HttpDone { id: self.id, path, total });
         Ok(())
+    }
+}
+
+/// One ffmpeg progress line: how far into the clip it is (seconds) and how big the
+/// output is so far. "frame=  656 fps= 38 q=32.0 size=    1536KiB time=00:00:27.33 …"
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FfProgress {
+    pub time: f64,
+    pub size: Option<u64>,
+}
+
+pub fn ffmpeg_progress(line: &str) -> Option<FfProgress> {
+    let after = |key: &str| -> Option<&str> {
+        let i = line.find(key)?;
+        line[i + key.len()..].split_whitespace().next()
+    };
+    let t = after("time=")?;
+    let mut secs = 0.0;
+    for part in t.split(':') {
+        secs = secs * 60.0 + part.parse::<f64>().ok()?;
+    }
+    let size = after("size=").and_then(|s| {
+        let digits = s.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+        let n: f64 = digits.parse().ok()?;
+        let mult = match &s[digits.len()..] {
+            "KiB" | "kB" => 1024.0,
+            "MiB" | "MB" => 1024.0 * 1024.0,
+            "GiB" | "GB" => 1024.0 * 1024.0 * 1024.0,
+            _ => 1.0,
+        };
+        Some((n * mult) as u64)
+    });
+    Some(FfProgress { time: secs, size })
+}
+
+/// Turns ffmpeg's progress on a clip into the row's numbers: done and total (by how far
+/// through the clip it is, against the expected size) and the speed (how fast the output
+/// grows, smoothed).
+#[derive(Default)]
+struct ClipMeter {
+    last: Option<(std::time::Instant, u64)>,
+    speed: f64,
+}
+
+impl ClipMeter {
+    fn add(&mut self, p: FfProgress, len: f64, expected: Option<u64>) -> (u64, u64, u64) {
+        let frac = (p.time / len).clamp(0.0, 0.99);
+        let size = p.size.unwrap_or(0);
+        let now = std::time::Instant::now();
+        match self.last {
+            Some((t0, s0)) => {
+                let dt = now.duration_since(t0).as_secs_f64();
+                if dt >= 0.25 {
+                    let rate = size.saturating_sub(s0) as f64 / dt;
+                    self.speed = if self.speed == 0.0 { rate } else { self.speed * 0.7 + rate * 0.3 };
+                    self.last = Some((now, size));
+                }
+            }
+            None => self.last = Some((now, size)),
+        }
+        let (done, total) = match expected.filter(|e| *e > 0) {
+            Some(e) => ((e as f64 * frac) as u64, e),
+            // no size to go by (and ffmpeg holds its output back at first): once it has
+            // written some, the size so far scaled up; before that, a stand-in total so
+            // the bar still follows the clip
+            None if size > 64 * 1024 && frac > 0.05 => (size, (size as f64 / frac) as u64),
+            None => ((frac * 1_000_000.0) as u64, 1_000_000),
+        };
+        (done, total.max(done), self.speed as u64)
     }
 }
 
@@ -907,6 +1079,95 @@ mod tests {
     }
 
     #[test]
+    fn ffmpeg_lines() {
+        let p = ffmpeg_progress("frame=  656 fps= 38 q=32.0 size=    1536KiB time=00:00:27.33 bitrate= 460.4kbits/s speed=1.59x").unwrap();
+        assert_eq!(p, FfProgress { time: 27.33, size: Some(1536 * 1024) });
+        let end = ffmpeg_progress("frame=  720 fps= 40 q=32.0 Lsize=    1751KiB time=00:00:30.00 bitrate= 478.2kbits/s").unwrap();
+        assert_eq!(end.time, 30.0);
+        assert_eq!(ffmpeg_progress("frame=  696 size=  1536KiB time=N/A bitrate=N/A"), None);
+        assert_eq!(ffmpeg_progress("[youtube] YE7VzlLtp-4: Downloading webpage"), None);
+        assert_eq!(ffmpeg_progress("size=1kB time=01:02:03.50").unwrap().time, 3723.5);
+        // halfway through a 30 s clip expected at 4 MB
+        let mut m = ClipMeter::default();
+        let (done, total, _) = m.add(FfProgress { time: 15.0, size: Some(1_000_000) }, 30.0, Some(4_000_000));
+        assert_eq!((done, total), (2_000_000, 4_000_000));
+        // never "done" before ffmpeg is
+        assert_eq!(m.add(FfProgress { time: 31.0, size: None }, 30.0, Some(100)).0, 99);
+        // no estimate, nothing written yet: still follows the clip
+        assert_eq!(m.add(FfProgress { time: 7.5, size: Some(0) }, 30.0, None), (250_000, 1_000_000, m.speed as u64));
+    }
+
+    #[test]
+    fn storyboards() {
+        let json = r#"{"title":"T","duration":600,"formats":[
+            {"format_id":"sb2","width":48,"height":27,"rows":10,"columns":10,"fps":0.17,"fragments":[{"url":"a"}]},
+            {"format_id":"sb0","width":159,"height":90,"rows":5,"columns":5,"fps":0.2,"fragments":[{"url":"s0"},{"url":"s1"}]}]}"#;
+        let b = parse_info(json).unwrap().storyboard.unwrap();
+        assert_eq!((b.width, b.cols, b.sheets.len()), (159, 5, 2));
+        // a frame every 5 s, 25 to a sheet
+        assert_eq!(b.cell(0.0), Some((0, 0, 0)));
+        assert_eq!(b.cell(31.0), Some((0, 1, 1)));
+        assert_eq!(b.cell(126.0), Some((1, 0, 0)));
+        assert_eq!(b.cell(10_000.0), Some((1, 4, 4)), "past the end: the last frame");
+    }
+
+    #[test]
+    fn clips() {
+        let s = Spec { title: "Talk".into(), clip: Some((65.0, 150.4)), ..Default::default() };
+        assert_eq!(s.file_name(), "Talk (1m05s-2m30s).mp4");
+        assert_eq!(s.clip_args(), ["--download-sections", "*65.0-150.4", "--force-keyframes-at-cuts"]);
+        let long = Spec { title: "Film".into(), quality: Quality::AudioM4a, clip: Some((3723.0, 3730.0)), ..Default::default() };
+        assert_eq!(long.file_name(), "Film (1h02m03s-1h02m10s).m4a");
+        assert!(Spec::default().clip_args().is_empty());
+    }
+
+    /// Network test: downloads 5 seconds out of the middle of a video, and checks the file
+    /// is about that long (ffprobe-free: by size against the whole video's estimate).
+    /// `cargo test dl::video::tests::clip_end_to_end -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn clip_end_to_end() {
+        use super::super::*;
+        let dir = std::env::temp_dir().join("stash-dl-test-clip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("STASH_DATA", dir.join("data")) };
+        let url = std::env::var("STASH_TEST_URL").unwrap_or("https://www.youtube.com/watch?v=YE7VzlLtp-4".into());
+        let info = crate::tools::runtime().block_on(probe(&url)).expect("probe");
+        let d = info.duration.expect("duration");
+        let (a, b) = ((d / 2.0).floor(), (d / 2.0).floor() + 5.0);
+        let q = Quality::P480;
+        // the size the New Download sheet would expect for this clip
+        let expected = info.size(q).map(|s| (s as f64 * (b - a) / d) as u64);
+        let spec = Spec { quality: q, title: info.title.clone(), expected, thumbnail: None, clip: Some((a, b)) };
+        let engine = Engine::start(Config { max_active: 1, connections: 4, limit_bps: 0, seed: false }, || {});
+        engine.add(AddRequest { source: info.url.clone(), dir: dir.clone(), video: Some(spec), ..Default::default() });
+        let start = std::time::Instant::now();
+        let mut moved = false;
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            let s = engine.snapshot();
+            let j = &s.jobs[0];
+            println!("{:?} {:?} {} {}/{:?} {:?}", j.state, j.phase, j.name, j.done, j.total, j.error);
+            // part-way through, the row shows how far the clip has got
+            moved |= j.state == State::Active && j.done > 0 && j.total.is_some_and(|t| j.done < t);
+            if matches!(j.state, State::Done | State::Failed) || start.elapsed().as_secs() > 300 {
+                assert_eq!(j.state, State::Done, "{:?}", j.error);
+                let p = j.path.clone().unwrap();
+                let len = std::fs::metadata(&p).unwrap().len();
+                println!("saved {} ({len} bytes, whole video about {:?})", p.display(), info.size(q));
+                assert!(p.file_name().unwrap().to_string_lossy().contains("-"), "the name says which part");
+                assert!(len > 10_000);
+                assert!(moved, "progress showed while the clip downloaded");
+                if let Some(whole) = info.size(q) {
+                    assert!((len as f64) < whole as f64 * 0.6, "only a part was downloaded");
+                }
+                break;
+            }
+        }
+    }
+
+    #[test]
     fn claims_a_free_stem() {
         let dir = std::env::temp_dir().join("stash-video-claim-test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -943,7 +1204,7 @@ mod tests {
         println!("{} {:?} {:?}", info.title, info.duration.map(duration_text), info.sizes);
         let engine = Engine::start(Config { max_active: 2, connections: 4, limit_bps: 0, seed: false }, || {});
         for (i, q) in [Quality::AudioM4a, Quality::P480].into_iter().enumerate() {
-            let spec = Spec { quality: q, title: info.title.clone(), expected: info.size(q), thumbnail: info.thumbnail.clone() };
+            let spec = Spec { quality: q, title: info.title.clone(), expected: info.size(q), thumbnail: info.thumbnail.clone(), clip: None };
             // (the same link twice would be one download)
             let source = if i == 0 { info.url.clone() } else { format!("{}&stash={i}", info.url) };
             engine.add(AddRequest { source, dir: dir.join(q.label().replace(['(', ')', ' '], "")), video: Some(spec), ..Default::default() });
